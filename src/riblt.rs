@@ -49,7 +49,7 @@ impl<S: Symbol> From<S> for HashedSymbol<S> {
 }
 
 #[derive(Clone, Copy)]
-struct CodedSymbol<S: Symbol> {
+pub struct CodedSymbol<S: Symbol> {
     count: i64,
     hash: u64,
     symxor: S,
@@ -132,16 +132,17 @@ impl PartialEq for MapEntry {
 impl Eq for MapEntry {}
 
 #[derive(Clone, Default)]
-struct CodingWindow<S: Symbol> {
+pub struct CodingWindow<S: Symbol> {
     syms: Vec<HashedSymbol<S>>,
     maps: Vec<RandMap>,
     queue: BinaryHeap<MapEntry>,
     next_i: u64,
 }
+
 impl<S: Symbol> CodingWindow<S> {
     fn add(&mut self, hs: HashedSymbol<S>) {
         let idx = self.syms.len();
-        let mut map = RandMap::new(hs.hash);
+        let map = RandMap::new(hs.hash);
         self.syms.push(hs);
         self.maps.push(map);
         self.queue.push(MapEntry {
@@ -246,21 +247,21 @@ impl<S: Symbol> Decoder<S> {
             self.decodable.push(idx);
         }
 
-        println!(
-            "+coded idx={:?} count={:?} hash={:?} symxor={:?}",
-            idx, c.count, c.hash, c.symxor
-        );
+        // println!(
+        //     "+coded idx={:?} count={:?} hash={:?} symxor={:?}",
+        //     idx, c.count, c.hash, c.symxor
+        // );
     }
 
     fn apply_new_symbol(&mut self, hs: HashedSymbol<S>, dir: i64) -> RandMap {
         let mut m = RandMap::new(hs.hash);
 
-        println!(
-            "→ peeling sym {:?} dir={} starting len={} m.last=0",
-            hs.sym,
-            dir,
-            self.coded.len()
-        );
+        // println!(
+        //     "→ peeling sym {:?} dir={} starting len={} m.last=0",
+        //     hs.sym,
+        //     dir,
+        //     self.coded.len()
+        // );
 
         while (m.last as usize) < self.coded.len() {
             let cidx = m.last as usize;
@@ -268,10 +269,10 @@ impl<S: Symbol> Decoder<S> {
 
             // Check if newly decodable - only add degree 1 or -1 symbols
             if matches!(self.coded[cidx].count, -1 | 1) && self.coded[cidx].decodable() {
-                println!(
-                    "   decodable now idx={} count={} hash={}",
-                    cidx, self.coded[cidx].count, self.coded[cidx].hash
-                );
+                // println!(
+                //     "   decodable now idx={} count={} hash={}",
+                //     cidx, self.coded[cidx].count, self.coded[cidx].hash
+                // );
                 self.decodable.push(cidx);
             }
 
@@ -321,13 +322,13 @@ impl<S: Symbol> Decoder<S> {
             }
         }
 
-        println!(
-            "→ done={}/{} rem={:?} loc={:?}",
-            self.done,
-            self.coded.len(),
-            self.remote_diff(),
-            self.local_diff()
-        );
+        // println!(
+        //     "→ done={}/{} rem={:?} loc={:?}",
+        //     self.done,
+        //     self.coded.len(),
+        //     self.remote_diff(),
+        //     self.local_diff()
+        //);
     }
 
     pub fn is_decoded(&self) -> bool {
@@ -344,14 +345,20 @@ impl<S: Symbol> Decoder<S> {
 }
 
 // ---------- 7.  Tests ------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
+    use rand::{
+        SeedableRng,
+        rngs::{StdRng, ThreadRng},
+    };
+
     use super::*;
+
+    const TRIALS: usize = 100;
 
     #[test]
     fn tiny_diff() {
-        // Alice: 1..10 ; Bob: 1,3..10,11
+        // This one is not randomized; just run once as before.
         let mut enc = Encoder::<u64>::new();
         for v in 1u64..=10 {
             enc.add_symbol(v);
@@ -363,7 +370,7 @@ mod tests {
             dec.add_symbol(b);
         }
 
-        for _ in 0..16 {
+        loop {
             dec.add_coded_symbol(enc.produce_next());
             dec.try_decode();
             if dec.is_decoded() {
@@ -381,55 +388,198 @@ mod tests {
     }
 
     #[test]
-    fn thousand_shared_fifty_delta_each() {
+    fn thousand_shared_fifty_delta_each_soak() {
         const COMMON: usize = 1000;
         const DELTA: usize = 5;
 
-        let mut rng = rand::rng();
-        let base: Vec<u64> = (0..COMMON).map(|_| rng.random::<u64>()).collect();
-        let extra_a: Vec<u64> = (0..DELTA).map(|_| rng.random::<u64>()).collect();
-        let extra_b: Vec<u64> = (0..DELTA).map(|_| rng.random::<u64>()).collect();
+        for trial in 0..TRIALS {
+            let mut rng = rand::rng();
+            let base: Vec<u64> = (0..COMMON).map(|_| rng.random::<u64>()).collect();
+            let extra_a: Vec<u64> = (0..DELTA).map(|_| rng.random::<u64>()).collect();
+            let extra_b: Vec<u64> = (0..DELTA).map(|_| rng.random::<u64>()).collect();
 
-        let mut enc = Encoder::<u64>::new();
-        for &v in base.iter().chain(extra_a.iter()) {
-            enc.add_symbol(v)
-        }
+            let mut enc = Encoder::<u64>::new();
+            for &v in base.iter().chain(extra_a.iter()) {
+                enc.add_symbol(v)
+            }
 
-        let mut dec = Decoder::<u64>::new();
-        for &v in base.iter().chain(extra_b.iter()) {
-            dec.add_symbol(v)
-        }
+            let mut dec = Decoder::<u64>::new();
+            for &v in base.iter().chain(extra_b.iter()) {
+                dec.add_symbol(v)
+            }
 
-        for i in 0..(DELTA * 6) {
-            // Increased iteration limit
-            dec.add_coded_symbol(enc.produce_next());
-            dec.try_decode();
-            if dec.is_decoded() {
-                println!("Converged after {} iterations", i + 1);
-                break;
+            loop {
+                dec.add_coded_symbol(enc.produce_next());
+                dec.try_decode();
+                if dec.is_decoded() {
+                    // println!("Converged after {} iterations", i + 1);
+                    break;
+                }
+            }
+
+            let mut r = dec.remote_diff();
+            r.sort_unstable();
+            let mut l = dec.local_diff();
+            l.sort_unstable();
+            let mut ea = extra_a.clone();
+            ea.sort_unstable();
+            let mut eb = extra_b.clone();
+            eb.sort_unstable();
+
+            if !(dec.is_decoded() && r == ea && l == eb) {
+                panic!(
+                    "FAILED at trial {}: is_decoded={} remote_diff={:?} local_diff={:?}\nExpected remote={:?} local={:?}",
+                    trial,
+                    dec.is_decoded(),
+                    r,
+                    l,
+                    ea,
+                    eb
+                );
             }
         }
+    }
 
-        if !dec.is_decoded() {
-            println!(
-                "Failed to converge: done={}, total={}",
-                dec.done,
-                dec.coded.len()
-            );
-            println!("Remote diff found: {:?}", dec.remote_diff().len());
-            println!("Local diff found: {:?}", dec.local_diff().len());
+    fn gen_unique(
+        rng: &mut ThreadRng,
+        count: usize,
+        forbidden: &mut std::collections::HashSet<u64>,
+    ) -> Vec<u64> {
+        let mut out = Vec::with_capacity(count);
+        while out.len() < count {
+            let v = rng.random::<u64>();
+            if forbidden.insert(v) {
+                out.push(v);
+            }
         }
-        assert!(dec.is_decoded(), "decoder failed to converge");
+        out
+    }
 
-        let mut r = dec.remote_diff();
-        r.sort_unstable();
-        let mut l = dec.local_diff();
-        l.sort_unstable();
-        let mut ea = extra_a.clone();
-        ea.sort_unstable();
-        let mut eb = extra_b.clone();
-        eb.sort_unstable();
-        assert_eq!(r, ea);
-        assert_eq!(l, eb);
+    #[test]
+    fn unique_deltas_no_overlap_soak() {
+        const COMMON: usize = 1000;
+        const DELTA: usize = 5;
+
+        for trial in 0..TRIALS {
+            let mut rng = rand::rng();
+            let mut taken = std::collections::HashSet::new();
+
+            // common base
+            let base: Vec<u64> = gen_unique(&mut rng, COMMON, &mut taken);
+
+            // disjoint deltas
+            let extra_a = gen_unique(&mut rng, DELTA, &mut taken);
+            let extra_b = gen_unique(&mut rng, DELTA, &mut taken);
+
+            let mut enc = Encoder::<u64>::new();
+            for &v in base.iter().chain(extra_a.iter()) {
+                enc.add_symbol(v)
+            }
+
+            let mut dec = Decoder::<u64>::new();
+            for &v in base.iter().chain(extra_b.iter()) {
+                dec.add_symbol(v)
+            }
+
+            loop {
+                dec.add_coded_symbol(enc.produce_next());
+                dec.try_decode();
+                if dec.is_decoded() {
+                    break;
+                }
+            }
+            let mut r = dec.remote_diff();
+            r.sort_unstable();
+            let mut l = dec.local_diff();
+            l.sort_unstable();
+            let mut ea = extra_a.clone();
+            ea.sort_unstable();
+            let mut eb = extra_b.clone();
+            eb.sort_unstable();
+
+            if !(dec.is_decoded() && r == ea && l == eb) {
+                panic!(
+                    "FAILED at trial {}: is_decoded={} remote_diff={:?} local_diff={:?}\nExpected remote={:?} local={:?}",
+                    trial,
+                    dec.is_decoded(),
+                    r,
+                    l,
+                    ea,
+                    eb
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn overlapping_deltas_cancel_out_soak() {
+        const COMMON: usize = 1000;
+        const EXCLUSIVE: usize = 4;
+        const OVERLAP: usize = 3;
+
+        for trial in 0..TRIALS {
+            let mut rng = rand::rng();
+            let mut taken = std::collections::HashSet::new();
+
+            let base: Vec<u64> = gen_unique(&mut rng, COMMON, &mut taken);
+
+            // items that appear in both Alice and Bob
+            let overlap = gen_unique(&mut rng, OVERLAP, &mut taken);
+
+            // unique to each side
+            let extra_a_only = gen_unique(&mut rng, EXCLUSIVE, &mut taken);
+            let extra_b_only = gen_unique(&mut rng, EXCLUSIVE, &mut taken);
+
+            let alice = base.iter().chain(overlap.iter()).chain(extra_a_only.iter());
+            let bob = base.iter().chain(overlap.iter()).chain(extra_b_only.iter());
+
+            let mut enc = Encoder::<u64>::new();
+            for &v in alice {
+                enc.add_symbol(v)
+            }
+
+            let mut dec = Decoder::<u64>::new();
+            for &v in bob {
+                dec.add_symbol(v)
+            }
+
+            // for _ in 0..((EXCLUSIVE + OVERLAP) * 8) {
+            loop {
+                dec.add_coded_symbol(enc.produce_next());
+                dec.try_decode();
+                if dec.is_decoded() {
+                    break;
+                }
+            }
+            let mut remote = dec.remote_diff();
+            remote.sort_unstable();
+            let mut local = dec.local_diff();
+            local.sort_unstable();
+            let mut a_only = extra_a_only.clone();
+            a_only.sort_unstable();
+            let mut b_only = extra_b_only.clone();
+            b_only.sort_unstable();
+
+            if !(dec.is_decoded() && remote == a_only && local == b_only) {
+                panic!(
+                    "FAILED at trial {}: is_decoded={} remote_diff={:?} local_diff={:?}\nExpected remote={:?} local={:?}",
+                    trial,
+                    dec.is_decoded(),
+                    remote,
+                    local,
+                    a_only,
+                    b_only
+                );
+            }
+            // sanity: nothing from `overlap` leaks into either diff
+            for v in &overlap {
+                if remote.contains(v) || local.contains(v) {
+                    panic!(
+                        "FAILED at trial {}: overlap element {:?} leaked into diffs. Remote: {:?}, Local: {:?}",
+                        trial, v, remote, local
+                    );
+                }
+            }
+        }
     }
 }
