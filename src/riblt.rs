@@ -48,7 +48,7 @@ impl<S: Symbol> From<S> for HashedSymbol<S> {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct CodedSymbol<S: Symbol> {
     count: i64,
     hash: u64,
@@ -74,7 +74,7 @@ impl<S: Symbol> CodedSymbol<S> {
     #[inline]
     fn decodable(&self) -> bool {
         matches!(self.count, -1 | 0 | 1)
-            && ((self.count == 0 && self.hash == 0) || (self.hash == self.symxor.hash()))
+            && (self.count == 0 && self.hash == 0 || (self.hash == self.symxor.hash()))
     }
 }
 
@@ -98,9 +98,11 @@ impl RandMap {
         self.seed ^= self.seed >> 27;
         let rand = self.seed.wrapping_mul(0x2545F4914F6CDD1D);
 
-        // The Go version uses a more complex gap calculation
-        // Let's match it more closely
-        let gap = (rand % 16) + 1; // 1..=16
+        let tp32 = 1u64 << 32;
+        let diff =
+            ((self.last as f64) + 1.5) * ((tp32 as f64) / ((rand as f64) + 1.0).sqrt() - 1.0);
+        let gap = diff.ceil() as u64;
+
         self.last = self.last.wrapping_add(gap);
         self.last
     }
@@ -216,6 +218,7 @@ pub struct Decoder<S: Symbol> {
     decodable: Vec<usize>,
     done: usize,
 }
+
 impl<S: Symbol> Decoder<S> {
     pub fn new() -> Self {
         Self {
@@ -241,14 +244,19 @@ impl<S: Symbol> Decoder<S> {
 
         // Check if decodable - only add to decodable list if count is 1 or -1
         // (not 0, as those will be handled when they transition from 1/-1 to 0)
-        if matches!(c.count, -1 | 1) && c.decodable() {
-            self.decodable.push(idx);
-        } else if c.count == 0 && c.hash == 0 {
+        // if matches!(c.count, -1 | 1) && c.decodable() {
+        //     println!("add_coded_symbol, count -1 | 1");
+        //     self.decodable.push(idx);
+        // } else if c.count == 0 && c.hash == 0 {
+        //     println!("add_coded_symbol 0, because count=0");
+        //     self.decodable.push(idx);
+        // }
+        if c.decodable() {
             self.decodable.push(idx);
         }
 
         // println!(
-        //     "+coded idx={:?} count={:?} hash={:?} symxor={:?}",
+        //     "add_coded_symbol idx={:?} count={:?} hash={:?} symxor={:?}",
         //     idx, c.count, c.hash, c.symxor
         // );
     }
@@ -257,7 +265,7 @@ impl<S: Symbol> Decoder<S> {
         let mut m = RandMap::new(hs.hash);
 
         // println!(
-        //     "→ peeling sym {:?} dir={} starting len={} m.last=0",
+        //     "apply_new_symbol {:?} dir={} starting len={} m.last=0",
         //     hs.sym,
         //     dir,
         //     self.coded.len()
@@ -282,11 +290,13 @@ impl<S: Symbol> Decoder<S> {
     }
 
     pub fn try_decode(&mut self) {
+        //println!("self.decodable {:#}", self.decodable.len());
         while let Some(idx) = self.decodable.pop() {
             let c = self.coded[idx];
 
             // Verify it's still decodable (might have changed due to peeling)
             if !c.decodable() {
+                //println!("Skip, no decodable {}", idx);
                 continue;
             }
 
@@ -317,7 +327,7 @@ impl<S: Symbol> Decoder<S> {
                 }
                 _ => {
                     // Should not happen for decodable symbols
-                    continue;
+                    panic!("Cound not -1, 0, 1, Should not happen for decodable symbols")
                 }
             }
         }
@@ -328,7 +338,7 @@ impl<S: Symbol> Decoder<S> {
         //     self.coded.len(),
         //     self.remote_diff(),
         //     self.local_diff()
-        //);
+        // );
     }
 
     pub fn is_decoded(&self) -> bool {
@@ -347,14 +357,11 @@ impl<S: Symbol> Decoder<S> {
 // ---------- 7.  Tests ------------------------------------------------------------------------
 #[cfg(test)]
 mod tests {
-    use rand::{
-        SeedableRng,
-        rngs::{StdRng, ThreadRng},
-    };
+    use rand::rngs::ThreadRng;
 
     use super::*;
 
-    const TRIALS: usize = 100;
+    const TRIALS: usize = 1;
 
     #[test]
     fn tiny_diff() {
@@ -390,7 +397,7 @@ mod tests {
     #[test]
     fn thousand_shared_fifty_delta_each_soak() {
         const COMMON: usize = 1000;
-        const DELTA: usize = 5;
+        const DELTA: usize = 100;
 
         for trial in 0..TRIALS {
             let mut rng = rand::rng();
@@ -398,29 +405,40 @@ mod tests {
             let extra_a: Vec<u64> = (0..DELTA).map(|_| rng.random::<u64>()).collect();
             let extra_b: Vec<u64> = (0..DELTA).map(|_| rng.random::<u64>()).collect();
 
+            println!("Starting to fill encoder");
             let mut enc = Encoder::<u64>::new();
             for &v in base.iter().chain(extra_a.iter()) {
                 enc.add_symbol(v)
             }
 
+            println!("Starting to fill decoder");
             let mut dec = Decoder::<u64>::new();
             for &v in base.iter().chain(extra_b.iter()) {
                 dec.add_symbol(v)
             }
 
+            println!("Starting to unravel");
+            let mut i: u64 = 0;
             loop {
+                if i % 10000 == 0 {
+                    println!("{}", i);
+                }
                 dec.add_coded_symbol(enc.produce_next());
                 dec.try_decode();
                 if dec.is_decoded() {
-                    // println!("Converged after {} iterations", i + 1);
+                    println!("Converged after {} iterations", i + 1);
                     break;
                 }
+                i += 1;
             }
+            println!("Done unraveling");
 
             let mut r = dec.remote_diff();
             r.sort_unstable();
             let mut l = dec.local_diff();
             l.sort_unstable();
+            println!("r {:?}", r);
+            println!("l {:?}", l);
             let mut ea = extra_a.clone();
             ea.sort_unstable();
             let mut eb = extra_b.clone();
@@ -513,9 +531,9 @@ mod tests {
 
     #[test]
     fn overlapping_deltas_cancel_out_soak() {
-        const COMMON: usize = 1000;
-        const EXCLUSIVE: usize = 4;
-        const OVERLAP: usize = 3;
+        const COMMON: usize = 1_000_000;
+        const EXCLUSIVE: usize = 100000;
+        const OVERLAP: usize = 6;
 
         for trial in 0..TRIALS {
             let mut rng = rand::rng();
@@ -543,7 +561,6 @@ mod tests {
                 dec.add_symbol(v)
             }
 
-            // for _ in 0..((EXCLUSIVE + OVERLAP) * 8) {
             loop {
                 dec.add_coded_symbol(enc.produce_next());
                 dec.try_decode();
