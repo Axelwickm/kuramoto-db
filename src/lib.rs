@@ -3,7 +3,6 @@ pub mod database;
 pub mod meta;
 pub mod region_lock;
 pub mod riblt;
-pub mod riblt2;
 pub mod storage_entity;
 pub mod storage_error;
 pub use database::*;
