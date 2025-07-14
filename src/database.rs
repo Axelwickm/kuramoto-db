@@ -76,6 +76,26 @@ impl KuramotoDb {
 
     // Generic CRUD (async)
 
+    /// Get the primary key for an entity by an index.
+    /// Returns Ok(Some(main_key)) if found, Ok(None) if not found, or Err on error.
+    pub async fn get_index(
+        &self,
+        table: StaticTableDef,
+        idx_key: &[u8],
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageError::Other(e.to_string()))?;
+        let table = txn
+            .open_table(table.clone())
+            .map_err(|e| StorageError::Other(e.to_string()))?;
+        let got = table
+            .get(idx_key)
+            .map_err(|e| StorageError::Other(e.to_string()))?;
+        Ok(got.map(|v| v.value().to_vec()))
+    }
+
     pub async fn put<E: StorageEntity>(&self, entity: E) -> Result<(), StorageError> {
         let (tx, rx) = oneshot::channel();
         let key = entity.primary_key();

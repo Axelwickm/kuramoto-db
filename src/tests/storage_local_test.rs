@@ -115,15 +115,10 @@ async fn assert_index_row(
     idx_key: &[u8],
     expect_main_key: Option<&[u8]>,
 ) {
-    let txn = sys
-        .begin_read_txn()
-        .expect("helper requires pub(crate) begin_read_txn");
-
-    let table = txn.open_table(*idx_table).unwrap();
-    let got = table.get(idx_key).unwrap();
+    let got = sys.get_index(idx_table, idx_key).await.unwrap();
     match expect_main_key {
         Some(main) => {
-            let v = got.expect("index row missing").value();
+            let v = got.expect("index row missing");
             assert_eq!(v, main);
         }
         None => assert!(got.is_none(), "index row should be absent"),
