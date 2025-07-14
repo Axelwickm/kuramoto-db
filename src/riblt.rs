@@ -10,6 +10,7 @@ macro_rules! debug_print {
         println!($($arg)*);
     };
 }
+
 #[cfg(not(feature = "riblt_debug"))]
 macro_rules! debug_print {
     ($($arg:tt)*) => {};
@@ -343,7 +344,7 @@ mod tests {
 
     #[test]
     fn thousand_shared_hundred_each() {
-        const COMMON: usize = 10000;
+        const COMMON: usize = 1000000;
         const DELTA: usize = 1000;
 
         for _ in 0..TRIALS {
