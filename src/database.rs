@@ -69,7 +69,12 @@ impl KuramotoDb {
         sys
     }
 
-    // ----------- GENERIC CRUD (async) ----------------
+    // Getters/setters
+    pub fn get_clock(&self) -> Arc<dyn Clock> {
+        self.clock.clone()
+    }
+
+    // Generic CRUD (async)
 
     pub async fn put<E: StorageEntity>(&self, entity: E) -> Result<(), StorageError> {
         let (tx, rx) = oneshot::channel();
