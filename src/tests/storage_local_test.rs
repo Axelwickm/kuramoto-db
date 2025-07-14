@@ -125,6 +125,20 @@ async fn assert_index_row(
     }
 }
 
+/// Assert that get_by_index returns the expected entity (or None).
+async fn assert_get_by_index<E: StorageEntity + PartialEq + std::fmt::Debug>(
+    sys: &KuramotoDb,
+    idx_table: StaticTableDef,
+    idx_key: &[u8],
+    expect: Option<&E>,
+) {
+    let got = sys.get_by_index::<E>(idx_table, idx_key).await.unwrap();
+    match expect {
+        Some(e) => assert_eq!(got.as_ref(), Some(e)),
+        None => assert!(got.is_none(), "entity should be absent"),
+    }
+}
+
 // ============== CRUD TESTS ==============
 
 #[tokio::test]
@@ -240,6 +254,7 @@ async fn index_insert_update_delete() {
     };
     sys.put(e.clone()).await.unwrap();
     assert_index_row(&sys, &TEST_NAME_INDEX, b"A", Some(&e.id.to_be_bytes())).await;
+    assert_get_by_index::<TestEntity>(&sys, &TEST_NAME_INDEX, b"A", Some(&e)).await;
 
     // ---- update (name changes) ----
     clock.advance(1);
@@ -247,11 +262,14 @@ async fn index_insert_update_delete() {
     sys.put(e.clone()).await.unwrap();
     assert_index_row(&sys, &TEST_NAME_INDEX, b"A", None).await; // old gone
     assert_index_row(&sys, &TEST_NAME_INDEX, b"B", Some(&e.id.to_be_bytes())).await; // new present
+    assert_get_by_index::<TestEntity>(&sys, &TEST_NAME_INDEX, b"A", None).await;
+    assert_get_by_index::<TestEntity>(&sys, &TEST_NAME_INDEX, b"B", Some(&e)).await;
 
     // ---- delete ----
     clock.advance(1);
     sys.delete::<TestEntity>(&e.id.to_be_bytes()).await.unwrap();
     assert_index_row(&sys, &TEST_NAME_INDEX, b"B", None).await; // index row removed
+    assert_get_by_index::<TestEntity>(&sys, &TEST_NAME_INDEX, b"B", None).await;
 }
 
 #[tokio::test]

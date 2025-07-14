@@ -96,6 +96,24 @@ impl KuramotoDb {
         Ok(got.map(|v| v.value().to_vec()))
     }
 
+    /// Get an entity by an index key.
+    /// Returns Ok(Some(entity)) if found, Ok(None) if not found, or Err on error.
+    pub async fn get_by_index<E: StorageEntity>(
+        &self,
+        index_table: StaticTableDef,
+        idx_key: &[u8],
+    ) -> Result<Option<E>, StorageError> {
+        if let Some(main_key) = self.get_index(index_table, idx_key).await? {
+            match self.get_data::<E>(&main_key).await {
+                Ok(entity) => Ok(Some(entity)),
+                Err(StorageError::NotFound) => Ok(None),
+                Err(e) => Err(e),
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
     pub async fn put<E: StorageEntity>(&self, entity: E) -> Result<(), StorageError> {
         let (tx, rx) = oneshot::channel();
         let key = entity.primary_key();
