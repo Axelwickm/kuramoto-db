@@ -147,11 +147,19 @@ async fn insert_and_read() {
     let clock = Arc::new(MockClock::new(1_000));
     let sys = KuramotoDb::new(dir.path().join("db.redb").to_str().unwrap(), clock.clone()).await;
 
+    // Should fail to put before table is created
     let e = TestEntity {
         id: 1,
         name: "Alice".into(),
         value: 42,
     };
+    let err = sys.put(e.clone()).await.err().expect("should error");
+    assert!(format!("{:?}", err).contains("does not exist"));
+
+    // Now create table and indexes
+    sys.create_table_and_indexes::<TestEntity>().unwrap();
+
+    // Now put should succeed
     sys.put(e.clone()).await.unwrap();
 
     assert_row::<TestEntity>(&sys, &e.id.to_be_bytes(), Some(&e), 0, 1_000, 1_000, false).await;
@@ -162,6 +170,8 @@ async fn overwrite_updates_meta() {
     let dir = tempdir().unwrap();
     let clock = Arc::new(MockClock::new(10));
     let sys = KuramotoDb::new(dir.path().join("db.redb").to_str().unwrap(), clock.clone()).await;
+
+    sys.create_table_and_indexes::<TestEntity>().unwrap();
 
     let mut e = TestEntity {
         id: 99,
@@ -182,6 +192,8 @@ async fn delete_and_undelete() {
     let dir = tempdir().unwrap();
     let clock = Arc::new(MockClock::new(500));
     let sys = KuramotoDb::new(dir.path().join("db.redb").to_str().unwrap(), clock.clone()).await;
+
+    sys.create_table_and_indexes::<TestEntity>().unwrap();
 
     let e = TestEntity {
         id: 7,
@@ -207,6 +219,8 @@ async fn stale_version_rejected() {
         clock.clone(),
     )
     .await;
+
+    sys.create_table_and_indexes::<TestEntity>().unwrap();
 
     // --- insert normally ---
     let e = TestEntity {
@@ -246,6 +260,8 @@ async fn index_insert_update_delete() {
     let clock = Arc::new(MockClock::new(0));
     let sys = KuramotoDb::new(dir.path().join("idx.redb").to_str().unwrap(), clock.clone()).await;
 
+    sys.create_table_and_indexes::<TestEntity>().unwrap();
+
     // ---- insert ----
     let mut e = TestEntity {
         id: 1,
@@ -278,6 +294,8 @@ async fn duplicate_index_rejected() {
     let clock = Arc::new(MockClock::new(0));
     let sys = KuramotoDb::new(dir.path().join("dup.redb").to_str().unwrap(), clock.clone()).await;
 
+    sys.create_table_and_indexes::<TestEntity>().unwrap();
+
     let a = TestEntity {
         id: 1,
         name: "X".into(),
@@ -292,4 +310,35 @@ async fn duplicate_index_rejected() {
     sys.put(a).await.unwrap();
     let err = sys.put(b).await.err().expect("should error");
     matches!(err, StorageError::DuplicateIndexKey { .. });
+}
+#[tokio::test]
+async fn manual_drop_and_cascade() {
+    let dir = tempdir().unwrap();
+    let clock = Arc::new(MockClock::new(0));
+    let sys = KuramotoDb::new(dir.path().join("drop.redb").to_str().unwrap(), clock.clone()).await;
+
+    // Create table and indexes
+    sys.create_table_and_indexes::<TestEntity>().unwrap();
+
+    // Insert a few rows
+    let e1 = TestEntity { id: 1, name: "A".into(), value: 1 };
+    let e2 = TestEntity { id: 2, name: "B".into(), value: 2 };
+    sys.put(e1.clone()).await.unwrap();
+    sys.put(e2.clone()).await.unwrap();
+
+    // Drop without cascade: should drop tables, but not error if empty
+    sys.drop_table_and_indexes::<TestEntity>(false).unwrap();
+
+    // Re-create and insert again
+    sys.create_table_and_indexes::<TestEntity>().unwrap();
+    sys.put(e1.clone()).await.unwrap();
+    sys.put(e2.clone()).await.unwrap();
+
+    // Drop with cascade: should clear all data before dropping
+    sys.drop_table_and_indexes::<TestEntity>(true).unwrap();
+
+    // Re-create and check tables are empty
+    sys.create_table_and_indexes::<TestEntity>().unwrap();
+    assert!(sys.get_data::<TestEntity>(&e1.id.to_be_bytes()).await.is_err());
+    assert!(sys.get_data::<TestEntity>(&e2.id.to_be_bytes()).await.is_err());
 }

@@ -69,6 +69,68 @@ impl KuramotoDb {
         sys
     }
 
+    /// Manually create a table and its indexes. Returns error if already exists.
+    pub fn create_table_and_indexes<E: StorageEntity>(&self) -> Result<(), StorageError> {
+        let txn = self.db.begin_write().map_err(|e| StorageError::Other(e.to_string()))?;
+        // Create main table
+        txn.create_table(E::table_def().clone())
+            .map_err(|e| StorageError::Other(e.to_string()))?;
+        // Create meta table
+        txn.create_table(E::meta_table_def().clone())
+            .map_err(|e| StorageError::Other(e.to_string()))?;
+        // Create index tables
+        for idx in E::indexes() {
+            txn.create_table(idx.table_def.clone())
+                .map_err(|e| StorageError::Other(e.to_string()))?;
+        }
+        txn.commit().map_err(|e| StorageError::Other(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Manually delete a table and its indexes. If cascade=true, also deletes all rows.
+    pub fn drop_table_and_indexes<E: StorageEntity>(&self, cascade: bool) -> Result<(), StorageError> {
+        let txn = self.db.begin_write().map_err(|e| StorageError::Other(e.to_string()))?;
+        // Optionally clear all rows before dropping
+        if cascade {
+            // Remove all rows from main table
+            if let Ok(mut t) = txn.open_table(E::table_def().clone()) {
+                let keys: Vec<Vec<u8>> = t.iter().filter_map(|r| r.ok().map(|(k, _)| k.value().to_vec())).collect();
+                for k in keys {
+                    t.remove(&k).ok();
+                }
+            }
+            // Remove all rows from meta table
+            if let Ok(mut t) = txn.open_table(E::meta_table_def().clone()) {
+                let keys: Vec<Vec<u8>> = t.iter().filter_map(|r| r.ok().map(|(k, _)| k.value().to_vec())).collect();
+                for k in keys {
+                    t.remove(&k).ok();
+                }
+            }
+            // Remove all rows from index tables
+            for idx in E::indexes() {
+                if let Ok(mut t) = txn.open_table(idx.table_def.clone()) {
+                    let keys: Vec<Vec<u8>> = t.iter().filter_map(|r| r.ok().map(|(k, _)| k.value().to_vec())).collect();
+                    for k in keys {
+                        t.remove(&k).ok();
+                    }
+                }
+            }
+        }
+        // Drop main table
+        txn.drop_table(E::table_def().clone())
+            .map_err(|e| StorageError::Other(e.to_string()))?;
+        // Drop meta table
+        txn.drop_table(E::meta_table_def().clone())
+            .map_err(|e| StorageError::Other(e.to_string()))?;
+        // Drop index tables
+        for idx in E::indexes() {
+            txn.drop_table(idx.table_def.clone())
+                .map_err(|e| StorageError::Other(e.to_string()))?;
+        }
+        txn.commit().map_err(|e| StorageError::Other(e.to_string()))?;
+        Ok(())
+    }
+
     // Getters/setters
     pub fn get_clock(&self) -> Arc<dyn Clock> {
         self.clock.clone()
@@ -327,9 +389,20 @@ impl KuramotoDb {
 
                 // ---- Version check (primary key) ----
                 {
-                    let meta_t = txn
-                        .open_table(*meta_table)
-                        .map_err(|e| StorageError::Other(e.to_string()))?;
+                    // Fail if meta table does not exist
+                    let meta_t = match txn.open_table(*meta_table) {
+                        Ok(t) => t,
+                        Err(_) => {
+                            let _ = respond_to.send(Err(StorageError::Other(format!(
+                                "Meta table does not exist: {}",
+                                meta_table.name()
+                            ))));
+                            return Err(StorageError::Other(format!(
+                                "Meta table does not exist: {}",
+                                meta_table.name()
+                            )));
+                        }
+                    };
 
                     if let Some(existing_meta_raw) = meta_t
                         .get(&*key)
@@ -357,27 +430,58 @@ impl KuramotoDb {
 
                 // ---- Insert / overwrite main row ----
                 {
-                    let mut t = txn
-                        .open_table(*data_table)
-                        .map_err(|e| StorageError::Other(e.to_string()))?;
+                    // Fail if data table does not exist
+                    let mut t = match txn.open_table(*data_table) {
+                        Ok(t) => t,
+                        Err(_) => {
+                            let _ = respond_to.send(Err(StorageError::Other(format!(
+                                "Data table does not exist: {}",
+                                data_table.name()
+                            ))));
+                            return Err(StorageError::Other(format!(
+                                "Data table does not exist: {}",
+                                data_table.name()
+                            )));
+                        }
+                    };
                     t.insert(&*key, value)
                         .map_err(|e| StorageError::Other(e.to_string()))?;
                 }
 
                 // ---- Handle index removals ----
                 for idx in index_removes {
-                    let mut t = txn
-                        .open_table(*idx.table)
-                        .map_err(|e| StorageError::Other(e.to_string()))?;
+                    let mut t = match txn.open_table(*idx.table) {
+                        Ok(t) => t,
+                        Err(_) => {
+                            let _ = respond_to.send(Err(StorageError::Other(format!(
+                                "Index table does not exist: {}",
+                                idx.table.name()
+                            ))));
+                            return Err(StorageError::Other(format!(
+                                "Index table does not exist: {}",
+                                idx.table.name()
+                            )));
+                        }
+                    };
                     t.remove(idx.key.as_slice())
                         .map_err(|e| StorageError::Other(e.to_string()))?;
                 }
 
                 // ---- Handle index inserts with uniqueness check ----
                 for idx in index_puts {
-                    let mut t = txn
-                        .open_table(*idx.table)
-                        .map_err(|e| StorageError::Other(e.to_string()))?;
+                    let mut t = match txn.open_table(*idx.table) {
+                        Ok(t) => t,
+                        Err(_) => {
+                            let _ = respond_to.send(Err(StorageError::Other(format!(
+                                "Index table does not exist: {}",
+                                idx.table.name()
+                            ))));
+                            return Err(StorageError::Other(format!(
+                                "Index table does not exist: {}",
+                                idx.table.name()
+                            )));
+                        }
+                    };
 
                     if let Some(existing) = t
                         .get(idx.key.as_slice())
@@ -396,9 +500,19 @@ impl KuramotoDb {
 
                 // ---- Finally write updated meta (includes bumped version) ----
                 {
-                    let mut meta_t = txn
-                        .open_table(*meta_table)
-                        .map_err(|e| StorageError::Other(e.to_string()))?;
+                    let mut meta_t = match txn.open_table(*meta_table) {
+                        Ok(t) => t,
+                        Err(_) => {
+                            let _ = respond_to.send(Err(StorageError::Other(format!(
+                                "Meta table does not exist: {}",
+                                meta_table.name()
+                            ))));
+                            return Err(StorageError::Other(format!(
+                                "Meta table does not exist: {}",
+                                meta_table.name()
+                            )));
+                        }
+                    };
                     meta_t
                         .insert(&*key, meta)
                         .map_err(|e| StorageError::Other(e.to_string()))?;
