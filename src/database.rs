@@ -71,82 +71,19 @@ impl KuramotoDb {
 
     /// Manually create a table and its indexes. Returns error if already exists.
     pub fn create_table_and_indexes<E: StorageEntity>(&self) -> Result<(), StorageError> {
-        let mut txn = self
+        let txn = self
             .db
             .begin_write()
             .map_err(|e| StorageError::Other(e.to_string()))?;
         // Create main table
-        txn.open_table_with_flags(E::table_def().clone(), redb::TableFlags::CREATE)
+        txn.open_table(E::table_def().clone())
             .map_err(|e| StorageError::Other(e.to_string()))?;
         // Create meta table
-        txn.open_table_with_flags(E::meta_table_def().clone(), redb::TableFlags::CREATE)
+        txn.open_table(E::meta_table_def().clone())
             .map_err(|e| StorageError::Other(e.to_string()))?;
         // Create index tables
         for idx in E::indexes() {
-            txn.open_table_with_flags(idx.table_def.clone(), redb::TableFlags::CREATE)
-                .map_err(|e| StorageError::Other(e.to_string()))?;
-        }
-        txn.commit()
-            .map_err(|e| StorageError::Other(e.to_string()))?;
-        Ok(())
-    }
-
-    /// Manually delete a table and its indexes. If cascade=true, also deletes all rows.
-    pub fn drop_table_and_indexes<E: StorageEntity>(
-        &self,
-        cascade: bool,
-    ) -> Result<(), StorageError> {
-        let mut txn = self
-            .db
-            .begin_write()
-            .map_err(|e| StorageError::Other(e.to_string()))?;
-        // Optionally clear all rows before dropping
-        if cascade {
-            // Remove all rows from main table
-            if let Ok(mut t) = txn.open_table(E::table_def().clone()) {
-                let keys: Vec<Vec<u8>> = t
-                    .iter()
-                    .into_iter()
-                    .filter_map(|r| r.ok().map(|(k, _)| k.value().to_vec()))
-                    .collect();
-                for k in keys {
-                    t.remove(&k).ok();
-                }
-            }
-            // Remove all rows from meta table
-            if let Ok(mut t) = txn.open_table(E::meta_table_def().clone()) {
-                let keys: Vec<Vec<u8>> = t
-                    .iter()
-                    .into_iter()
-                    .filter_map(|r| r.ok().map(|(k, _)| k.value().to_vec()))
-                    .collect();
-                for k in keys {
-                    t.remove(&k).ok();
-                }
-            }
-            // Remove all rows from index tables
-            for idx in E::indexes() {
-                if let Ok(mut t) = txn.open_table(idx.table_def.clone()) {
-                    let keys: Vec<Vec<u8>> = t
-                        .iter()
-                        .into_iter()
-                        .filter_map(|r| r.ok().map(|(k, _)| k.value().to_vec()))
-                        .collect();
-                    for k in keys {
-                        t.remove(&k).ok();
-                    }
-                }
-            }
-        }
-        // Drop main table
-        txn.remove_table(E::table_def().clone())
-            .map_err(|e| StorageError::Other(e.to_string()))?;
-        // Drop meta table
-        txn.remove_table(E::meta_table_def().clone())
-            .map_err(|e| StorageError::Other(e.to_string()))?;
-        // Drop index tables
-        for idx in E::indexes() {
-            txn.remove_table(idx.table_def.clone())
+            txn.open_table(idx.table_def.clone())
                 .map_err(|e| StorageError::Other(e.to_string()))?;
         }
         txn.commit()
