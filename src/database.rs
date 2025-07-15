@@ -71,19 +71,19 @@ impl KuramotoDb {
 
     /// Manually create a table and its indexes. Returns error if already exists.
     pub fn create_table_and_indexes<E: StorageEntity>(&self) -> Result<(), StorageError> {
-        let txn = self
+        let mut txn = self
             .db
             .begin_write()
             .map_err(|e| StorageError::Other(e.to_string()))?;
         // Create main table
-        txn.create_table(E::table_def().clone())
+        txn.open_table_with_flags(E::table_def().clone(), redb::TableFlags::CREATE)
             .map_err(|e| StorageError::Other(e.to_string()))?;
         // Create meta table
-        txn.create_table(E::meta_table_def().clone())
+        txn.open_table_with_flags(E::meta_table_def().clone(), redb::TableFlags::CREATE)
             .map_err(|e| StorageError::Other(e.to_string()))?;
         // Create index tables
         for idx in E::indexes() {
-            txn.create_table(idx.table_def.clone())
+            txn.open_table_with_flags(idx.table_def.clone(), redb::TableFlags::CREATE)
                 .map_err(|e| StorageError::Other(e.to_string()))?;
         }
         txn.commit()
@@ -96,7 +96,7 @@ impl KuramotoDb {
         &self,
         cascade: bool,
     ) -> Result<(), StorageError> {
-        let txn = self
+        let mut txn = self
             .db
             .begin_write()
             .map_err(|e| StorageError::Other(e.to_string()))?;
@@ -106,6 +106,7 @@ impl KuramotoDb {
             if let Ok(mut t) = txn.open_table(E::table_def().clone()) {
                 let keys: Vec<Vec<u8>> = t
                     .iter()
+                    .into_iter()
                     .filter_map(|r| r.ok().map(|(k, _)| k.value().to_vec()))
                     .collect();
                 for k in keys {
@@ -116,6 +117,7 @@ impl KuramotoDb {
             if let Ok(mut t) = txn.open_table(E::meta_table_def().clone()) {
                 let keys: Vec<Vec<u8>> = t
                     .iter()
+                    .into_iter()
                     .filter_map(|r| r.ok().map(|(k, _)| k.value().to_vec()))
                     .collect();
                 for k in keys {
@@ -127,6 +129,7 @@ impl KuramotoDb {
                 if let Ok(mut t) = txn.open_table(idx.table_def.clone()) {
                     let keys: Vec<Vec<u8>> = t
                         .iter()
+                        .into_iter()
                         .filter_map(|r| r.ok().map(|(k, _)| k.value().to_vec()))
                         .collect();
                     for k in keys {
@@ -136,14 +139,14 @@ impl KuramotoDb {
             }
         }
         // Drop main table
-        txn.drop_table(E::table_def().clone())
+        txn.remove_table(E::table_def().clone())
             .map_err(|e| StorageError::Other(e.to_string()))?;
         // Drop meta table
-        txn.drop_table(E::meta_table_def().clone())
+        txn.remove_table(E::meta_table_def().clone())
             .map_err(|e| StorageError::Other(e.to_string()))?;
         // Drop index tables
         for idx in E::indexes() {
-            txn.drop_table(idx.table_def.clone())
+            txn.remove_table(idx.table_def.clone())
                 .map_err(|e| StorageError::Other(e.to_string()))?;
         }
         txn.commit()
