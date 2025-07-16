@@ -208,9 +208,9 @@ impl KuramotoDb {
                 respond_to: tx,
             })
             .await
-            .map_err(|_| StorageError::Other("Write queue closed".to_string()))?;
+            .map_err(|e| StorageError::Other(format!("Write queue dropped: {}", e)))?;
         rx.await
-            .map_err(|_| StorageError::Other("Write task dropped".to_string()))?
+            .map_err(|e| StorageError::Other(format!("Write task dropped: {}", e)))?
     }
 
     pub async fn get_data<E: StorageEntity>(&self, key: &[u8]) -> Result<E, StorageError> {
@@ -295,10 +295,10 @@ impl KuramotoDb {
                 respond_to: tx,
             })
             .await
-            .map_err(|_| StorageError::Other("Write queue closed".to_string()))?;
+            .map_err(|e| StorageError::Other(format!("Write queue dropped: {}", e)))?;
 
         rx.await
-            .map_err(|_| StorageError::Other("Write task dropped".to_string()))?
+            .map_err(|e| StorageError::Other(format!("Write task dropped: {}", e)))?
     }
 
     // ----------- Raw public handlers --------------
@@ -322,11 +322,11 @@ impl KuramotoDb {
         self.write_tx
             .send(req)
             .await
-            .map_err(|_| StorageError::Other("Write queue closed".into()))?;
+            .map_err(|e| StorageError::Other(format!("Write queue dropped: {}", e)))?;
 
         // await the background writer’s result
         rx.await
-            .map_err(|_| StorageError::Other("Write task dropped".into()))?
+            .map_err(|e| StorageError::Other(format!("Write task dropped: {}", e)))?
     }
 
     // ----------- Internal handler --------------
