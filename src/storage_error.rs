@@ -13,6 +13,21 @@ pub enum StorageError {
     Other(String),
 }
 
+impl Clone for StorageError {
+    fn clone(&self) -> Self {
+        match self {
+            StorageError::Io(e) => StorageError::Io(std::io::Error::new(e.kind(), e.to_string())),
+            StorageError::NotFound => StorageError::NotFound,
+            StorageError::Bincode(s) => StorageError::Bincode(s.clone()),
+            StorageError::DuplicateIndexKey { index_name } => {
+                StorageError::DuplicateIndexKey { index_name }
+            }
+            StorageError::PutButNoVersionIncrease => StorageError::PutButNoVersionIncrease,
+            StorageError::Other(s) => StorageError::Other(s.clone()),
+        }
+    }
+}
+
 impl std::fmt::Display for StorageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

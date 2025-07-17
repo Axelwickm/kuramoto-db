@@ -353,14 +353,12 @@ impl KuramotoDb {
                     let meta_t = match txn.open_table(*meta_table) {
                         Ok(t) => t,
                         Err(_) => {
-                            let _ = respond_to.send(Err(StorageError::Other(format!(
-                                "Meta table does not exist: {}",
-                                meta_table.name()
-                            ))));
-                            return Err(StorageError::Other(format!(
+                            let error = Err(StorageError::Other(format!(
                                 "Meta table does not exist: {}",
                                 meta_table.name()
                             )));
+                            let _ = respond_to.send(error.clone());
+                            return error;
                         }
                     };
 
@@ -394,14 +392,12 @@ impl KuramotoDb {
                     let mut t = match txn.open_table(*data_table) {
                         Ok(t) => t,
                         Err(_) => {
-                            let _ = respond_to.send(Err(StorageError::Other(format!(
-                                "Data table does not exist: {}",
-                                data_table.name()
-                            ))));
-                            return Err(StorageError::Other(format!(
+                            let error = Err(StorageError::Other(format!(
                                 "Data table does not exist: {}",
                                 data_table.name()
                             )));
+                            let _ = respond_to.send(error.clone());
+                            return error;
                         }
                     };
                     t.insert(&*key, value)
@@ -432,14 +428,12 @@ impl KuramotoDb {
                     let mut t = match txn.open_table(*idx.table) {
                         Ok(t) => t,
                         Err(_) => {
-                            let _ = respond_to.send(Err(StorageError::Other(format!(
-                                "Index table does not exist: {}",
-                                idx.table.name()
-                            ))));
-                            return Err(StorageError::Other(format!(
+                            let error = Err(StorageError::Other(format!(
                                 "Index table does not exist: {}",
                                 idx.table.name()
                             )));
+                            let _ = respond_to.send(error.clone());
+                            return error;
                         }
                     };
 
@@ -448,9 +442,11 @@ impl KuramotoDb {
                         .map_err(|e| StorageError::Other(e.to_string()))?
                     {
                         if existing.value() != idx.value.as_slice() {
-                            return Err(StorageError::DuplicateIndexKey {
+                            let error = Err(StorageError::DuplicateIndexKey {
                                 index_name: idx.table.name(),
                             });
+                            let _ = respond_to.send(error.clone());
+                            return error;
                         }
                     }
 
@@ -463,14 +459,12 @@ impl KuramotoDb {
                     let mut meta_t = match txn.open_table(*meta_table) {
                         Ok(t) => t,
                         Err(_) => {
-                            let _ = respond_to.send(Err(StorageError::Other(format!(
-                                "Meta table does not exist: {}",
-                                meta_table.name()
-                            ))));
-                            return Err(StorageError::Other(format!(
+                            let error = Err(StorageError::Other(format!(
                                 "Meta table does not exist: {}",
                                 meta_table.name()
                             )));
+                            let _ = respond_to.send(error.clone());
+                            return error;
                         }
                     };
                     meta_t

@@ -3,8 +3,8 @@ pub trait Clock: Send + Sync + 'static {
 }
 pub struct SystemClock;
 impl Clock for SystemClock {
+    // Unix apoch time as secs
     fn now(&self) -> u64 {
-        // e.g., UNIX epoch seconds or millis
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
