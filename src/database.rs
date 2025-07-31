@@ -12,6 +12,8 @@ use super::{
 
 pub type StaticTableDef = &'static TableDefinition<'static, &'static [u8], Vec<u8>>;
 
+pub trait Plugin: Send + Sync {}
+
 pub struct IndexPutRequest {
     table: StaticTableDef,
     key: Vec<u8>,   // index key (e.g., email as bytes)
