@@ -4,11 +4,11 @@ use std::sync::Arc;
 use tempfile::tempdir;
 
 use crate::{
+    KuramotoDb, StaticTableDef, WriteRequest,
     clock::Clock,
     region_lock::RegionLock,
-    storage_entity::{IndexSpec, StorageEntity},
+    storage_entity::{IndexCardinality, IndexSpec, StorageEntity},
     storage_error::StorageError,
-    {KuramotoDb, StaticTableDef, WriteRequest},
 };
 
 // ============== Mock clock ==============
@@ -47,14 +47,25 @@ static TEST_META: TableDefinition<'static, &'static [u8], Vec<u8>> =
     TableDefinition::new("test_meta");
 
 static TEST_NAME_INDEX: TableDefinition<'static, &'static [u8], Vec<u8>> =
-    TableDefinition::new("test_name_idx");
+    TableDefinition::new("test_name_idx"); // UNIQUE
 
-// ---------- static slice of specs ----------
-static TEST_INDEXES: &[IndexSpec<TestEntity>] = &[IndexSpec {
-    name: "name",
-    key_fn: |e: &TestEntity| e.name.as_bytes().to_vec(), // index key = name
-    table_def: &TEST_NAME_INDEX,
-}];
+static TEST_VALUE_INDEX: TableDefinition<'static, &'static [u8], Vec<u8>> =
+    TableDefinition::new("test_value_idx"); // NON-UNIQUE
+
+static TEST_INDEXES: &[IndexSpec<TestEntity>] = &[
+    IndexSpec {
+        name: "name",
+        key_fn: |e: &TestEntity| e.name.as_bytes().to_vec(),
+        table_def: &TEST_NAME_INDEX,
+        cardinality: IndexCardinality::Unique,
+    },
+    IndexSpec {
+        name: "value",
+        key_fn: |e: &TestEntity| e.value.to_be_bytes().to_vec(), // many can share same value
+        table_def: &TEST_VALUE_INDEX,
+        cardinality: IndexCardinality::NonUnique,
+    },
+];
 
 impl StorageEntity for TestEntity {
     const STRUCT_VERSION: u8 = 0;
@@ -308,4 +319,58 @@ async fn duplicate_index_rejected() {
     sys.put(a).await.unwrap();
     let err = sys.put(b).await.err().expect("should error");
     matches!(err, StorageError::DuplicateIndexKey { .. });
+}
+
+#[tokio::test]
+async fn duplicate_index_allowed_nonunique() {
+    let dir = tempdir().unwrap();
+    let clock = Arc::new(MockClock::new(0));
+    let sys = KuramotoDb::new(
+        dir.path().join("dup_ok.redb").to_str().unwrap(),
+        clock.clone(),
+    )
+    .await;
+    sys.create_table_and_indexes::<TestEntity>().unwrap();
+
+    // Two different entities share the same "value"
+    let a = TestEntity {
+        id: 10,
+        name: "A".into(),
+        value: 7,
+    };
+    let b = TestEntity {
+        id: 11,
+        name: "B".into(),
+        value: 7,
+    };
+
+    sys.put(a.clone()).await.unwrap();
+    sys.put(b.clone()).await.unwrap(); // should NOT error
+
+    // Range-based lookup should yield both ids
+    let all_main_keys = sys
+        .get_index_all(&TEST_VALUE_INDEX, &7i32.to_be_bytes())
+        .await
+        .unwrap();
+    assert_eq!(all_main_keys.len(), 2);
+    assert!(all_main_keys.contains(&a.id.to_be_bytes().to_vec()));
+    assert!(all_main_keys.contains(&b.id.to_be_bytes().to_vec()));
+
+    // Fetch entities by non-unique index
+    let got = sys
+        .get_by_index_all::<TestEntity>(&TEST_VALUE_INDEX, &7i32.to_be_bytes())
+        .await
+        .unwrap();
+    assert_eq!(got.len(), 2);
+    assert!(got.contains(&a));
+    assert!(got.contains(&b));
+
+    // Deleting one removes only its (idx_key, pk) mapping
+    sys.delete::<TestEntity>(&a.id.to_be_bytes()).await.unwrap();
+    let rest = sys
+        .get_by_index_all::<TestEntity>(&TEST_VALUE_INDEX, &7i32.to_be_bytes())
+        .await
+        .unwrap();
+    assert_eq!(rest.len(), 1);
+    assert_eq!(rest[0], b);
 }

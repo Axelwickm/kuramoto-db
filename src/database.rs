@@ -5,6 +5,8 @@ use redb::{Database, TableDefinition};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::storage_entity::IndexCardinality;
+
 use super::{
     clock::Clock, meta::BlobMeta, region_lock::RegionLock, storage_entity::StorageEntity,
     storage_error::StorageError,
@@ -18,6 +20,7 @@ pub struct IndexPutRequest {
     table: StaticTableDef,
     key: Vec<u8>,   // index key (e.g., email as bytes)
     value: Vec<u8>, // usually the main key (e.g., user_id)
+    unique: bool,
 }
 pub struct IndexRemoveRequest {
     table: StaticTableDef,
@@ -43,6 +46,25 @@ pub enum WriteRequest {
         index_removes: Vec<IndexRemoveRequest>,
         respond_to: oneshot::Sender<Result<(), StorageError>>,
     },
+}
+
+fn encode_nonunique_key(idx_key: &[u8], pk: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(idx_key.len() + 1 + pk.len());
+    out.extend_from_slice(idx_key);
+    out.push(0); // separator
+    out.extend_from_slice(pk); // disambiguator
+    out
+}
+
+fn nonunique_bounds(idx_key: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    // [idx_key • 0x00, idx_key • 0x01) – half-open range
+    let mut lo = Vec::with_capacity(idx_key.len() + 1);
+    lo.extend_from_slice(idx_key);
+    lo.push(0);
+    let mut hi = Vec::with_capacity(idx_key.len() + 1);
+    hi.extend_from_slice(idx_key);
+    hi.push(1);
+    (lo, hi)
 }
 
 pub struct KuramotoDb {
@@ -138,6 +160,44 @@ impl KuramotoDb {
         }
     }
 
+    pub async fn get_index_all(
+        &self,
+        table: StaticTableDef,
+        idx_key: &[u8],
+    ) -> Result<Vec<Vec<u8>>, StorageError> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageError::Other(e.to_string()))?;
+        let table = txn
+            .open_table(table.clone())
+            .map_err(|e| StorageError::Other(e.to_string()))?;
+        let (lo, hi) = nonunique_bounds(idx_key);
+        let mut out = Vec::new();
+        for item in table
+            .range(lo.as_slice()..hi.as_slice())
+            .map_err(|e| StorageError::Other(e.to_string()))?
+        {
+            let (_k, v) = item.map_err(|e| StorageError::Other(e.to_string()))?;
+            out.push(v.value().to_vec());
+        }
+        Ok(out)
+    }
+
+    pub async fn get_by_index_all<E: StorageEntity>(
+        &self,
+        index_table: StaticTableDef,
+        idx_key: &[u8],
+    ) -> Result<Vec<E>, StorageError> {
+        let mut out = Vec::new();
+        for main_key in self.get_index_all(index_table, idx_key).await? {
+            if let Ok(e) = self.get_data::<E>(&main_key).await {
+                out.push(e);
+            }
+        }
+        Ok(out)
+    }
+
     pub async fn put<E: StorageEntity>(&self, entity: E) -> Result<(), StorageError> {
         let (tx, rx) = oneshot::channel();
         let key = entity.primary_key();
@@ -170,28 +230,48 @@ impl KuramotoDb {
                     let old_key = (idx.key_fn)(&old);
                     let new_key = (idx.key_fn)(&entity);
 
+                    // stored keys depend on cardinality
+                    let pk = entity.primary_key();
+                    let old_stored = match idx.cardinality {
+                        IndexCardinality::Unique => old_key.clone(),
+                        IndexCardinality::NonUnique => encode_nonunique_key(&old_key, &pk),
+                    };
+                    let new_stored = match idx.cardinality {
+                        IndexCardinality::Unique => new_key.clone(),
+                        IndexCardinality::NonUnique => encode_nonunique_key(&new_key, &pk),
+                    };
+
                     if old_key != new_key {
                         removes.push(IndexRemoveRequest {
                             table: idx.table_def,
-                            key: old_key,
+                            key: old_stored,
                         });
                         puts.push(IndexPutRequest {
                             table: idx.table_def,
-                            key: new_key,
-                            value: entity.primary_key(),
+                            key: new_stored,
+                            value: pk,
+                            unique: matches!(idx.cardinality, IndexCardinality::Unique),
                         });
                     }
                     (puts, removes)
                 })
         } else {
-            // New insert, insert index
+            let pk = entity.primary_key();
             (
                 E::indexes()
                     .iter()
-                    .map(|idx| IndexPutRequest {
-                        table: idx.table_def,
-                        key: (idx.key_fn)(&entity),
-                        value: entity.primary_key(),
+                    .map(|idx| {
+                        let idx_key = (idx.key_fn)(&entity);
+                        let stored = match idx.cardinality {
+                            IndexCardinality::Unique => idx_key,
+                            IndexCardinality::NonUnique => encode_nonunique_key(&idx_key, &pk),
+                        };
+                        IndexPutRequest {
+                            table: idx.table_def,
+                            key: stored,
+                            value: pk.clone(),
+                            unique: matches!(idx.cardinality, IndexCardinality::Unique),
+                        }
                     })
                     .collect(),
                 Vec::new(),
@@ -279,11 +359,19 @@ impl KuramotoDb {
         };
 
         // Generate index_removes
+        let pk = key.to_vec();
         let index_removes: Vec<IndexRemoveRequest> = E::indexes()
             .iter()
-            .map(|idx| IndexRemoveRequest {
-                table: idx.table_def,
-                key: (idx.key_fn)(&old_entity),
+            .map(|idx| {
+                let raw = (idx.key_fn)(&old_entity);
+                let stored = match idx.cardinality {
+                    IndexCardinality::Unique => raw,
+                    IndexCardinality::NonUnique => encode_nonunique_key(&raw, &pk),
+                };
+                IndexRemoveRequest {
+                    table: idx.table_def,
+                    key: stored,
+                }
             })
             .collect();
 
@@ -439,16 +527,18 @@ impl KuramotoDb {
                         }
                     };
 
-                    if let Some(existing) = t
-                        .get(idx.key.as_slice())
-                        .map_err(|e| StorageError::Other(e.to_string()))?
-                    {
-                        if existing.value() != idx.value.as_slice() {
-                            let error = Err(StorageError::DuplicateIndexKey {
-                                index_name: idx.table.name(),
-                            });
-                            let _ = respond_to.send(error.clone());
-                            return error;
+                    if idx.unique {
+                        if let Some(existing) = t
+                            .get(idx.key.as_slice())
+                            .map_err(|e| StorageError::Other(e.to_string()))?
+                        {
+                            if existing.value() != idx.value.as_slice() {
+                                let error = Err(StorageError::DuplicateIndexKey {
+                                    index_name: idx.table.name(),
+                                });
+                                let _ = respond_to.send(error.clone());
+                                return error;
+                            }
                         }
                     }
 

@@ -4,10 +4,17 @@ use crate::StaticTableDef;
 
 use super::storage_error::StorageError;
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum IndexCardinality {
+    Unique,
+    NonUnique, // allows duplicates
+}
+
 pub struct IndexSpec<T: StorageEntity> {
     pub name: &'static str,
     pub key_fn: fn(&T) -> Vec<u8>,
     pub table_def: StaticTableDef,
+    pub cardinality: IndexCardinality,
 }
 
 pub trait StorageEntity: Encode + Decode<()> + Sized + Send + Sync + 'static {
