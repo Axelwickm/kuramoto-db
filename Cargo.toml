@@ -12,6 +12,7 @@ tokio = { version = "1.43", features = ["rt", "macros", "sync"] }
 
 rand = { version = "0.9.1" }
 getrandom = { version = "0.3.3", features = ["wasm_js"] }
+uuid = "1.17.0"
 
 [features]
 riblt_debug = []

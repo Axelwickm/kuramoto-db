@@ -1,7 +1,7 @@
 pub mod clock;
 pub mod database;
 pub mod meta;
-pub mod plugins;
+pub mod middlewares;
 pub mod region_lock;
 pub mod riblt;
 pub mod storage_entity;

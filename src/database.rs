@@ -5,6 +5,7 @@ use redb::{Database, TableDefinition};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::middlewares::Middleware;
 use crate::storage_entity::IndexCardinality;
 
 use super::{
@@ -71,10 +72,15 @@ pub struct KuramotoDb {
     db: Arc<Database>,
     write_tx: mpsc::Sender<WriteRequest>,
     clock: Arc<dyn Clock>,
+    middlewares: Vec<Arc<dyn Middleware>>,
 }
 
 impl KuramotoDb {
-    pub async fn new(path: &str, clock: Arc<dyn Clock>) -> Arc<Self> {
+    pub async fn new(
+        path: &str,
+        clock: Arc<dyn Clock>,
+        middlewares: Vec<Arc<dyn Middleware>>,
+    ) -> Arc<Self> {
         let db = Database::create(path).unwrap();
         let (write_tx, mut write_rx) = mpsc::channel(100);
         let db_arc = Arc::new(db);
@@ -83,6 +89,7 @@ impl KuramotoDb {
             db: db_arc.clone(),
             write_tx,
             clock,
+            middlewares,
         });
         let sys2 = sys.clone();
         tokio::spawn(async move {
@@ -421,6 +428,11 @@ impl KuramotoDb {
 
     // ----------- Internal handler --------------
     async fn handle_write(&self, req: WriteRequest) -> Result<(), StorageError> {
+        let mut req = req;
+        for m in &self.middlewares {
+            m.before_write(&mut req)?;
+        }
+
         match req {
             WriteRequest::Put {
                 data_table,

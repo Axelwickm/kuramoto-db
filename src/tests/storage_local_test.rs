@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use bincode::{Decode, Encode};
 use redb::TableDefinition;
 use std::sync::Arc;
@@ -6,6 +7,8 @@ use tempfile::tempdir;
 use crate::{
     KuramotoDb, StaticTableDef, WriteRequest,
     clock::Clock,
+    meta::BlobMeta,
+    middlewares::Middleware,
     region_lock::RegionLock,
     storage_entity::{IndexCardinality, IndexSpec, StorageEntity},
     storage_error::StorageError,
@@ -156,7 +159,12 @@ async fn assert_get_by_index<E: StorageEntity + PartialEq + std::fmt::Debug>(
 async fn insert_and_read() {
     let dir = tempdir().unwrap();
     let clock = Arc::new(MockClock::new(1_000));
-    let sys = KuramotoDb::new(dir.path().join("db.redb").to_str().unwrap(), clock.clone()).await;
+    let sys = KuramotoDb::new(
+        dir.path().join("db.redb").to_str().unwrap(),
+        clock.clone(),
+        vec![],
+    )
+    .await;
 
     // Should fail to put before table is created
     let e = TestEntity {
@@ -178,7 +186,12 @@ async fn insert_and_read() {
 async fn overwrite_updates_meta() {
     let dir = tempdir().unwrap();
     let clock = Arc::new(MockClock::new(10));
-    let sys = KuramotoDb::new(dir.path().join("db.redb").to_str().unwrap(), clock.clone()).await;
+    let sys = KuramotoDb::new(
+        dir.path().join("db.redb").to_str().unwrap(),
+        clock.clone(),
+        vec![],
+    )
+    .await;
 
     sys.create_table_and_indexes::<TestEntity>().unwrap();
 
@@ -200,7 +213,12 @@ async fn overwrite_updates_meta() {
 async fn delete_and_undelete() {
     let dir = tempdir().unwrap();
     let clock = Arc::new(MockClock::new(500));
-    let sys = KuramotoDb::new(dir.path().join("db.redb").to_str().unwrap(), clock.clone()).await;
+    let sys = KuramotoDb::new(
+        dir.path().join("db.redb").to_str().unwrap(),
+        clock.clone(),
+        vec![],
+    )
+    .await;
 
     sys.create_table_and_indexes::<TestEntity>().unwrap();
 
@@ -226,6 +244,7 @@ async fn stale_version_rejected() {
     let sys = KuramotoDb::new(
         dir.path().join("stale.redb").to_str().unwrap(),
         clock.clone(),
+        vec![],
     )
     .await;
 
@@ -267,7 +286,12 @@ async fn stale_version_rejected() {
 async fn index_insert_update_delete() {
     let dir = tempdir().unwrap();
     let clock = Arc::new(MockClock::new(0));
-    let sys = KuramotoDb::new(dir.path().join("idx.redb").to_str().unwrap(), clock.clone()).await;
+    let sys = KuramotoDb::new(
+        dir.path().join("idx.redb").to_str().unwrap(),
+        clock.clone(),
+        vec![],
+    )
+    .await;
 
     sys.create_table_and_indexes::<TestEntity>().unwrap();
 
@@ -301,7 +325,12 @@ async fn index_insert_update_delete() {
 async fn duplicate_index_rejected() {
     let dir = tempdir().unwrap();
     let clock = Arc::new(MockClock::new(0));
-    let sys = KuramotoDb::new(dir.path().join("dup.redb").to_str().unwrap(), clock.clone()).await;
+    let sys = KuramotoDb::new(
+        dir.path().join("dup.redb").to_str().unwrap(),
+        clock.clone(),
+        vec![],
+    )
+    .await;
 
     sys.create_table_and_indexes::<TestEntity>().unwrap();
 
@@ -328,6 +357,7 @@ async fn duplicate_index_allowed_nonunique() {
     let sys = KuramotoDb::new(
         dir.path().join("dup_ok.redb").to_str().unwrap(),
         clock.clone(),
+        vec![],
     )
     .await;
     sys.create_table_and_indexes::<TestEntity>().unwrap();
@@ -373,4 +403,66 @@ async fn duplicate_index_allowed_nonunique() {
         .unwrap();
     assert_eq!(rest.len(), 1);
     assert_eq!(rest[0], b);
+}
+
+#[tokio::test]
+async fn middleware_applied_in_order() {
+    // ───── two middle-wares with observable, order-dependent effects ─────
+    struct Add100; // updated_at += 100
+    struct Double; // updated_at *= 2
+
+    impl Middleware for Add100 {
+        fn before_write(&self, req: &mut WriteRequest) -> Result<(), StorageError> {
+            if let WriteRequest::Put { meta, .. } = req {
+                let (mut m, _): (BlobMeta, _) =
+                    bincode::decode_from_slice(meta, bincode::config::standard())
+                        .map_err(|o| StorageError::Bincode(o.to_string()))?;
+                m.updated_at += 100;
+                *meta = bincode::encode_to_vec(m, bincode::config::standard())
+                    .map_err(|o| StorageError::Bincode(o.to_string()))?;
+            }
+            Ok(())
+        }
+    }
+
+    impl Middleware for Double {
+        fn before_write(&self, req: &mut WriteRequest) -> Result<(), StorageError> {
+            if let WriteRequest::Put { meta, .. } = req {
+                let (mut m, _): (BlobMeta, _) =
+                    bincode::decode_from_slice(meta, bincode::config::standard())
+                        .map_err(|o| StorageError::Bincode(o.to_string()))?;
+                m.updated_at *= 2;
+                *meta = bincode::encode_to_vec(m, bincode::config::standard())
+                    .map_err(|o| StorageError::Bincode(o.to_string()))?;
+            }
+            Ok(())
+        }
+    }
+
+    // ───── assemble DB with middle-wares in a specific order ─────
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(MockClock::new(100)); // initial now = 100
+
+    let db = KuramotoDb::new(
+        dir.path().join("order.redb").to_str().unwrap(),
+        clock.clone(),
+        vec![Arc::new(Add100), Arc::new(Double)], // <- order!
+    )
+    .await;
+    db.create_table_and_indexes::<TestEntity>().unwrap();
+
+    // ───── put one entity ─────
+    let e = TestEntity {
+        id: 1,
+        name: "O".into(),
+        value: 9,
+    };
+    db.put(e.clone()).await.unwrap();
+
+    // ───── meta.updated_at should be (100 + 100) * 2 = 400 ─────
+    let meta = db
+        .get_meta::<TestEntity>(&1u64.to_be_bytes())
+        .await
+        .unwrap();
+    assert_eq!(meta.updated_at, 400);
 }
