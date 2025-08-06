@@ -349,6 +349,175 @@ impl KuramotoDb {
         Ok((data, meta))
     }
 
+    // ------------  RANGE API  ------------
+    /// Return up to `limit` entities whose **primary key** ∈ `[start, end)`.
+    /// Pass `None` to stream the full range.
+    pub async fn range_by_pk<E: StorageEntity>(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        limit: Option<usize>,
+    ) -> Result<Vec<E>, StorageError> {
+        // 1) collect raw bytes inside one read-txn
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageError::Other(e.to_string()))?;
+        let table = txn
+            .open_table(E::table_def().clone())
+            .map_err(|e| StorageError::Other(e.to_string()))?;
+
+        let mut rows: Vec<Vec<u8>> = Vec::new();
+        for r in table
+            .range(start..end)
+            .map_err(|e| StorageError::Other(e.to_string()))?
+        {
+            let (_k, v) = r.map_err(|e| StorageError::Other(e.to_string()))?;
+            rows.push(v.value().to_vec());
+            if limit.map_or(false, |n| rows.len() >= n) {
+                break;
+            }
+        }
+        drop(table);
+        drop(txn); // ensure all borrows dead before decoding
+
+        // 2) decode
+        rows.into_iter()
+            .map(|bytes| E::load_and_migrate(&bytes))
+            .collect()
+    }
+
+    /// Return up to `limit` entities whose **index key** ∈ `[start, end)`.
+    ///
+    /// Works for both unique and non-unique indexes. For a *non-unique*
+    /// lookup of a single key you’d normally pass the low/high bounds you
+    /// already use elsewhere (`nonunique_bounds(&idx_key)`).
+    pub async fn range_by_index<E: StorageEntity>(
+        &self,
+        index_table: StaticTableDef,
+        start_idx_key: &[u8],
+        end_idx_key: &[u8],
+        limit: Option<usize>,
+    ) -> Result<Vec<E>, StorageError> {
+        // (a) gather PKs
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageError::Other(e.to_string()))?;
+        let idx = txn
+            .open_table(index_table.clone())
+            .map_err(|e| StorageError::Other(e.to_string()))?;
+
+        let mut pks: Vec<Vec<u8>> = Vec::new();
+        for r in idx
+            .range(start_idx_key..end_idx_key)
+            .map_err(|e| StorageError::Other(e.to_string()))?
+        {
+            let (_k, v) = r.map_err(|e| StorageError::Other(e.to_string()))?;
+            pks.push(v.value().to_vec());
+            if limit.map_or(false, |n| pks.len() >= n) {
+                break;
+            }
+        }
+        drop(idx);
+        drop(txn);
+
+        // (b) load entities
+        let mut out = Vec::with_capacity(pks.len());
+        for pk in pks {
+            if let Ok(e) = self.get_data::<E>(&pk).await {
+                out.push(e);
+            }
+        }
+        Ok(out)
+    }
+
+    pub async fn range_with_meta_by_pk<E: StorageEntity>(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        limit: Option<usize>,
+    ) -> Result<Vec<(E, BlobMeta)>, StorageError> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageError::Other(e.to_string()))?;
+        let data_t = txn
+            .open_table(E::table_def().clone())
+            .map_err(|e| StorageError::Other(e.to_string()))?;
+        let meta_t = txn
+            .open_table(E::meta_table_def().clone())
+            .map_err(|e| StorageError::Other(e.to_string()))?;
+
+        let mut out = Vec::new();
+        for row in data_t
+            .range(start..end)
+            .map_err(|e| StorageError::Other(e.to_string()))?
+        {
+            let (k, v) = row.map_err(|e| StorageError::Other(e.to_string()))?;
+
+            // decode entity
+            let entity = E::load_and_migrate(v.value().as_slice())?;
+
+            // fetch and decode meta
+            let meta_raw = meta_t
+                .get(k.value())
+                .map_err(|e| StorageError::Other(e.to_string()))?
+                .expect("meta missing")
+                .value();
+            let (meta, _) =
+                bincode::decode_from_slice::<BlobMeta, _>(&meta_raw, bincode::config::standard())
+                    .map_err(|e| StorageError::Bincode(e.to_string()))?;
+
+            out.push((entity, meta));
+            if limit.map_or(false, |n| out.len() >= n) {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Return up to `limit` **(entity, meta)** pairs whose *index* key ∈ `[start,end)`.
+    pub async fn range_with_meta_by_index<E: StorageEntity>(
+        &self,
+        index_table: StaticTableDef,
+        start_idx_key: &[u8],
+        end_idx_key: &[u8],
+        limit: Option<usize>,
+    ) -> Result<Vec<(E, BlobMeta)>, StorageError> {
+        // (1) collect PKs first
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageError::Other(e.to_string()))?;
+        let idx = txn
+            .open_table(index_table.clone())
+            .map_err(|e| StorageError::Other(e.to_string()))?;
+
+        let mut pks = Vec::new();
+        for row in idx
+            .range(start_idx_key..end_idx_key)
+            .map_err(|e| StorageError::Other(e.to_string()))?
+        {
+            let (_k, v) = row.map_err(|e| StorageError::Other(e.to_string()))?;
+            pks.push(v.value().to_vec());
+            if limit.map_or(false, |n| pks.len() >= n) {
+                break;
+            }
+        }
+        drop(idx);
+        drop(txn);
+
+        // (2) resolve (entity,meta) for each PK
+        let mut out = Vec::with_capacity(pks.len());
+        for pk in pks {
+            let e = self.get_data::<E>(&pk).await?;
+            let m = self.get_meta::<E>(&pk).await?;
+            out.push((e, m));
+        }
+        Ok(out)
+    }
+
     pub async fn delete<E: StorageEntity>(&self, key: &[u8]) -> Result<(), StorageError> {
         let (tx, rx) = oneshot::channel();
         let now = self.clock.now();

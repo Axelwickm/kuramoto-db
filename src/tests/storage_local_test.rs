@@ -466,3 +466,140 @@ async fn middleware_applied_in_order() {
         .unwrap();
     assert_eq!(meta.updated_at, 400);
 }
+
+// ───────── RANGE HELPERS: one test per public function ──────────────────────
+
+#[tokio::test]
+async fn range_by_pk_basic() {
+    let dir = tempdir().unwrap();
+    let db = KuramotoDb::new(
+        dir.path().join("pk.redb").to_str().unwrap(),
+        Arc::new(MockClock::new(0)),
+        vec![],
+    )
+    .await;
+    db.create_table_and_indexes::<TestEntity>().unwrap();
+
+    // ids 1-3
+    for i in 1..=3 {
+        db.put(TestEntity {
+            id: i,
+            name: (b'A' + i as u8 - 1).to_string(),
+            value: i as i32,
+        })
+        .await
+        .unwrap();
+    }
+
+    let got = db
+        .range_by_pk::<TestEntity>(&2u64.to_be_bytes(), &4u64.to_be_bytes(), None)
+        .await
+        .unwrap();
+    assert_eq!(got.iter().map(|e| e.id).collect::<Vec<_>>(), vec![2, 3]);
+}
+
+#[tokio::test]
+async fn range_by_index_basic() {
+    let dir = tempdir().unwrap();
+    let db = KuramotoDb::new(
+        dir.path().join("idx.redb").to_str().unwrap(),
+        Arc::new(MockClock::new(0)),
+        vec![],
+    )
+    .await;
+    db.create_table_and_indexes::<TestEntity>().unwrap();
+
+    for (id, name) in [(1, "A"), (2, "B"), (3, "C")] {
+        db.put(TestEntity {
+            id,
+            name: name.into(),
+            value: 0,
+        })
+        .await
+        .unwrap();
+    }
+
+    let got = db
+        .range_by_index::<TestEntity>(&TEST_NAME_INDEX, b"B", b"D", None)
+        .await
+        .unwrap();
+    assert_eq!(
+        got.iter().map(|e| e.name.clone()).collect::<Vec<_>>(),
+        vec!["B", "C"]
+    );
+}
+
+#[tokio::test]
+async fn range_with_meta_by_pk_basic() {
+    let dir = tempdir().unwrap();
+    let db = KuramotoDb::new(
+        dir.path().join("pk_meta.redb").to_str().unwrap(),
+        Arc::new(MockClock::new(123)),
+        vec![],
+    )
+    .await;
+    db.create_table_and_indexes::<TestEntity>().unwrap();
+
+    db.put(TestEntity {
+        id: 10,
+        name: "X".into(),
+        value: 1,
+    })
+    .await
+    .unwrap();
+    db.put(TestEntity {
+        id: 11,
+        name: "Y".into(),
+        value: 1,
+    })
+    .await
+    .unwrap();
+
+    let got = db
+        .range_with_meta_by_pk::<TestEntity>(&10u64.to_be_bytes(), &12u64.to_be_bytes(), None)
+        .await
+        .unwrap();
+    assert_eq!(got.len(), 2);
+    assert!(
+        got.iter()
+            .all(|(_, m)| m.version == 0 && m.created_at == 123)
+    );
+}
+
+#[tokio::test]
+async fn range_with_meta_by_index_basic() {
+    let dir = tempdir().unwrap();
+    let db = KuramotoDb::new(
+        dir.path().join("idx_meta.redb").to_str().unwrap(),
+        Arc::new(MockClock::new(999)),
+        vec![],
+    )
+    .await;
+    db.create_table_and_indexes::<TestEntity>().unwrap();
+
+    let rows = [
+        TestEntity {
+            id: 5,
+            name: "K".into(),
+            value: 2,
+        },
+        TestEntity {
+            id: 6,
+            name: "L".into(),
+            value: 2,
+        },
+    ];
+    for r in &rows {
+        db.put(r.clone()).await.unwrap();
+    }
+
+    let got = db
+        .range_with_meta_by_index::<TestEntity>(&TEST_NAME_INDEX, b"K", b"M", None)
+        .await
+        .unwrap();
+    assert_eq!(got.len(), 2);
+    for ((e, meta), expected) in got.iter().zip(rows.iter()) {
+        assert_eq!(e, expected);
+        assert_eq!(meta.created_at, 999);
+    }
+}
