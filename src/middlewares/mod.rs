@@ -1,4 +1,4 @@
-//pub mod harmonizer;
+pub mod harmonizer;
 
 use crate::{WriteRequest, storage_error::StorageError};
 

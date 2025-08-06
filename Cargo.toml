@@ -5,14 +5,21 @@ edition = "2024"
 
 [dependencies]
 bincode = "2.0"
-redb = "2.6.0"
+redb = "2.6.2"
 async-trait = "0.1.88"
 tempfile = "3.20.0"
-tokio = { version = "1.43", features = ["rt", "macros", "sync"] }
+tokio = { version = "1.43", features = [
+  "rt-multi-thread",
+  "rt",
+  "macros",
+  "sync",
+] }
+
 
 rand = { version = "0.9.1" }
 getrandom = { version = "0.3.3", features = ["wasm_js"] }
-uuid = "1.17.0"
+uuid = { version = "1.17", features = ["v4"] }
+smallvec = { version = "1.15.1", features = ["impl_bincode"] }
 
 [features]
 riblt_debug = []

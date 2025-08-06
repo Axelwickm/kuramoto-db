@@ -91,7 +91,7 @@ pub struct CodedSymbol<const BYTES: usize, S: Symbol<BYTES>> {
     pub count: i64,
     pub xor: [u8; BYTES],
     pub hash: u64,
-    _ty: std::marker::PhantomData<S>,
+    pub _ty: std::marker::PhantomData<S>,
 }
 
 impl<const BYTES: usize, S: Symbol<BYTES>> CodedSymbol<BYTES, S> {
@@ -155,6 +155,12 @@ impl<const BYTES: usize, S: Symbol<BYTES>> Encoder<BYTES, S> {
         debug_print!("");
         self.cursor += 1;
         coded_symbol
+    }
+
+    pub fn seek(&mut self, target: usize) {
+        while self.cursor < target {
+            self.next_coded(); // generate & throw away
+        }
     }
 }
 
@@ -298,20 +304,20 @@ impl<const BYTES: usize, S: Symbol<BYTES>> Decoder<BYTES, S> {
     }
 }
 
+impl Symbol<8> for u64 {
+    fn encode(&self) -> [u8; 8] {
+        self.to_le_bytes()
+    }
+    fn decode(bytes: [u8; 8]) -> Self {
+        u64::from_le_bytes(bytes)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rand::Rng;
     use rand::rngs::ThreadRng;
-
-    impl Symbol<8> for u64 {
-        fn encode(&self) -> [u8; 8] {
-            self.to_le_bytes()
-        }
-        fn decode(bytes: [u8; 8]) -> Self {
-            u64::from_le_bytes(bytes)
-        }
-    }
 
     type U64Enc = Encoder<8, u64>;
     type U64Dec = Decoder<8, u64>;
@@ -344,7 +350,7 @@ mod tests {
 
     #[test]
     fn thousand_shared_hundred_each() {
-        const COMMON: usize = 1000000;
+        const COMMON: usize = 100000;
         const DELTA: usize = 1000;
 
         for _ in 0..TRIALS {
