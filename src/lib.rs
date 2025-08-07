@@ -7,6 +7,7 @@ pub mod storage_entity;
 pub mod storage_error;
 pub mod tables;
 pub use database::*;
+pub mod uuid_bytes;
 
 pub use redb::TableDefinition;
 

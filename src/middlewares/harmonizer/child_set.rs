@@ -1,31 +1,21 @@
-//! Rateless IBLT *ChildSet* – fixed-size chunks, limited persistence.
+//! Rateless IBLT *ChildSet* – fixed‑size chunks, limited persistence.
 
 use bincode::{Decode, Encode};
 use redb::TableDefinition;
-use uuid::Uuid;
+use uuid::Uuid; // only used inside tests
 
 use crate::{
     KuramotoDb, StaticTableDef,
     middlewares::harmonizer::riblt::{CodedSymbol, Encoder, Symbol},
     storage_entity::{IndexSpec, StorageEntity},
     storage_error::StorageError,
+    uuid_bytes::UuidBytes,
 };
 
 /*──────────────────────────────────── glue impls ────────────────*/
-
 use bincode::de::Decoder as BinDecoder;
 use bincode::enc::Encoder as BinEncoder;
 use bincode::error::{DecodeError, EncodeError};
-
-#[inline]
-fn encode_uuid<E: BinEncoder>(u: &Uuid, e: &mut E) -> Result<(), EncodeError> {
-    (*u.as_bytes()).encode(e)
-}
-#[inline]
-fn decode_uuid<D: BinDecoder<Context = ()>>(d: &mut D) -> Result<Uuid, DecodeError> {
-    let raw: [u8; 16] = <[u8; 16] as Decode<()>>::decode(d)?;
-    Ok(Uuid::from_bytes(raw))
-}
 
 /*──────────────────────────── constants ─────────────────────────*/
 
@@ -52,15 +42,15 @@ pub static AVAIL_DIG_CHUNK_META_TBL: StaticTableDef =
 
 #[derive(Clone, Debug)]
 pub struct Child {
-    pub parent: Uuid,
+    pub parent: UuidBytes,
     pub ordinal: u32,
     pub child_id: Sym,
 }
 
-// manual encode/decode (avoid orphan rule on `Uuid`)
+// manual encode/decode (newtype avoids orphan‑rule problems)
 impl Encode for Child {
     fn encode<E: BinEncoder>(&self, e: &mut E) -> Result<(), EncodeError> {
-        encode_uuid(&self.parent, e)?;
+        self.parent.encode(e)?;
         self.ordinal.encode(e)?;
         Encode::encode(&self.child_id, e)
     }
@@ -68,7 +58,7 @@ impl Encode for Child {
 impl Decode<()> for Child {
     fn decode<D: BinDecoder<Context = ()>>(d: &mut D) -> Result<Self, DecodeError> {
         Ok(Self {
-            parent: decode_uuid(d)?,
+            parent: UuidBytes::decode(d)?,
             ordinal: <u32 as Decode<()>>::decode(d)?,
             child_id: <u64 as Decode<()>>::decode(d)?,
         })
@@ -77,17 +67,20 @@ impl Decode<()> for Child {
 
 impl StorageEntity for Child {
     const STRUCT_VERSION: u8 = 0;
+
     fn primary_key(&self) -> Vec<u8> {
         let mut k = self.parent.as_bytes().to_vec();
         k.extend_from_slice(&self.ordinal.to_le_bytes());
         k
     }
+
     fn table_def() -> StaticTableDef {
         AVAIL_CHILDREN_TBL
     }
     fn meta_table_def() -> StaticTableDef {
         AVAIL_CHILDREN_META_TBL
     }
+
     fn load_and_migrate(src: &[u8]) -> Result<Self, StorageError> {
         bincode::decode_from_slice(
             src.get(1..).unwrap_or_default(),
@@ -96,6 +89,7 @@ impl StorageEntity for Child {
         .map(|(v, _)| v)
         .map_err(|e| StorageError::Bincode(e.to_string()))
     }
+
     fn indexes() -> &'static [IndexSpec<Self>] {
         &[]
     }
@@ -105,14 +99,14 @@ impl StorageEntity for Child {
 
 #[derive(Clone, Debug)]
 pub struct DigestChunk {
-    pub parent: Uuid,
+    pub parent: UuidBytes,
     pub chunk_no: u32,
     pub bytes: Vec<u8>, // encoded Vec<Cell>
 }
 
 impl Encode for DigestChunk {
     fn encode<E: BinEncoder>(&self, e: &mut E) -> Result<(), EncodeError> {
-        encode_uuid(&self.parent, e)?;
+        self.parent.encode(e)?;
         self.chunk_no.encode(e)?;
         self.bytes.encode(e)
     }
@@ -120,7 +114,7 @@ impl Encode for DigestChunk {
 impl Decode<()> for DigestChunk {
     fn decode<D: BinDecoder<Context = ()>>(d: &mut D) -> Result<Self, DecodeError> {
         Ok(Self {
-            parent: decode_uuid(d)?,
+            parent: UuidBytes::decode(d)?,
             chunk_no: <u32 as Decode<()>>::decode(d)?,
             bytes: Vec::<u8>::decode(d)?,
         })
@@ -129,17 +123,20 @@ impl Decode<()> for DigestChunk {
 
 impl StorageEntity for DigestChunk {
     const STRUCT_VERSION: u8 = 0;
+
     fn primary_key(&self) -> Vec<u8> {
         let mut k = self.parent.as_bytes().to_vec();
         k.extend_from_slice(&self.chunk_no.to_le_bytes());
         k
     }
+
     fn table_def() -> StaticTableDef {
         AVAIL_DIG_CHUNK_TBL
     }
     fn meta_table_def() -> StaticTableDef {
         AVAIL_DIG_CHUNK_META_TBL
     }
+
     fn load_and_migrate(src: &[u8]) -> Result<Self, StorageError> {
         bincode::decode_from_slice(
             src.get(1..).unwrap_or_default(),
@@ -148,6 +145,7 @@ impl StorageEntity for DigestChunk {
         .map(|(v, _)| v)
         .map_err(|e| StorageError::Bincode(e.to_string()))
     }
+
     fn indexes() -> &'static [IndexSpec<Self>] {
         &[]
     }
@@ -173,7 +171,7 @@ impl Decode<()> for Cell {
     }
 }
 
-/*──────────────── prefix-scan helper ───────────────────────────*/
+/*──────────────── prefix‑scan helper ───────────────────────────*/
 
 async fn scan_prefix<E: StorageEntity>(
     db: &KuramotoDb,
@@ -186,14 +184,15 @@ async fn scan_prefix<E: StorageEntity>(
 
 /*────────────────────────── ChildSet ───────────────────────────*/
 
+#[derive(Clone, Debug, Encode, Decode)]
 pub struct ChildSet {
-    parent: Uuid,
+    parent: UuidBytes,
     children: Vec<Sym>,
 }
 
 impl ChildSet {
     /* open ------------------------------------------------------*/
-    pub async fn open(db: &KuramotoDb, parent: Uuid) -> Result<Self, StorageError> {
+    pub async fn open(db: &KuramotoDb, parent: UuidBytes) -> Result<Self, StorageError> {
         let rows = scan_prefix::<Child>(db, parent.as_bytes()).await?;
         Ok(Self {
             parent,
@@ -255,7 +254,7 @@ impl ChildSet {
             return Ok(vec_cells[offset].clone());
         }
 
-        // ── 2️⃣ on-the-fly stream beyond persisted window
+        // ── 2️⃣ on‑the‑fly stream beyond persisted window
         let mut enc = Enc::new(&self.children);
         enc.seek(idx);
         Ok(enc.next_coded())
@@ -297,7 +296,7 @@ impl ChildSet {
 
     async fn store_chunk(
         db: &KuramotoDb,
-        parent: Uuid,
+        parent: UuidBytes,
         no: u32,
         cells: &[Cell],
     ) -> Result<(), StorageError> {
@@ -356,7 +355,7 @@ mod tests {
     /*──────── serialisation sanity check ────────────────*/
     #[test]
     fn serial_roundtrip() {
-        let parent = Uuid::new_v4();
+        let parent = UuidBytes::new();
         let child = Child {
             parent,
             ordinal: 7,
@@ -378,7 +377,7 @@ mod tests {
         db.create_table_and_indexes::<DigestChunk>().unwrap();
 
         rt.block_on(async {
-            let parent = Uuid::new_v4();
+            let parent = UuidBytes::new();
             let mut cs = ChildSet::open(&db, parent).await.unwrap();
             cs.add_child(&db, 10).await.unwrap();
             cs.add_child(&db, 11).await.unwrap();
@@ -402,11 +401,10 @@ mod tests {
         db.create_table_and_indexes::<DigestChunk>().unwrap();
 
         rt.block_on(async {
-            let parent = Uuid::new_v4();
             let mut rng = rand::rng();
             let kids: Vec<u64> = (0..50).map(|_| rng.random()).collect();
 
-            let mut cs = ChildSet::open(&db, parent).await.unwrap();
+            let mut cs = ChildSet::open(&db, UuidBytes::new()).await.unwrap();
             for k in &kids {
                 cs.add_child(&db, *k).await.unwrap();
             }
