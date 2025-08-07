@@ -45,10 +45,16 @@ impl RangeCube {
         j == other.dims.len() // no missing dims in `other`
     }
 
-    /// Intersection of two cubes.
-    /// * If they overlap, returns `Some(cube)` whose bounds are the tight overlap.
-    /// * If they are disjoint, returns `None`.
+    /// Fast axis-aligned intersection.
+    /// Returns `None` if the cubes are disjoint; otherwise returns the tightest
+    /// cube that lies inside **both** inputs.
     pub fn intersect(&self, other: &RangeCube) -> Option<RangeCube> {
+        // Early-reject if either dims list is empty and the other has a
+        // disjoint bound on at least one axis.  We’ll detect that while
+        // scanning, so no extra work here.
+
+        // Pre-allocate only if we know there *is* an overlap.
+        // We accumulate mins/maxs lazily in two small stacks.
         let mut out_dims = SmallVec::<[TableHash; 4]>::new();
         let mut out_mins = SmallVec::<[Vec<u8>; 4]>::new();
         let mut out_maxs = SmallVec::<[Vec<u8>; 4]>::new();
@@ -56,47 +62,48 @@ impl RangeCube {
         let mut i = 0;
         let mut j = 0;
 
-        // walk two sorted dim-lists
+        // Merge-walk the two sorted dim lists
         while i < self.dims.len() || j < other.dims.len() {
             match (self.dims.get(i), other.dims.get(j)) {
                 (Some(da), Some(db)) => match da.hash.cmp(&db.hash) {
                     Ordering::Less => {
-                        // dim present only in self → take self's bounds
+                        // Only `self` constrains this axis.
                         out_dims.push(*da);
                         out_mins.push(self.mins[i].clone());
                         out_maxs.push(self.maxs[i].clone());
                         i += 1;
                     }
                     Ordering::Greater => {
-                        // dim present only in other → take other's bounds
+                        // Only `other` constrains this axis.
                         out_dims.push(*db);
                         out_mins.push(other.mins[j].clone());
                         out_maxs.push(other.maxs[j].clone());
                         j += 1;
                     }
                     Ordering::Equal => {
-                        // constrained in both: intersect ranges
-                        let lo = max(&self.mins[i], &other.mins[j]).clone();
-                        let hi = min(&self.maxs[i], &other.maxs[j]).clone();
+                        // Both constrain → tighten to overlap.
+                        let lo = std::cmp::max(&self.mins[i], &other.mins[j]);
+                        let hi = std::cmp::min(&self.maxs[i], &other.maxs[j]);
                         if lo > hi {
-                            return None; // disjoint on this axis
+                            // Disjoint on this axis → whole cubes are disjoint
+                            return None;
                         }
                         out_dims.push(*da);
-                        out_mins.push(lo);
-                        out_maxs.push(hi);
+                        out_mins.push(lo.clone());
+                        out_maxs.push(hi.clone());
                         i += 1;
                         j += 1;
                     }
                 },
                 (Some(_), None) => {
-                    // remaining dims only in self
+                    // Remaining dims only in `self`
                     out_dims.push(self.dims[i]);
                     out_mins.push(self.mins[i].clone());
                     out_maxs.push(self.maxs[i].clone());
                     i += 1;
                 }
                 (None, Some(_)) => {
-                    // remaining dims only in other
+                    // Remaining dims only in `other`
                     out_dims.push(other.dims[j]);
                     out_mins.push(other.mins[j].clone());
                     out_maxs.push(other.maxs[j].clone());
