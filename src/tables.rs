@@ -16,7 +16,7 @@ pub fn stable_hash(s: &str) -> u64 {
     hash
 }
 
-#[derive(Copy, Clone, Debug, Encode, Decode)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct TableHash {
     pub hash: u64,
 }

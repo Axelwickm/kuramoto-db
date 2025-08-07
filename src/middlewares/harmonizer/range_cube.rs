@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::cmp::{max, min};
 
 use bincode::{Decode, Encode};
 use smallvec::SmallVec;
@@ -14,6 +15,11 @@ pub struct RangeCube {
 }
 
 impl RangeCube {
+    #[inline]
+    pub fn overlaps(&self, other: &RangeCube) -> bool {
+        self.intersect(other).is_some()
+    }
+
     /// Assumes `dims` are sorted ascending (enforced on constructor)
     pub fn contains(&self, other: &RangeCube) -> bool {
         // walk two sorted lists in O(N+M)
@@ -37,6 +43,74 @@ impl RangeCube {
             }
         }
         j == other.dims.len() // no missing dims in `other`
+    }
+
+    /// Intersection of two cubes.
+    /// * If they overlap, returns `Some(cube)` whose bounds are the tight overlap.
+    /// * If they are disjoint, returns `None`.
+    pub fn intersect(&self, other: &RangeCube) -> Option<RangeCube> {
+        let mut out_dims = SmallVec::<[TableHash; 4]>::new();
+        let mut out_mins = SmallVec::<[Vec<u8>; 4]>::new();
+        let mut out_maxs = SmallVec::<[Vec<u8>; 4]>::new();
+
+        let mut i = 0;
+        let mut j = 0;
+
+        // walk two sorted dim-lists
+        while i < self.dims.len() || j < other.dims.len() {
+            match (self.dims.get(i), other.dims.get(j)) {
+                (Some(da), Some(db)) => match da.hash.cmp(&db.hash) {
+                    Ordering::Less => {
+                        // dim present only in self → take self's bounds
+                        out_dims.push(*da);
+                        out_mins.push(self.mins[i].clone());
+                        out_maxs.push(self.maxs[i].clone());
+                        i += 1;
+                    }
+                    Ordering::Greater => {
+                        // dim present only in other → take other's bounds
+                        out_dims.push(*db);
+                        out_mins.push(other.mins[j].clone());
+                        out_maxs.push(other.maxs[j].clone());
+                        j += 1;
+                    }
+                    Ordering::Equal => {
+                        // constrained in both: intersect ranges
+                        let lo = max(&self.mins[i], &other.mins[j]).clone();
+                        let hi = min(&self.maxs[i], &other.maxs[j]).clone();
+                        if lo > hi {
+                            return None; // disjoint on this axis
+                        }
+                        out_dims.push(*da);
+                        out_mins.push(lo);
+                        out_maxs.push(hi);
+                        i += 1;
+                        j += 1;
+                    }
+                },
+                (Some(_), None) => {
+                    // remaining dims only in self
+                    out_dims.push(self.dims[i]);
+                    out_mins.push(self.mins[i].clone());
+                    out_maxs.push(self.maxs[i].clone());
+                    i += 1;
+                }
+                (None, Some(_)) => {
+                    // remaining dims only in other
+                    out_dims.push(other.dims[j]);
+                    out_mins.push(other.mins[j].clone());
+                    out_maxs.push(other.maxs[j].clone());
+                    j += 1;
+                }
+                (None, None) => unreachable!(),
+            }
+        }
+
+        Some(RangeCube {
+            dims: out_dims,
+            mins: out_mins,
+            maxs: out_maxs,
+        })
     }
 }
 
@@ -169,5 +243,79 @@ mod tests {
         };
 
         assert!(big.contains(&unconstrained));
+    }
+
+    #[test]
+    fn overlaps_and_intersect_basics() {
+        let a = RangeCube {
+            dims: smallvec![hash(1)],
+            mins: smallvec![b"a".to_vec()],
+            maxs: smallvec![b"m".to_vec()],
+        };
+        let b = RangeCube {
+            dims: smallvec![hash(1)],
+            mins: smallvec![b"h".to_vec()],
+            maxs: smallvec![b"z".to_vec()],
+        };
+        // overlap
+        assert!(a.overlaps(&b));
+
+        let inter = a.intersect(&b).unwrap();
+        let expected: SmallVec<[TableHash; 4]> = smallvec![hash(1)];
+        assert_eq!(inter.dims, expected);
+        assert_eq!(inter.mins[0], b"h".to_vec());
+        assert_eq!(inter.maxs[0], b"m".to_vec());
+    }
+
+    #[test]
+    fn disjoint_on_one_axis() {
+        let a = RangeCube {
+            dims: smallvec![hash(1)],
+            mins: smallvec![b"a".to_vec()],
+            maxs: smallvec![b"f".to_vec()],
+        };
+        let b = RangeCube {
+            dims: smallvec![hash(1)],
+            mins: smallvec![b"g".to_vec()],
+            maxs: smallvec![b"k".to_vec()],
+        };
+        assert!(!a.overlaps(&b));
+        assert!(a.intersect(&b).is_none());
+    }
+
+    #[test]
+    fn unconstrained_dim_in_other() {
+        // self constrains dim1, other constrains dim2
+        let self_cube = RangeCube {
+            dims: smallvec![hash(1)],
+            mins: smallvec![b"a".to_vec()],
+            maxs: smallvec![b"z".to_vec()],
+        };
+        let other_cube = RangeCube {
+            dims: smallvec![hash(2)],
+            mins: smallvec![b"c".to_vec()],
+            maxs: smallvec![b"d".to_vec()],
+        };
+
+        // They overlap because each cube is unbounded on the other's axis.
+        assert!(self_cube.overlaps(&other_cube));
+
+        let inter = self_cube.intersect(&other_cube).unwrap();
+        // Intersection constrains both axes.
+        assert_eq!(inter.dims.len(), 2);
+    }
+
+    #[test]
+    fn identical_cubes_intersect_to_self() {
+        let c = RangeCube {
+            dims: smallvec![hash(1), hash(2)],
+            mins: smallvec![b"a".to_vec(), b"m".to_vec()],
+            maxs: smallvec![b"z".to_vec(), b"z".to_vec()],
+        };
+        let d = c.clone();
+        let inter = c.intersect(&d).unwrap();
+        assert_eq!(inter.dims, c.dims);
+        assert_eq!(inter.mins, c.mins);
+        assert_eq!(inter.maxs, c.maxs);
     }
 }
