@@ -1,11 +1,10 @@
 use async_recursion::async_recursion;
 use async_trait::async_trait;
 use bincode::{Decode, Encode};
-use redb::{TableDefinition, TableHandle, WriteTransaction};
+use redb::{TableHandle, WriteTransaction};
 use std::{
     collections::{HashSet, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
-    sync::Arc,
 };
 
 use smallvec::smallvec;
@@ -282,17 +281,12 @@ impl Middleware for Harmonizer {
 /*───────────────────────────────────────────────────────────────*/
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::{clock::Clock, storage_entity::*};
-    use tempfile::tempdir;
+    use std::sync::Arc;
 
-    /* -- stub clock so `updated_at` is deterministic -- */
-    struct StubClock;
-    impl Clock for StubClock {
-        fn now(&self) -> u64 {
-            123456
-        }
-    }
+    use super::*;
+    use crate::{clock::MockClock, storage_entity::*};
+    use redb::TableDefinition;
+    use tempfile::tempdir;
 
     /* -- dummy scoreable -- */
     struct NullScore;
@@ -359,7 +353,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = KuramotoDb::new(
             dir.path().join("t.redb").to_str().unwrap(),
-            Arc::new(StubClock),
+            Arc::new(MockClock::new(0)),
             vec![h.clone()],
         )
         .await;

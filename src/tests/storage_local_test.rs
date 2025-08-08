@@ -5,37 +5,15 @@ use redb::WriteTransaction;
 use std::sync::Arc;
 use tempfile::tempdir;
 
+use crate::clock::MockClock;
 use crate::{
     KuramotoDb, StaticTableDef, WriteBatch, WriteRequest,
-    clock::Clock,
     meta::BlobMeta,
     middlewares::Middleware,
     region_lock::RegionLock,
     storage_entity::{IndexCardinality, IndexSpec, StorageEntity},
     storage_error::StorageError,
 };
-
-// ============== Mock clock ==============
-struct MockClock {
-    ts: std::sync::Mutex<u64>,
-}
-
-impl MockClock {
-    fn new(start: u64) -> Self {
-        Self {
-            ts: std::sync::Mutex::new(start),
-        }
-    }
-    fn advance(&self, delta: u64) {
-        *self.ts.lock().unwrap() += delta;
-    }
-}
-
-impl Clock for MockClock {
-    fn now(&self) -> u64 {
-        *self.ts.lock().unwrap()
-    }
-}
 
 // ============== TestEntity ==============
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
@@ -183,7 +161,7 @@ async fn insert_and_read() {
     assert_row::<TestEntity>(&sys, &e.id.to_be_bytes(), Some(&e), 0, 1_000, 1_000, false).await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn overwrite_updates_meta() {
     let dir = tempdir().unwrap();
     let clock = Arc::new(MockClock::new(10));
@@ -203,14 +181,14 @@ async fn overwrite_updates_meta() {
     };
     sys.put(e.clone()).await.unwrap(); // initial
     assert_row::<TestEntity>(&sys, &e.id.to_be_bytes(), Some(&e), 0, 10, 10, false).await;
-    clock.advance(5);
+    clock.advance(5).await;
     e.value = 2;
     sys.put(e.clone()).await.unwrap(); // overwrite
 
     assert_row::<TestEntity>(&sys, &e.id.to_be_bytes(), Some(&e), 1, 10, 15, false).await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn delete_and_undelete() {
     let dir = tempdir().unwrap();
     let clock = Arc::new(MockClock::new(500));
@@ -229,11 +207,11 @@ async fn delete_and_undelete() {
         value: 0,
     };
     sys.put(e.clone()).await.unwrap(); // insert
-    clock.advance(10);
+    clock.advance(10).await;
     sys.delete::<TestEntity>(&e.id.to_be_bytes()).await.unwrap(); // delete
     assert_row::<TestEntity>(&sys, &e.id.to_be_bytes(), None, 0, 500, 510, true).await;
 
-    clock.advance(5);
+    clock.advance(5).await;
     sys.put(e.clone()).await.unwrap(); // undelete / re-insert
     assert_row::<TestEntity>(&sys, &e.id.to_be_bytes(), Some(&e), 1, 500, 515, false).await;
 }
@@ -282,7 +260,7 @@ async fn stale_version_rejected() {
 }
 
 // ============== INDEX TESTS ==============
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn index_insert_update_delete() {
     let dir = tempdir().unwrap();
     let clock = Arc::new(MockClock::new(0));
@@ -306,7 +284,7 @@ async fn index_insert_update_delete() {
     assert_get_by_index::<TestEntity>(&sys, &TEST_NAME_INDEX, b"A", Some(&e)).await;
 
     // ---- update (name changes) ----
-    clock.advance(1);
+    clock.advance(1).await;
     e.name = "B".into();
     sys.put(e.clone()).await.unwrap();
     assert_index_row(&sys, &TEST_NAME_INDEX, b"A", None).await; // old gone
@@ -315,7 +293,7 @@ async fn index_insert_update_delete() {
     assert_get_by_index::<TestEntity>(&sys, &TEST_NAME_INDEX, b"B", Some(&e)).await;
 
     // ---- delete ----
-    clock.advance(1);
+    clock.advance(1).await;
     sys.delete::<TestEntity>(&e.id.to_be_bytes()).await.unwrap();
     assert_index_row(&sys, &TEST_NAME_INDEX, b"B", None).await; // index row removed
     assert_get_by_index::<TestEntity>(&sys, &TEST_NAME_INDEX, b"B", None).await;

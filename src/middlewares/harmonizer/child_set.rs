@@ -322,14 +322,7 @@ mod tests {
     use tokio::runtime::Runtime;
 
     /*── glue for db bootstrap ─────────────────────────────*/
-    use crate::{WriteBatch, clock::Clock, middlewares::Middleware};
-
-    struct StubClock;
-    impl Clock for StubClock {
-        fn now(&self) -> u64 {
-            0
-        }
-    }
+    use crate::{WriteBatch, clock::MockClock, middlewares::Middleware};
 
     struct NoopMw;
 
@@ -351,7 +344,7 @@ mod tests {
         rt.block_on(async {
             KuramotoDb::new(
                 path.to_str().unwrap(),
-                Arc::new(StubClock),
+                Arc::new(MockClock::new(0)),
                 vec![Arc::new(NoopMw)],
             )
             .await

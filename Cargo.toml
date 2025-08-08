@@ -14,6 +14,8 @@ tokio = { version = "1.43", features = [
   "rt",
   "macros",
   "sync",
+  "io-util",
+  "test-util",       # TODO: only if testing
 ] }
 
 
@@ -21,6 +23,15 @@ rand = { version = "0.9.1" }
 getrandom = { version = "0.3.3", features = ["wasm_js"] }
 uuid = { version = "1.17", features = ["v4"] }
 smallvec = { version = "1.15.1", features = ["impl_bincode"] }
+
+
+dashmap = "6.1.0" # TODO: feat inmem
+quinn = "0.11.8" # TODO: feat quic
+rustls = { version = "0.23", default-features = false, features = [
+  "ring",
+] } # TODO: feat quic
+rcgen = "0.13" # TODO: feat quic
+
 
 [features]
 riblt_debug = []

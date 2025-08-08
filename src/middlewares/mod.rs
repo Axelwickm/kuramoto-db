@@ -28,19 +28,11 @@ mod tests {
 
     use crate::{
         StaticTableDef,
-        clock::Clock,
+        clock::{Clock, MockClock},
         storage_entity::{IndexSpec, StorageEntity},
     };
 
     use super::*;
-    /* ───── Mock clock ───── */
-    struct ZeroClock;
-    impl Clock for ZeroClock {
-        fn now(&self) -> u64 {
-            0
-        }
-    }
-
     /* ───── Middleware that counts calls ───── */
     struct CounterMiddleware {
         count: Arc<Mutex<u32>>,
@@ -112,7 +104,12 @@ mod tests {
         });
 
         // build DB with middleware
-        let db = KuramotoDb::new(db_path.to_str().unwrap(), Arc::new(ZeroClock), vec![mw]).await;
+        let db = KuramotoDb::new(
+            db_path.to_str().unwrap(),
+            Arc::new(MockClock::new(0)),
+            vec![mw],
+        )
+        .await;
 
         // create tables for Foo and insert one row
         db.create_table_and_indexes::<Foo>().unwrap();
