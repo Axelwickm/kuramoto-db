@@ -1,6 +1,8 @@
-use dashmap::DashMap;
-use std::sync::{Arc, Mutex, OnceLock};
-use tokio::sync::mpsc;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, OnceLock},
+};
+use tokio::sync::{RwLock, mpsc};
 
 use crate::communication::transports::{
     Connector, PeerId, PeerResolver, TransportConn, TransportError,
@@ -38,25 +40,38 @@ type RxCell = Arc<Mutex<Option<ChanRx>>>;
 type Key = (u64, PeerId, PeerId);
 
 // Global maps, initialized on first use.
-static SENDERS: OnceLock<DashMap<Key, ChanTx>> = OnceLock::new();
-static RECEIVERS: OnceLock<DashMap<Key, RxCell>> = OnceLock::new();
+static SENDERS: OnceLock<RwLock<HashMap<Key, ChanTx>>> = OnceLock::new();
+static RECEIVERS: OnceLock<RwLock<HashMap<Key, RxCell>>> = OnceLock::new();
 
 #[inline]
-fn senders() -> &'static DashMap<Key, ChanTx> {
-    SENDERS.get_or_init(DashMap::new)
+fn senders() -> &'static RwLock<HashMap<Key, ChanTx>> {
+    SENDERS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 #[inline]
-fn receivers() -> &'static DashMap<Key, RxCell> {
-    RECEIVERS.get_or_init(DashMap::new)
+fn receivers() -> &'static RwLock<HashMap<Key, RxCell>> {
+    RECEIVERS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-fn ensure_path(ns: u64, src: PeerId, dst: PeerId) {
+async fn ensure_path(ns: u64, src: PeerId, dst: PeerId) {
     let key = (ns, src, dst);
-    if !senders().contains_key(&key) {
+
+    // Fast path: check under read lock.
+    {
+        let s_map = senders().read().await;
+        if s_map.contains_key(&key) {
+            return;
+        }
+    }
+
+    // Slow path: upgrade to write and double-check (classic check-then-insert).
+    let mut s_map = senders().write().await;
+    if !s_map.contains_key(&key) {
         let (tx, rx) = mpsc::channel::<Vec<u8>>(1024);
-        senders().insert(key, tx);
+        s_map.insert(key, tx);
+
         // Store the receiver under (ns, dst, src) so *dst* can later recv "from src".
-        receivers().insert((ns, dst, src), Arc::new(Mutex::new(Some(rx))));
+        let mut r_map = receivers().write().await;
+        r_map.insert((ns, dst, src), Arc::new(Mutex::new(Some(rx))));
     }
 }
 
@@ -84,7 +99,8 @@ impl TransportConn for InMemConn {
         if let Some(rx) = guard.take() {
             rx
         } else {
-            let (_tx, rx) = mpsc::channel(1); // closed immediately (sender dropped)
+            // Return an already-closed channel on subsequent calls.
+            let (_tx, rx) = mpsc::channel(1);
             rx
         }
     }
@@ -121,21 +137,26 @@ impl Connector<InMemAddr> for InMemConnector {
         let remote = addr.peer;
 
         // Ensure both directed paths exist in this namespace.
-        ensure_path(self.ns, self.local, remote);
-        ensure_path(self.ns, remote, self.local);
+        ensure_path(self.ns, self.local, remote).await;
+        ensure_path(self.ns, remote, self.local).await;
 
         // Sender for local → remote
-        let tx = senders()
-            .get(&(self.ns, self.local, remote))
-            .ok_or_else(|| TransportError::Io("missing sender".into()))?
-            .clone();
+        let tx = {
+            let s_map = senders().read().await;
+            s_map
+                .get(&(self.ns, self.local, remote))
+                .ok_or_else(|| TransportError::Io("missing sender".into()))?
+                .clone()
+        };
 
         // Receiver for remote → local; take it exactly once.
-        let rx_arc = receivers()
-            .get(&(self.ns, self.local, remote))
-            .ok_or_else(|| TransportError::Io("missing receiver".into()))?
-            .value()
-            .clone();
+        let rx_arc = {
+            let r_map = receivers().read().await;
+            r_map
+                .get(&(self.ns, self.local, remote))
+                .ok_or_else(|| TransportError::Io("missing receiver".into()))?
+                .clone()
+        };
 
         let mut guard = rx_arc.lock().expect("poisoned");
         let rx = guard.take().ok_or(TransportError::ConnectionClosed)?;

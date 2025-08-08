@@ -40,3 +40,12 @@ impl AsRef<[u8]> for UuidBytes {
         &self.0
     }
 }
+
+impl std::fmt::Display for UuidBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let full = Uuid::from(*self);
+        let s = full.as_hyphenated().to_string(); // full hex with dashes
+        // Truncate: first 8 chars + … + last 4
+        write!(f, "{}…{}", &s[..8], &s[s.len() - 4..])
+    }
+}
