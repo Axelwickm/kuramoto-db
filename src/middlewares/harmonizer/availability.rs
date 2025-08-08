@@ -31,6 +31,7 @@ pub struct AvailabilityV0 {
     /* ─ bookkeeping ─ */
     pub version: u32,
     pub updated_at: u64,
+    pub complete: bool,
 }
 
 pub type Availability = AvailabilityV0;
@@ -63,10 +64,18 @@ impl StorageEntity for AvailabilityV0 {
     }
 
     fn load_and_migrate(data: &[u8]) -> Result<Self, StorageError> {
-        // with only one version we can ditch the leading‐byte tag
-        bincode::decode_from_slice::<Self, _>(data, bincode::config::standard())
-            .map(|(v, _)| v)
-            .map_err(|e| StorageError::Bincode(e.to_string()))
+        if data.is_empty() {
+            return Err(StorageError::Bincode("empty input".into()));
+        }
+        match data[0] {
+            0 => {
+                // v0 payload starts after the tag
+                bincode::decode_from_slice::<Self, _>(&data[1..], bincode::config::standard())
+                    .map(|(v, _)| v)
+                    .map_err(|e| StorageError::Bincode(e.to_string()))
+            }
+            n => Err(StorageError::Bincode(format!("unknown version {n}"))),
+        }
     }
 
     fn indexes() -> &'static [IndexSpec<Self>] {

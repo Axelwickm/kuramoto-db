@@ -10,11 +10,14 @@ impl UuidBytes {
         UuidBytes(*Uuid::new_v4().as_bytes())
     }
 
-    /// Borrow as a byte array (for key functions etc)
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        UuidBytes(bytes)
+    }
+
     pub fn as_bytes(&self) -> &[u8; 16] {
         &self.0
     }
-    /// Into owned Vec<u8>
+
     pub fn into_vec(self) -> Vec<u8> {
         self.0.to_vec()
     }

@@ -1,8 +1,5 @@
-//! Rateless IBLT *ChildSet* – fixed‑size chunks, limited persistence.
-
 use bincode::{Decode, Encode};
 use redb::TableDefinition;
-use uuid::Uuid; // only used inside tests
 
 use crate::{
     KuramotoDb, StaticTableDef,
@@ -186,8 +183,8 @@ async fn scan_prefix<E: StorageEntity>(
 
 #[derive(Clone, Debug, Encode, Decode)]
 pub struct ChildSet {
-    parent: UuidBytes,
-    children: Vec<Sym>,
+    pub parent: UuidBytes,
+    pub children: Vec<Sym>,
 }
 
 impl ChildSet {
@@ -317,13 +314,15 @@ impl ChildSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use rand::Rng;
+    use redb::WriteTransaction;
     use std::sync::Arc;
     use tempfile::tempdir;
     use tokio::runtime::Runtime;
 
     /*── glue for db bootstrap ─────────────────────────────*/
-    use crate::{WriteRequest, clock::Clock, middlewares::Middleware};
+    use crate::{WriteBatch, clock::Clock, middlewares::Middleware};
 
     struct StubClock;
     impl Clock for StubClock {
@@ -333,8 +332,15 @@ mod tests {
     }
 
     struct NoopMw;
+
+    #[async_trait]
     impl Middleware for NoopMw {
-        fn before_write(&self, _: &mut WriteRequest) -> Result<(), StorageError> {
+        async fn before_write(
+            &self,
+            _db: &KuramotoDb,
+            _txn: &WriteTransaction,
+            _batch: &mut WriteBatch,
+        ) -> Result<(), StorageError> {
             Ok(())
         }
     }

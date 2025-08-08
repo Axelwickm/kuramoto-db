@@ -1,10 +1,12 @@
+use async_trait::async_trait;
 use bincode::{Decode, Encode};
 use redb::TableDefinition;
+use redb::WriteTransaction;
 use std::sync::Arc;
 use tempfile::tempdir;
 
 use crate::{
-    KuramotoDb, StaticTableDef, WriteRequest,
+    KuramotoDb, StaticTableDef, WriteBatch, WriteRequest,
     clock::Clock,
     meta::BlobMeta,
     middlewares::Middleware,
@@ -272,7 +274,6 @@ async fn stale_version_rejected() {
         meta: bincode::encode_to_vec(meta, bincode::config::standard()).unwrap(), // same version
         index_puts: vec![],
         index_removes: vec![],
-        respond_to: tokio::sync::oneshot::channel().0, // will never be read
     };
 
     // Push manually and expect StaleVersion
@@ -410,29 +411,45 @@ async fn middleware_applied_in_order() {
     struct Add100; // updated_at += 100
     struct Double; // updated_at *= 2
 
+    #[async_trait]
     impl Middleware for Add100 {
-        fn before_write(&self, req: &mut WriteRequest) -> Result<(), StorageError> {
-            if let WriteRequest::Put { meta, .. } = req {
-                let (mut m, _): (BlobMeta, _) =
-                    bincode::decode_from_slice(meta, bincode::config::standard())
+        async fn before_write(
+            &self,
+            _db: &KuramotoDb,
+            _txn: &WriteTransaction,
+            batch: &mut WriteBatch,
+        ) -> Result<(), StorageError> {
+            for req in batch {
+                if let WriteRequest::Put { meta, .. } = req {
+                    let (mut m, _): (BlobMeta, _) =
+                        bincode::decode_from_slice(meta, bincode::config::standard())
+                            .map_err(|o| StorageError::Bincode(o.to_string()))?;
+                    m.updated_at += 100;
+                    *meta = bincode::encode_to_vec(m, bincode::config::standard())
                         .map_err(|o| StorageError::Bincode(o.to_string()))?;
-                m.updated_at += 100;
-                *meta = bincode::encode_to_vec(m, bincode::config::standard())
-                    .map_err(|o| StorageError::Bincode(o.to_string()))?;
+                }
             }
             Ok(())
         }
     }
 
+    #[async_trait]
     impl Middleware for Double {
-        fn before_write(&self, req: &mut WriteRequest) -> Result<(), StorageError> {
-            if let WriteRequest::Put { meta, .. } = req {
-                let (mut m, _): (BlobMeta, _) =
-                    bincode::decode_from_slice(meta, bincode::config::standard())
+        async fn before_write(
+            &self,
+            _db: &KuramotoDb,
+            _txn: &WriteTransaction,
+            batch: &mut WriteBatch,
+        ) -> Result<(), StorageError> {
+            for req in batch {
+                if let WriteRequest::Put { meta, .. } = req {
+                    let (mut m, _): (BlobMeta, _) =
+                        bincode::decode_from_slice(meta, bincode::config::standard())
+                            .map_err(|o| StorageError::Bincode(o.to_string()))?;
+                    m.updated_at *= 2;
+                    *meta = bincode::encode_to_vec(m, bincode::config::standard())
                         .map_err(|o| StorageError::Bincode(o.to_string()))?;
-                m.updated_at *= 2;
-                *meta = bincode::encode_to_vec(m, bincode::config::standard())
-                    .map_err(|o| StorageError::Bincode(o.to_string()))?;
+                }
             }
             Ok(())
         }

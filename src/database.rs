@@ -28,6 +28,13 @@ pub struct IndexRemoveRequest {
     key: Vec<u8>,
 }
 
+pub type WriteBatch = Vec<WriteRequest>;
+
+type WriteMsg = (
+    WriteBatch,
+    tokio::sync::oneshot::Sender<Result<(), StorageError>>,
+);
+
 pub enum WriteRequest {
     Put {
         data_table: StaticTableDef,
@@ -37,7 +44,6 @@ pub enum WriteRequest {
         meta: Vec<u8>,
         index_removes: Vec<IndexRemoveRequest>,
         index_puts: Vec<IndexPutRequest>,
-        respond_to: oneshot::Sender<Result<(), StorageError>>,
     },
     Delete {
         data_table: StaticTableDef,
@@ -45,7 +51,6 @@ pub enum WriteRequest {
         key: Vec<u8>,
         meta: Vec<u8>,
         index_removes: Vec<IndexRemoveRequest>,
-        respond_to: oneshot::Sender<Result<(), StorageError>>,
     },
 }
 
@@ -70,7 +75,7 @@ fn nonunique_bounds(idx_key: &[u8]) -> (Vec<u8>, Vec<u8>) {
 
 pub struct KuramotoDb {
     db: Arc<Database>,
-    write_tx: mpsc::Sender<WriteRequest>,
+    write_tx: mpsc::Sender<WriteMsg>,
     clock: Arc<dyn Clock>,
     middlewares: Vec<Arc<dyn Middleware>>,
 }
@@ -93,8 +98,8 @@ impl KuramotoDb {
         });
         let sys2 = sys.clone();
         tokio::spawn(async move {
-            while let Some(req) = write_rx.recv().await {
-                let _ = sys2.handle_write(req).await;
+            while let Some((batch, reply)) = write_rx.recv().await {
+                let _ = sys2.handle_write(batch, reply).await;
             }
         });
         sys
@@ -284,18 +289,18 @@ impl KuramotoDb {
                 Vec::new(),
             )
         };
+        let req = WriteRequest::Put {
+            data_table: &E::table_def(),
+            meta_table: &E::meta_table_def(),
+            key,
+            value: entity.to_bytes(),
+            meta: bincode::encode_to_vec(meta, bincode::config::standard()).unwrap(),
+            index_puts,
+            index_removes,
+        };
 
         self.write_tx
-            .send(WriteRequest::Put {
-                data_table: &E::table_def(),
-                meta_table: &E::meta_table_def(),
-                key,
-                value: entity.to_bytes(),
-                meta: bincode::encode_to_vec(meta, bincode::config::standard()).unwrap(),
-                index_puts,
-                index_removes,
-                respond_to: tx,
-            })
+            .send((vec![req], tx))
             .await
             .map_err(|e| StorageError::Other(format!("Write queue dropped: {}", e)))?;
         rx.await
@@ -551,15 +556,15 @@ impl KuramotoDb {
             })
             .collect();
 
+        let req = WriteRequest::Delete {
+            data_table: &E::table_def(),
+            meta_table: &E::meta_table_def(),
+            key: key.to_vec(),
+            meta: bincode::encode_to_vec(meta, bincode::config::standard()).unwrap(),
+            index_removes,
+        };
         self.write_tx
-            .send(WriteRequest::Delete {
-                data_table: &E::table_def(),
-                meta_table: &E::meta_table_def(),
-                key: key.to_vec(),
-                meta: bincode::encode_to_vec(meta, bincode::config::standard()).unwrap(),
-                index_removes,
-                respond_to: tx,
-            })
+            .send((vec![req], tx))
             .await
             .map_err(|e| StorageError::Other(format!("Write queue dropped: {}", e)))?;
 
@@ -574,19 +579,13 @@ impl KuramotoDb {
             .map_err(|e| StorageError::Other(e.to_string()))
     }
 
-    pub async fn raw_write(&self, mut req: WriteRequest) -> Result<(), StorageError> {
+    pub async fn raw_write(&self, req: WriteRequest) -> Result<(), StorageError> {
         // create a fresh responder
         let (tx, rx) = oneshot::channel();
 
-        // patch the request’s respond_to field
-        match &mut req {
-            WriteRequest::Put { respond_to, .. } => *respond_to = tx,
-            WriteRequest::Delete { respond_to, .. } => *respond_to = tx,
-        }
-
         // enqueue
         self.write_tx
-            .send(req)
+            .send((vec![req], tx))
             .await
             .map_err(|e| StorageError::Other(format!("Write queue dropped: {}", e)))?;
 
@@ -596,200 +595,159 @@ impl KuramotoDb {
     }
 
     // ----------- Internal handler --------------
-    async fn handle_write(&self, req: WriteRequest) -> Result<(), StorageError> {
-        let mut req = req;
+    async fn handle_write(
+        &self,
+        mut batch: WriteBatch,
+        reply: tokio::sync::oneshot::Sender<Result<(), StorageError>>,
+    ) -> Result<(), StorageError> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| StorageError::Other(e.to_string()))?;
+
+        // Middleware can append more requests to `batch`
         for m in &self.middlewares {
-            m.before_write(&mut req)?;
+            m.before_write(self, &txn, &mut batch).await?;
         }
 
-        match req {
-            WriteRequest::Put {
-                data_table,
-                meta_table,
-                key,
-                value,
-                meta,
-                index_puts,
-                index_removes,
-                respond_to,
-            } => {
-                let txn = self
-                    .db
-                    .begin_write()
-                    .map_err(|e| StorageError::Other(e.to_string()))?;
-
-                // ---- Version check (primary key) ----
-                {
-                    // Fail if meta table does not exist
-                    let meta_t = match txn.open_table(*meta_table) {
-                        Ok(t) => t,
-                        Err(_) => {
-                            let error = Err(StorageError::Other(format!(
-                                "Meta table does not exist: {}",
-                                meta_table.name()
-                            )));
-                            let _ = respond_to.send(error.clone());
-                            return error;
-                        }
-                    };
-
-                    if let Some(existing_meta_raw) = meta_t
-                        .get(&*key)
-                        .map_err(|e| StorageError::Other(e.to_string()))?
+        // Apply all requests
+        for req in batch.into_iter() {
+            match req {
+                WriteRequest::Put {
+                    data_table,
+                    meta_table,
+                    key,
+                    value,
+                    meta,
+                    index_puts,
+                    index_removes,
+                } => {
+                    // ---- Version check ----
                     {
-                        // decode existing meta to inspect its version
-                        let (existing_meta, _) = bincode::decode_from_slice::<BlobMeta, _>(
-                            &existing_meta_raw.value(),
-                            bincode::config::standard(),
-                        )
-                        .map_err(|e| StorageError::Bincode(e.to_string()))?;
-
-                        let new_meta: BlobMeta = bincode::decode_from_slice::<BlobMeta, _>(
-                            &meta,
-                            bincode::config::standard(),
-                        )
-                        .map_err(|e| StorageError::Bincode(e.to_string()))?
-                        .0;
-
-                        if new_meta.version <= existing_meta.version {
-                            return Err(StorageError::PutButNoVersionIncrease);
-                        }
-                    };
-                }
-
-                // ---- Insert / overwrite main row ----
-                {
-                    // Fail if data table does not exist
-                    let mut t = match txn.open_table(*data_table) {
-                        Ok(t) => t,
-                        Err(_) => {
-                            let error = Err(StorageError::Other(format!(
-                                "Data table does not exist: {}",
-                                data_table.name()
-                            )));
-                            let _ = respond_to.send(error.clone());
-                            return error;
-                        }
-                    };
-                    t.insert(&*key, value)
-                        .map_err(|e| StorageError::Other(e.to_string()))?;
-                }
-
-                // ---- Handle index removals ----
-                for idx in index_removes {
-                    let mut t = match txn.open_table(*idx.table) {
-                        Ok(t) => t,
-                        Err(_) => {
-                            let _ = respond_to.send(Err(StorageError::Other(format!(
-                                "Index table does not exist: {}",
-                                idx.table.name()
-                            ))));
-                            return Err(StorageError::Other(format!(
-                                "Index table does not exist: {}",
-                                idx.table.name()
-                            )));
-                        }
-                    };
-                    t.remove(idx.key.as_slice())
-                        .map_err(|e| StorageError::Other(e.to_string()))?;
-                }
-
-                // ---- Handle index inserts with uniqueness check ----
-                for idx in index_puts {
-                    let mut t = match txn.open_table(*idx.table) {
-                        Ok(t) => t,
-                        Err(_) => {
-                            let error = Err(StorageError::Other(format!(
-                                "Index table does not exist: {}",
-                                idx.table.name()
-                            )));
-                            let _ = respond_to.send(error.clone());
-                            return error;
-                        }
-                    };
-
-                    if idx.unique {
-                        if let Some(existing) = t
-                            .get(idx.key.as_slice())
+                        let meta_t = txn
+                            .open_table(*meta_table)
+                            .map_err(|e| StorageError::Other(e.to_string()))?;
+                        if let Some(existing_meta_raw) = meta_t
+                            .get(&*key)
                             .map_err(|e| StorageError::Other(e.to_string()))?
                         {
-                            if existing.value() != idx.value.as_slice() {
-                                let error = Err(StorageError::DuplicateIndexKey {
-                                    index_name: idx.table.name(),
-                                });
-                                let _ = respond_to.send(error.clone());
-                                return error;
+                            let (existing_meta, _) = bincode::decode_from_slice::<BlobMeta, _>(
+                                &existing_meta_raw.value(),
+                                bincode::config::standard(),
+                            )
+                            .map_err(|e| StorageError::Bincode(e.to_string()))?;
+                            let new_meta: BlobMeta = bincode::decode_from_slice::<BlobMeta, _>(
+                                &meta,
+                                bincode::config::standard(),
+                            )
+                            .map_err(|e| StorageError::Bincode(e.to_string()))?
+                            .0;
+
+                            if new_meta.version <= existing_meta.version {
+                                let _ = reply.send(Err(StorageError::PutButNoVersionIncrease));
+                                return Err(StorageError::PutButNoVersionIncrease);
                             }
                         }
                     }
 
-                    t.insert(idx.key.as_slice(), idx.value)
-                        .map_err(|e| StorageError::Other(e.to_string()))?;
-                }
+                    // ---- Insert/overwrite main row ----
+                    {
+                        let mut t = txn
+                            .open_table(*data_table)
+                            .map_err(|e| StorageError::Other(e.to_string()))?;
+                        t.insert(&*key, value)
+                            .map_err(|e| StorageError::Other(e.to_string()))?;
+                    }
 
-                // ---- Finally write updated meta (includes bumped version) ----
-                {
-                    let mut meta_t = match txn.open_table(*meta_table) {
-                        Ok(t) => t,
-                        Err(_) => {
-                            let error = Err(StorageError::Other(format!(
-                                "Meta table does not exist: {}",
-                                meta_table.name()
-                            )));
-                            let _ = respond_to.send(error.clone());
-                            return error;
+                    // ---- Index removes ----
+                    for idx in index_removes {
+                        let mut t = txn
+                            .open_table(*idx.table)
+                            .map_err(|e| StorageError::Other(e.to_string()))?;
+                        t.remove(idx.key.as_slice())
+                            .map_err(|e| StorageError::Other(e.to_string()))?;
+                    }
+
+                    // ---- Index inserts (uniqueness) ----
+                    for idx in index_puts {
+                        let mut t = txn
+                            .open_table(*idx.table)
+                            .map_err(|e| StorageError::Other(e.to_string()))?;
+
+                        if idx.unique {
+                            if let Some(existing) = t
+                                .get(idx.key.as_slice())
+                                .map_err(|e| StorageError::Other(e.to_string()))?
+                            {
+                                if existing.value() != idx.value.as_slice() {
+                                    let e = StorageError::DuplicateIndexKey {
+                                        index_name: idx.table.name(),
+                                    };
+                                    let _ = reply.send(Err(e.clone()));
+                                    return Err(e);
+                                }
+                            }
                         }
-                    };
-                    meta_t
-                        .insert(&*key, meta)
-                        .map_err(|e| StorageError::Other(e.to_string()))?;
+
+                        t.insert(idx.key.as_slice(), idx.value)
+                            .map_err(|e| StorageError::Other(e.to_string()))?;
+                    }
+
+                    // ---- Write meta ----
+                    {
+                        let mut meta_t = txn
+                            .open_table(*meta_table)
+                            .map_err(|e| StorageError::Other(e.to_string()))?;
+                        meta_t
+                            .insert(&*key, meta)
+                            .map_err(|e| StorageError::Other(e.to_string()))?;
+                    }
                 }
 
-                txn.commit()
-                    .map_err(|e| StorageError::Other(e.to_string()))?;
-                let _ = respond_to.send(Ok(()));
-            }
+                WriteRequest::Delete {
+                    data_table,
+                    meta_table,
+                    key,
+                    meta,
+                    index_removes,
+                } => {
+                    // ---- Delete main row ----
+                    {
+                        let mut t = txn
+                            .open_table(*data_table)
+                            .map_err(|e| StorageError::Other(e.to_string()))?;
+                        t.remove(&*key)
+                            .map_err(|e| StorageError::Other(e.to_string()))?;
+                    }
 
-            WriteRequest::Delete {
-                data_table,
-                meta_table,
-                key,
-                meta,
-                index_removes,
-                respond_to,
-            } => {
-                let txn = self
-                    .db
-                    .begin_write()
-                    .map_err(|e| StorageError::Other(e.to_string()))?;
-                {
-                    let mut t = txn
-                        .open_table(*data_table)
-                        .map_err(|e| StorageError::Other(e.to_string()))?;
-                    t.remove(&*key)
-                        .map_err(|e| StorageError::Other(e.to_string()))?;
+                    // ---- Meta update ----
+                    {
+                        let mut meta_t = txn
+                            .open_table(*meta_table)
+                            .map_err(|e| StorageError::Other(e.to_string()))?;
+                        meta_t
+                            .insert(&*key, meta)
+                            .map_err(|e| StorageError::Other(e.to_string()))?;
+                    }
+
+                    // ---- Index removes ----
+                    for idx in index_removes {
+                        let mut t = txn
+                            .open_table(*idx.table)
+                            .map_err(|e| StorageError::Other(e.to_string()))?;
+                        t.remove(idx.key.as_slice())
+                            .map_err(|e| StorageError::Other(e.to_string()))?;
+                    }
                 }
-                {
-                    let mut meta_t = txn
-                        .open_table(*meta_table)
-                        .map_err(|e| StorageError::Other(e.to_string()))?;
-                    meta_t
-                        .insert(&*key, meta)
-                        .map_err(|e| StorageError::Other(e.to_string()))?;
-                }
-                // Handle index removes
-                for idx in index_removes {
-                    let mut t = txn
-                        .open_table(*idx.table)
-                        .map_err(|e| StorageError::Other(e.to_string()))?;
-                    t.remove(idx.key.as_slice())
-                        .map_err(|e| StorageError::Other(e.to_string()))?;
-                }
-                txn.commit()
-                    .map_err(|e| StorageError::Other(e.to_string()))?;
-                let _ = respond_to.send(Ok(()));
             }
         }
+
+        // Commit once
+        txn.commit()
+            .map_err(|e| StorageError::Other(e.to_string()))?;
+
+        // Reply once for the whole batch
+        let _ = reply.send(Ok(()));
         Ok(())
     }
 }
