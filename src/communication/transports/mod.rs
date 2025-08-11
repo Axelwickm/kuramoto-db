@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 /*──────── types from your minimal API ───────*/
 pub type PeerId = UuidBytes;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransportError {
     ConnectionClosed,
     Io(String),

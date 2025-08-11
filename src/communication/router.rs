@@ -2,21 +2,21 @@ use std::{
     collections::HashMap,
     fmt,
     sync::{
-        Arc, Mutex, RwLock,
         atomic::{AtomicU64, Ordering},
+        Arc, Mutex, RwLock,
     },
     time::Duration,
 };
 
 use bincode::{Decode, Encode};
-use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Semaphore};
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::{
     clock::Clock,
     communication::{
         rate_limiter::RateLimiter,
-        transports::{PeerId, TransportConn, TransportError},
+        transports::{PeerId, TransportConn},
     },
 };
 
@@ -28,7 +28,7 @@ pub type MsgId = u64;
 /// - `Request`: caller expects a `Response` or `Error`
 /// - `Response`: success path containing protocol-specific bytes
 /// - `Notify`: fire-and-forget
-/// - `Error`: standardized failure envelope carrying `StdError`
+/// - `Error`: carries a bincode-encoded `RouterError`
 #[derive(Clone, Copy, Debug, Encode, Decode, PartialEq, Eq)]
 pub enum Verb {
     Request,
@@ -53,37 +53,53 @@ pub struct Envelope {
     pub payload: Vec<u8>,
 }
 
-/*──────────────────────── standardized error ───────────*/
+/*──────────────────────── errors ─────────*/
 
-#[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
-pub struct StdError {
-    pub code: u16,
-    pub msg: String,
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+pub enum DenyReason {
+    PeerInflight,
+    OutboundRate,
+    InboundRate,
+    FrameTooLarge,
+    NoHandler,
+    VersionMismatch,
 }
 
-/*──────────────────────── errors (no thiserror) ─────────*/
-
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub enum RouterError {
     NoConnection,
-    Transport(TransportError),
     Timeout,
     Encode(String),
     Decode(String),
-    Denied(&'static str),
-    Remote { code: u16, msg: String },
+    /// Local/remote policy denials (rate limits, etc.)
+    Denied {
+        reason: DenyReason,
+        /// Optional backoff in milliseconds (kept as u64 to avoid Duration codec concerns)
+        retry_after_ms: Option<u64>,
+    },
+    /// Handler returned Err(String)
+    Handler(String),
 }
+
 impl fmt::Display for RouterError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         use RouterError::*;
         match self {
             NoConnection => write!(f, "no connection"),
-            Transport(e) => write!(f, "transport: {:?}", e),
             Timeout => write!(f, "timeout"),
             Encode(e) => write!(f, "encode: {e}"),
             Decode(e) => write!(f, "decode: {e}"),
-            Denied(r) => write!(f, "denied: {r}"),
-            Remote { code, msg } => write!(f, "remote error {code}: {msg}"),
+            Denied {
+                reason,
+                retry_after_ms,
+            } => {
+                write!(f, "denied: {:?}", reason)?;
+                if let Some(ms) = retry_after_ms {
+                    write!(f, " (retry_after={}ms)", ms)?;
+                }
+                Ok(())
+            }
+            Handler(msg) => write!(f, "handler error: {msg}"),
         }
     }
 }
@@ -309,20 +325,13 @@ impl Router {
         peer: PeerId,
         correl: MsgId,
         proto: u16,
-        code: u16,
-        msg: impl Into<String>,
+        err: RouterError,
     ) {
-        // Encode StdError payload
-        let payload = match bincode::encode_to_vec(
-            StdError {
-                code,
-                msg: msg.into(),
-            },
-            bincode::config::standard(),
-        ) {
+        // Encode RouterError payload
+        let payload = match bincode::encode_to_vec(err, bincode::config::standard()) {
             Ok(p) => p,
             Err(e) => {
-                warn!(peer=?peer, ?e, "router: failed to encode StdError payload");
+                warn!(peer=?peer, ?e, "router: failed to encode RouterError payload");
                 return;
             }
         };
@@ -362,6 +371,8 @@ impl Router {
         if let Some(tx) = tx_opt {
             if let Err(e) = tx.send(bytes).await {
                 warn!(peer=?peer, ?e, "router: failed to send error frame");
+                // If we can't send to worker, peer is effectively dead.
+                self.drop_peer(peer);
             }
         } else {
             debug!(peer=?peer, "router: no worker found for peer when sending error");
@@ -397,28 +408,35 @@ impl Router {
                         continue;
                     }
                     if let Some(cid) = env.correl {
+                        // FIX: verify response came from the same peer that owns the pending
                         if let Some(p) = self.pending.lock().unwrap().remove(&cid) {
+                            if p.peer != peer {
+                                // wrong-peer response; put it back and strike
+                                self.pending.lock().unwrap().insert(cid, p);
+                                self.strike(peer, "correl peer mismatch");
+                                continue;
+                            }
                             let _ = p.tx.send(Ok(env));
                         }
                     }
                 }
                 Verb::Error => {
                     if let Some(cid) = env.correl {
-                        let remote = match bincode::decode_from_slice::<StdError, _>(
+                        let remote_err = match bincode::decode_from_slice::<RouterError, _>(
                             &env.payload,
                             bincode::config::standard(),
                         ) {
-                            Ok((se, _)) => RouterError::Remote {
-                                code: se.code,
-                                msg: se.msg,
-                            },
-                            Err(_) => RouterError::Remote {
-                                code: 500,
-                                msg: "malformed remote error".into(),
-                            },
+                            Ok((e, _)) => e,
+                            Err(_) => RouterError::Decode("malformed remote error".into()),
                         };
+                        // FIX: verify error came from the correct peer
                         if let Some(p) = self.pending.lock().unwrap().remove(&cid) {
-                            let _ = p.tx.send(Err(remote));
+                            if p.peer != peer {
+                                self.pending.lock().unwrap().insert(cid, p);
+                                self.strike(peer, "correl peer mismatch");
+                                continue;
+                            }
+                            let _ = p.tx.send(Err(remote_err));
                         }
                     }
                 }
@@ -426,10 +444,23 @@ impl Router {
                     // Version gate first
                     if !self.inbound_version_ok(env.major, env.minor) {
                         if matches!(env.verb, Verb::Request) {
-                            self.send_error(peer, env.id, env.proto, 400, "incompatible version")
+                            let _ = self
+                                .send_error(
+                                    peer,
+                                    env.id,
+                                    env.proto,
+                                    RouterError::Denied {
+                                        reason: DenyReason::VersionMismatch,
+                                        retry_after_ms: None,
+                                    },
+                                )
                                 .await;
+                            // Keep strike for requests (protocol violation)
+                            self.strike(peer, "req/notify version");
+                        } else {
+                            // For notifies, don't strike on version mismatch to avoid easy DoS
+                            warn!(%peer, "router: notify version mismatch");
                         }
-                        self.strike(peer, "req/notify version");
                         continue;
                     }
 
@@ -443,12 +474,22 @@ impl Router {
                         }
                     };
                     if !allowed {
-                        // Soft drop and strike for requests; drop for notifies.
+                        // FIX: Do not strike for notifies; only send error+strike for requests
                         if matches!(env.verb, Verb::Request) {
-                            self.send_error(peer, env.id, env.proto, 429, "rate limited")
-                                .await;
+                            self.send_error(
+                                peer,
+                                env.id,
+                                env.proto,
+                                RouterError::Denied {
+                                    reason: DenyReason::InboundRate,
+                                    retry_after_ms: None,
+                                },
+                            )
+                            .await;
+                            self.strike(peer, "rate");
+                        } else {
+                            debug!(%peer, "router: notify dropped due to inbound rate");
                         }
-                        self.strike(peer, "rate");
                         continue;
                     }
 
@@ -459,8 +500,16 @@ impl Router {
                     };
                     let Some(h) = handler else {
                         if matches!(env.verb, Verb::Request) {
-                            self.send_error(peer, env.id, env.proto, 404, "no handler")
-                                .await;
+                            self.send_error(
+                                peer,
+                                env.id,
+                                env.proto,
+                                RouterError::Denied {
+                                    reason: DenyReason::NoHandler,
+                                    retry_after_ms: None,
+                                },
+                            )
+                            .await;
                         }
                         continue;
                     };
@@ -482,7 +531,8 @@ impl Router {
                                 let _ = self.enqueue(peer, reply, FrameClass::Bypass).await;
                             }
                             Err(msg) => {
-                                self.send_error(peer, env.id, env.proto, 500, msg).await;
+                                self.send_error(peer, env.id, env.proto, RouterError::Handler(msg))
+                                    .await;
                             }
                         }
                     } else {
@@ -492,6 +542,8 @@ impl Router {
             }
         }
         debug!(%peer, "router: read loop exit");
+        // FIX: ensure cleanup and fail pendings immediately on reader exit
+        self.drop_peer(peer);
     }
 
     /// Pre-encode and send; enforce max-frame and outbound rate-limit (unless bypass).
@@ -510,13 +562,25 @@ impl Router {
             // If this was a response we owe the caller a small error frame.
             if matches!(env.verb, Verb::Response) {
                 if let Some(correl) = env.correl {
-                    self.send_error(peer, correl, env.proto, 413, "response too large")
-                        .await;
+                    self.send_error(
+                        peer,
+                        correl,
+                        env.proto,
+                        RouterError::Denied {
+                            reason: DenyReason::FrameTooLarge,
+                            retry_after_ms: None,
+                        },
+                    )
+                    .await;
                 }
             }
             // Also notify our own waiter if any (only meaningful for locally-correlated sends).
-            self.fail_correl(env.correl, RouterError::Denied("frame too large"));
-            return Err(RouterError::Denied("frame too large"));
+            let e = RouterError::Denied {
+                reason: DenyReason::FrameTooLarge,
+                retry_after_ms: None,
+            };
+            self.fail_correl(env.correl, e.clone());
+            return Err(e);
         }
 
         // Outbound rate limiting unless bypassed.
@@ -530,7 +594,10 @@ impl Router {
                 }
             };
             if !allowed {
-                return Err(RouterError::Denied("outbound rate"));
+                return Err(RouterError::Denied {
+                    reason: DenyReason::OutboundRate,
+                    retry_after_ms: None,
+                });
             }
         }
 
@@ -541,7 +608,14 @@ impl Router {
         }
         .ok_or(RouterError::NoConnection)?;
 
-        tx.send(bytes).await.map_err(|_| RouterError::NoConnection)
+        // FIX: if worker send fails, drop the peer to clean up maps & pendings
+        match tx.send(bytes).await {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                self.drop_peer(peer);
+                Err(RouterError::NoConnection)
+            }
+        }
     }
 
     /*──────── public API ────────*/
@@ -582,7 +656,10 @@ impl Router {
             st.sem
                 .clone()
                 .try_acquire_owned()
-                .map_err(|_| RouterError::Denied("peer inflight limit"))?
+                .map_err(|_| RouterError::Denied {
+                    reason: DenyReason::PeerInflight,
+                    retry_after_ms: None,
+                })?
         };
         let _permit = permit; // RAII: releases when dropped
 
@@ -613,18 +690,25 @@ impl Router {
 
         // await response with timeout
         let r = tokio::time::timeout(timeout, rx).await;
-        if r.is_err() {
-            // timeout
-            self.pending.lock().unwrap().remove(&id);
-            return Err(RouterError::Timeout); // `_permit` drops here
-        }
-        let env = r.unwrap().map_err(|_| RouterError::Timeout)??;
+        let env_res: Result<Envelope, RouterError> = match r {
+            Err(_) => {
+                self.pending.lock().unwrap().remove(&id);
+                Err(RouterError::Timeout)
+            }
+            Ok(Err(_)) => {
+                self.pending.lock().unwrap().remove(&id);
+                Err(RouterError::NoConnection)
+            }
+            Ok(Ok(env_or_err)) => env_or_err, // already Result<Envelope, RouterError>
+        };
+        let env = env_res?; // now env: Envelope
 
-        // decode response body
-        let (resp, _) =
-            bincode::decode_from_slice::<Resp, _>(&env.payload, bincode::config::standard())
-                .map_err(|e| RouterError::Decode(e.to_string()))?;
-        Ok(resp) // `_permit` drops here
+        let (resp, _) = bincode::decode_from_slice::<Resp, _>(
+            &env.payload,
+            bincode::config::standard(),
+        ).map_err(|e| RouterError::Decode(e.to_string()))?;
+        Ok(resp)
+
     }
 
     /*──────── optional convenience (legacy, proto 0) ────────*/
@@ -650,14 +734,14 @@ impl Router {
 mod tests {
     use super::*;
     use crate::communication::transports::{
-        Connector, PeerResolver,
         inmem::{InMemConnector, InMemResolver},
+        Connector, PeerResolver,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::{
         sync::{mpsc, oneshot},
         task::yield_now,
-        time::{Duration as TDuration, advance},
+        time::{advance, Duration as TDuration},
     };
 
     // Unique namespace per test for in-mem transport isolation
@@ -927,7 +1011,13 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(err, RouterError::Denied(_)));
+        assert!(matches!(
+            err,
+            RouterError::Denied {
+                reason: DenyReason::PeerInflight,
+                ..
+            }
+        ));
 
         // Let the first finish
         let _ = tx_release.send(());
@@ -936,7 +1026,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn handler_error_is_returned_as_remote_error() {
+    async fn handler_error_is_returned_as_handler_variant() {
         let ns = ns();
         let a = InMemConnector::with_namespace(pid(1), ns);
         let b = InMemConnector::with_namespace(pid(2), ns);
@@ -967,8 +1057,7 @@ mod tests {
             .unwrap_err();
 
         match err {
-            RouterError::Remote { code, msg } => {
-                assert_eq!(code, 500, "server maps handler Err(...) to 500");
+            RouterError::Handler(msg) => {
                 assert_eq!(msg, "E418:teapot");
             }
             other => panic!("unexpected error: {other:?}"),
@@ -1072,7 +1161,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn oversize_response_maps_to_413() {
+    async fn oversize_response_maps_to_denied_frame_too_large() {
         use tokio::task::yield_now;
 
         let ns = ns();
@@ -1120,8 +1209,10 @@ mod tests {
             .unwrap_err();
 
         match err {
-            RouterError::Remote { code, .. } => assert_eq!(code, 413, "should map oversize to 413"),
-            other => panic!("expected Remote 413, got {other:?}"),
+            RouterError::Denied { reason, .. } => {
+                assert_eq!(reason, DenyReason::FrameTooLarge, "should map oversize to Denied(FrameTooLarge)");
+            }
+            other => panic!("expected Denied(FrameTooLarge), got {other:?}"),
         }
     }
 
@@ -1166,7 +1257,13 @@ mod tests {
             .notify_on(PROTO_TEST, pid(2), &Msg::Notify("y".into()))
             .await
             .unwrap_err();
-        assert!(matches!(e, RouterError::Denied(r) if r == "outbound rate"));
+        assert!(matches!(
+            e,
+            RouterError::Denied {
+                reason: DenyReason::OutboundRate,
+                retry_after_ms: None
+            }
+        ));
 
         // Drain deliveries (bounded spin, deterministic)
         let first = {
@@ -1211,3 +1308,4 @@ mod tests {
         assert_eq!(z, "z");
     }
 }
+
