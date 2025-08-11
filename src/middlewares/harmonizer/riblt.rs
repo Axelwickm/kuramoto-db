@@ -3,6 +3,8 @@ use std::collections::{BinaryHeap, HashSet, VecDeque};
 use std::fmt::Debug;
 use std::hash::{Hash, Hasher};
 
+use bincode::{Decode, Encode};
+
 // Feature flag for debug printing
 #[cfg(feature = "riblt_debug")]
 macro_rules! debug_print {
@@ -86,7 +88,7 @@ impl<const BYTES: usize, S: Symbol<BYTES>> SymbolMappingGenerator<BYTES, S> {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct CodedSymbol<const BYTES: usize, S: Symbol<BYTES>> {
     pub count: i64,
     pub xor: [u8; BYTES],

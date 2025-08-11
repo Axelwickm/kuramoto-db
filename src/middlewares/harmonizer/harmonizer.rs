@@ -227,6 +227,7 @@ impl Middleware for Harmonizer {
                 mins: smallvec![],
                 maxs: smallvec![],
             },
+            level: 0,
             children: ChildSet {
                 parent: avail_id,
                 children: vec![sym],
@@ -284,7 +285,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::{clock::MockClock, storage_entity::*};
+    use crate::{clock::MockClock, communication::router::Router, storage_entity::*};
     use redb::TableDefinition;
     use tempfile::tempdir;
 
@@ -351,10 +352,13 @@ mod tests {
 
         /* -- build DB, then inject real Arc<KuramotoDb> -- */
         let dir = tempdir().unwrap();
+        let clock = Arc::new(MockClock::new(0));
+        let router = Router::new(Default::default(), clock.clone());
         let db = KuramotoDb::new(
             dir.path().join("t.redb").to_str().unwrap(),
-            Arc::new(MockClock::new(0)),
+            clock,
             vec![h.clone()],
+            router,
         )
         .await;
 

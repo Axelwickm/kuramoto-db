@@ -2,14 +2,14 @@ use std::{
     collections::HashMap,
     fmt,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc, Mutex, RwLock,
+        atomic::{AtomicU64, Ordering},
     },
     time::Duration,
 };
 
 use bincode::{Decode, Encode};
-use tokio::sync::{mpsc, oneshot, Semaphore};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::{
@@ -209,9 +209,13 @@ impl Router {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Register a handler for a protocol id.
+    /// Register a handler for a protocol id. Fail if already taken
     pub fn set_handler(&self, proto: u16, h: Arc<dyn Handler>) {
         let mut g = self.handlers.write().unwrap();
+        assert!(
+            !g.contains_key(&proto),
+            "protocol id {proto} already registered"
+        );
         g.insert(proto, h);
     }
 
@@ -320,13 +324,7 @@ impl Router {
         major == self.cfg.version_major && minor >= self.cfg.version_minor
     }
 
-    async fn send_error(
-        &self,
-        peer: PeerId,
-        correl: MsgId,
-        proto: u16,
-        err: RouterError,
-    ) {
+    async fn send_error(&self, peer: PeerId, correl: MsgId, proto: u16, err: RouterError) {
         // Encode RouterError payload
         let payload = match bincode::encode_to_vec(err, bincode::config::standard()) {
             Ok(p) => p,
@@ -703,12 +701,10 @@ impl Router {
         };
         let env = env_res?; // now env: Envelope
 
-        let (resp, _) = bincode::decode_from_slice::<Resp, _>(
-            &env.payload,
-            bincode::config::standard(),
-        ).map_err(|e| RouterError::Decode(e.to_string()))?;
+        let (resp, _) =
+            bincode::decode_from_slice::<Resp, _>(&env.payload, bincode::config::standard())
+                .map_err(|e| RouterError::Decode(e.to_string()))?;
         Ok(resp)
-
     }
 
     /*──────── optional convenience (legacy, proto 0) ────────*/
@@ -734,14 +730,14 @@ impl Router {
 mod tests {
     use super::*;
     use crate::communication::transports::{
-        inmem::{InMemConnector, InMemResolver},
         Connector, PeerResolver,
+        inmem::{InMemConnector, InMemResolver},
     };
     use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::{
         sync::{mpsc, oneshot},
         task::yield_now,
-        time::{advance, Duration as TDuration},
+        time::{Duration as TDuration, advance},
     };
 
     // Unique namespace per test for in-mem transport isolation
@@ -1210,7 +1206,11 @@ mod tests {
 
         match err {
             RouterError::Denied { reason, .. } => {
-                assert_eq!(reason, DenyReason::FrameTooLarge, "should map oversize to Denied(FrameTooLarge)");
+                assert_eq!(
+                    reason,
+                    DenyReason::FrameTooLarge,
+                    "should map oversize to Denied(FrameTooLarge)"
+                );
             }
             other => panic!("expected Denied(FrameTooLarge), got {other:?}"),
         }
@@ -1308,4 +1308,3 @@ mod tests {
         assert_eq!(z, "z");
     }
 }
-

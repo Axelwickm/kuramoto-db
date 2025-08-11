@@ -6,6 +6,7 @@ use std::sync::Arc;
 use tempfile::tempdir;
 
 use crate::clock::MockClock;
+use crate::communication::router::Router;
 use crate::{
     KuramotoDb, StaticTableDef, WriteBatch, WriteRequest,
     meta::BlobMeta,
@@ -138,10 +139,12 @@ async fn assert_get_by_index<E: StorageEntity + PartialEq + std::fmt::Debug>(
 async fn insert_and_read() {
     let dir = tempdir().unwrap();
     let clock = Arc::new(MockClock::new(1_000));
+    let router = Router::new(Default::default(), clock.clone());
     let sys = KuramotoDb::new(
         dir.path().join("db.redb").to_str().unwrap(),
         clock.clone(),
         vec![],
+        router,
     )
     .await;
 
@@ -165,10 +168,12 @@ async fn insert_and_read() {
 async fn overwrite_updates_meta() {
     let dir = tempdir().unwrap();
     let clock = Arc::new(MockClock::new(10));
+    let router = Router::new(Default::default(), clock.clone());
     let sys = KuramotoDb::new(
         dir.path().join("db.redb").to_str().unwrap(),
         clock.clone(),
         vec![],
+        router,
     )
     .await;
 
@@ -192,10 +197,12 @@ async fn overwrite_updates_meta() {
 async fn delete_and_undelete() {
     let dir = tempdir().unwrap();
     let clock = Arc::new(MockClock::new(500));
+    let router = Router::new(Default::default(), clock.clone());
     let sys = KuramotoDb::new(
         dir.path().join("db.redb").to_str().unwrap(),
         clock.clone(),
         vec![],
+        router,
     )
     .await;
 
@@ -220,10 +227,12 @@ async fn delete_and_undelete() {
 async fn stale_version_rejected() {
     let dir = tempdir().unwrap();
     let clock = Arc::new(MockClock::new(50));
+    let router = Router::new(Default::default(), clock.clone());
     let sys = KuramotoDb::new(
         dir.path().join("stale.redb").to_str().unwrap(),
         clock.clone(),
         vec![],
+        router,
     )
     .await;
 
@@ -264,10 +273,12 @@ async fn stale_version_rejected() {
 async fn index_insert_update_delete() {
     let dir = tempdir().unwrap();
     let clock = Arc::new(MockClock::new(0));
+    let router = Router::new(Default::default(), clock.clone());
     let sys = KuramotoDb::new(
         dir.path().join("idx.redb").to_str().unwrap(),
         clock.clone(),
         vec![],
+        router,
     )
     .await;
 
@@ -303,10 +314,12 @@ async fn index_insert_update_delete() {
 async fn duplicate_index_rejected() {
     let dir = tempdir().unwrap();
     let clock = Arc::new(MockClock::new(0));
+    let router = Router::new(Default::default(), clock.clone());
     let sys = KuramotoDb::new(
         dir.path().join("dup.redb").to_str().unwrap(),
         clock.clone(),
         vec![],
+        router,
     )
     .await;
 
@@ -332,10 +345,12 @@ async fn duplicate_index_rejected() {
 async fn duplicate_index_allowed_nonunique() {
     let dir = tempdir().unwrap();
     let clock = Arc::new(MockClock::new(0));
+    let router = Router::new(Default::default(), clock.clone());
     let sys = KuramotoDb::new(
         dir.path().join("dup_ok.redb").to_str().unwrap(),
         clock.clone(),
         vec![],
+        router,
     )
     .await;
     sys.create_table_and_indexes::<TestEntity>().unwrap();
@@ -436,11 +451,13 @@ async fn middleware_applied_in_order() {
     // ───── assemble DB with middle-wares in a specific order ─────
     let dir = tempfile::tempdir().unwrap();
     let clock = Arc::new(MockClock::new(100)); // initial now = 100
+    let router = Router::new(Default::default(), clock.clone());
 
     let db = KuramotoDb::new(
         dir.path().join("order.redb").to_str().unwrap(),
         clock.clone(),
         vec![Arc::new(Add100), Arc::new(Double)], // <- order!
+        router,
     )
     .await;
     db.create_table_and_indexes::<TestEntity>().unwrap();
@@ -466,10 +483,13 @@ async fn middleware_applied_in_order() {
 #[tokio::test]
 async fn range_by_pk_basic() {
     let dir = tempdir().unwrap();
+    let clock = Arc::new(MockClock::new(0));
+    let router = Router::new(Default::default(), clock.clone());
     let db = KuramotoDb::new(
         dir.path().join("pk.redb").to_str().unwrap(),
-        Arc::new(MockClock::new(0)),
+        clock,
         vec![],
+        router,
     )
     .await;
     db.create_table_and_indexes::<TestEntity>().unwrap();
@@ -495,10 +515,13 @@ async fn range_by_pk_basic() {
 #[tokio::test]
 async fn range_by_index_basic() {
     let dir = tempdir().unwrap();
+    let clock = Arc::new(MockClock::new(0));
+    let router = Router::new(Default::default(), clock.clone());
     let db = KuramotoDb::new(
         dir.path().join("idx.redb").to_str().unwrap(),
-        Arc::new(MockClock::new(0)),
+        clock,
         vec![],
+        router,
     )
     .await;
     db.create_table_and_indexes::<TestEntity>().unwrap();
@@ -526,10 +549,13 @@ async fn range_by_index_basic() {
 #[tokio::test]
 async fn range_with_meta_by_pk_basic() {
     let dir = tempdir().unwrap();
+    let clock = Arc::new(MockClock::new(123)); // initial now = 100
+    let router = Router::new(Default::default(), clock.clone());
     let db = KuramotoDb::new(
         dir.path().join("pk_meta.redb").to_str().unwrap(),
-        Arc::new(MockClock::new(123)),
+        clock,
         vec![],
+        router,
     )
     .await;
     db.create_table_and_indexes::<TestEntity>().unwrap();
@@ -563,10 +589,13 @@ async fn range_with_meta_by_pk_basic() {
 #[tokio::test]
 async fn range_with_meta_by_index_basic() {
     let dir = tempdir().unwrap();
+    let clock = Arc::new(MockClock::new(999));
+    let router = Router::new(Default::default(), clock.clone());
     let db = KuramotoDb::new(
         dir.path().join("idx_meta.redb").to_str().unwrap(),
-        Arc::new(MockClock::new(999)),
+        clock,
         vec![],
+        router,
     )
     .await;
     db.create_table_and_indexes::<TestEntity>().unwrap();

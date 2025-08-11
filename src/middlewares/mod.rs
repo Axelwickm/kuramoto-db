@@ -16,6 +16,19 @@ pub trait Middleware: Send + Sync {
     ) -> Result<(), StorageError>;
 }
 
+// Just to hash the name into something nice and stable.
+pub const fn fnv1a_16(s: &str) -> u16 {
+    let mut hash: u32 = 0x811C_9DC5; // 32-bit offset basis
+    let mut i = 0;
+    let bytes = s.as_bytes();
+    while i < bytes.len() {
+        hash ^= bytes[i] as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
+        i += 1;
+    }
+    (hash & 0xFFFF) as u16
+}
+
 /*───────────────────────────────────────────────────────────────*/
 /* tests                                                         */
 /*───────────────────────────────────────────────────────────────*/
@@ -29,6 +42,7 @@ mod tests {
     use crate::{
         StaticTableDef,
         clock::{Clock, MockClock},
+        communication::router::Router,
         storage_entity::{IndexSpec, StorageEntity},
     };
 
@@ -104,12 +118,9 @@ mod tests {
         });
 
         // build DB with middleware
-        let db = KuramotoDb::new(
-            db_path.to_str().unwrap(),
-            Arc::new(MockClock::new(0)),
-            vec![mw],
-        )
-        .await;
+        let clock = Arc::new(MockClock::new(0));
+        let router = Router::new(Default::default(), clock.clone());
+        let db = KuramotoDb::new(db_path.to_str().unwrap(), clock, vec![mw], router).await;
 
         // create tables for Foo and insert one row
         db.create_table_and_indexes::<Foo>().unwrap();

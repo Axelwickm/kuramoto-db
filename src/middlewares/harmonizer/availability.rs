@@ -24,6 +24,7 @@ pub struct AvailabilityV0 {
     pub peer_id: UuidBytes,
 
     pub range: RangeCube,
+    pub level: u16,
     pub children: ChildSet,
 
     pub schema_hash: u64, // hash(dataset + struct_version + index_layout)

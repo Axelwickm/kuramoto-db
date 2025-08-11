@@ -5,6 +5,7 @@ use redb::{Database, TableDefinition};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::communication::router::Router;
 use crate::middlewares::Middleware;
 use crate::storage_entity::IndexCardinality;
 
@@ -78,6 +79,7 @@ pub struct KuramotoDb {
     write_tx: mpsc::Sender<WriteMsg>,
     clock: Arc<dyn Clock>,
     middlewares: Vec<Arc<dyn Middleware>>,
+    router: Arc<Router>,
 }
 
 impl KuramotoDb {
@@ -85,6 +87,7 @@ impl KuramotoDb {
         path: &str,
         clock: Arc<dyn Clock>,
         middlewares: Vec<Arc<dyn Middleware>>,
+        router: Arc<Router>,
     ) -> Arc<Self> {
         let db = Database::create(path).unwrap();
         let (write_tx, mut write_rx) = mpsc::channel(100);
@@ -95,6 +98,7 @@ impl KuramotoDb {
             write_tx,
             clock,
             middlewares,
+            router,
         });
         let sys2 = sys.clone();
         tokio::spawn(async move {

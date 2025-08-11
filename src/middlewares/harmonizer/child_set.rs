@@ -322,7 +322,9 @@ mod tests {
     use tokio::runtime::Runtime;
 
     /*── glue for db bootstrap ─────────────────────────────*/
-    use crate::{WriteBatch, clock::MockClock, middlewares::Middleware};
+    use crate::{
+        WriteBatch, clock::MockClock, communication::router::Router, middlewares::Middleware,
+    };
 
     struct NoopMw;
 
@@ -342,10 +344,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("redb.ub");
         rt.block_on(async {
+            let clock = Arc::new(MockClock::new(0));
+            let router = Router::new(Default::default(), clock.clone());
             KuramotoDb::new(
                 path.to_str().unwrap(),
-                Arc::new(MockClock::new(0)),
+                clock,
                 vec![Arc::new(NoopMw)],
+                router,
             )
             .await
         })
