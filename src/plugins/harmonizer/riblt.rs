@@ -88,7 +88,7 @@ impl<const BYTES: usize, S: Symbol<BYTES>> SymbolMappingGenerator<BYTES, S> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Encode, Decode)]
 pub struct CodedSymbol<const BYTES: usize, S: Symbol<BYTES>> {
     pub count: i64,
     pub xor: [u8; BYTES],

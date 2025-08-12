@@ -3,7 +3,7 @@ use redb::TableDefinition;
 
 use crate::{
     KuramotoDb, StaticTableDef,
-    middlewares::harmonizer::riblt::{CodedSymbol, Encoder, Symbol},
+    plugins::harmonizer::riblt::{CodedSymbol, Encoder, Symbol},
     storage_entity::{IndexSpec, StorageEntity},
     storage_error::StorageError,
     uuid_bytes::UuidBytes,
@@ -145,26 +145,6 @@ impl StorageEntity for DigestChunk {
 
     fn indexes() -> &'static [IndexSpec<Self>] {
         &[]
-    }
-}
-
-/*──────────────────── Cell Encode/Decode ───────────────────────*/
-
-impl Encode for Cell {
-    fn encode<E: BinEncoder>(&self, e: &mut E) -> Result<(), EncodeError> {
-        self.count.encode(e)?;
-        self.xor.encode(e)?;
-        Encode::encode(&self.hash, e)
-    }
-}
-impl Decode<()> for Cell {
-    fn decode<D: BinDecoder<Context = ()>>(d: &mut D) -> Result<Self, DecodeError> {
-        Ok(Self {
-            count: <i64 as Decode<()>>::decode(d)?,
-            xor: <[u8; 8] as Decode<()>>::decode(d)?,
-            hash: <u64 as Decode<()>>::decode(d)?,
-            _ty: core::marker::PhantomData,
-        })
     }
 }
 
@@ -323,14 +303,14 @@ mod tests {
 
     /*── glue for db bootstrap ─────────────────────────────*/
     use crate::{
-        WriteBatch, clock::MockClock, communication::router::Router, middlewares::Middleware,
+        WriteBatch, clock::MockClock, plugins::Plugin, plugins::communication::router::Router,
     };
 
     struct NoopMw;
 
     #[async_trait]
-    impl Middleware for NoopMw {
-        async fn before_write(
+    impl Plugin for NoopMw {
+        async fn before_update(
             &self,
             _db: &KuramotoDb,
             _txn: &WriteTransaction,
@@ -349,8 +329,10 @@ mod tests {
             KuramotoDb::new(
                 path.to_str().unwrap(),
                 clock,
-                vec![Arc::new(NoopMw)],
-                router,
+                vec![
+                    router.clone() as Arc<dyn crate::plugins::Plugin>,
+                    Arc::new(NoopMw) as Arc<dyn crate::plugins::Plugin>, // NoopMw is a plain value
+                ],
             )
             .await
         })

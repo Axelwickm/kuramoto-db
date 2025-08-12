@@ -1,20 +1,10 @@
 use async_trait::async_trait;
 use redb::WriteTransaction;
 
+pub mod communication;
 pub mod harmonizer;
 
 use crate::{KuramotoDb, WriteBatch, storage_error::StorageError};
-
-#[async_trait]
-pub trait Middleware: Send + Sync {
-    /// Inspect / mutate / veto a write
-    async fn before_write(
-        &self,
-        db: &KuramotoDb,
-        _txn: &WriteTransaction,
-        batch: &mut WriteBatch,
-    ) -> Result<(), StorageError>;
-}
 
 // Just to hash the name into something nice and stable.
 pub const fn fnv1a_16(s: &str) -> u16 {
@@ -29,39 +19,69 @@ pub const fn fnv1a_16(s: &str) -> u16 {
     (hash & 0xFFFF) as u16
 }
 
+#[async_trait]
+pub trait Plugin: Send + Sync + 'static {
+    async fn before_update(
+        &self,
+        db: &KuramotoDb,
+        txn: &WriteTransaction,
+        batch: &mut WriteBatch,
+    ) -> Result<(), StorageError>;
+}
+
 /*───────────────────────────────────────────────────────────────*/
 /* tests                                                         */
 /*───────────────────────────────────────────────────────────────*/
 #[cfg(test)]
 mod tests {
+    use super::*;
     use bincode::{Decode, Encode};
     use redb::TableDefinition;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use tempfile::tempdir;
 
+    use crate::storage_error::StorageError;
     use crate::{
-        StaticTableDef,
-        clock::{Clock, MockClock},
-        communication::router::Router,
+        KuramotoDb, StaticTableDef,
+        clock::MockClock,
         storage_entity::{IndexSpec, StorageEntity},
     };
 
-    use super::*;
-    /* ───── Middleware that counts calls ───── */
-    struct CounterMiddleware {
-        count: Arc<Mutex<u32>>,
-        db: Option<Arc<KuramotoDb>>,
+    /* ───── Hook that increments a counter ───── */
+    struct CounterHook {
+        count: Arc<AtomicU32>,
     }
 
     #[async_trait]
-    impl Middleware for CounterMiddleware {
-        async fn before_write(
+    impl Plugin for Arc<CounterHook> {
+        async fn before_update(
             &self,
             _db: &KuramotoDb,
             _txn: &WriteTransaction,
             _batch: &mut WriteBatch,
         ) -> Result<(), StorageError> {
-            *self.count.lock().unwrap() += 1;
+            self.count.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    /* ───── Plugin that registers the counter hook ───── */
+    struct CounterPlugin {
+        count: Arc<AtomicU32>,
+    }
+
+    #[async_trait]
+    impl Plugin for CounterPlugin {
+        async fn before_update(
+            &self,
+            _db: &KuramotoDb,
+            _txn: &WriteTransaction,
+            _batch: &mut WriteBatch,
+        ) -> Result<(), StorageError> {
+            self.count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
             Ok(())
         }
     }
@@ -105,28 +125,26 @@ mod tests {
 
     /* ───── The test ───── */
     #[tokio::test]
-    async fn middleware_runs_in_order() {
+    async fn plugin_before_update_runs() {
         // temp dir + db path
         let dir = tempdir().unwrap();
-        let db_path = dir.path().join("mw.redb");
+        let db_path = dir.path().join("plugins.redb");
 
-        // counter shared with middleware
-        let counter = Arc::new(Mutex::new(0u32));
-        let mw = Arc::new(CounterMiddleware {
+        // counter shared with hook
+        let counter = Arc::new(AtomicU32::new(0));
+        let plugin = Arc::new(CounterPlugin {
             count: counter.clone(),
-            db: None,
         });
 
-        // build DB with middleware
+        // build DB with plugin (build a Router even if unused)
         let clock = Arc::new(MockClock::new(0));
-        let router = Router::new(Default::default(), clock.clone());
-        let db = KuramotoDb::new(db_path.to_str().unwrap(), clock, vec![mw], router).await;
+        let db = KuramotoDb::new(db_path.to_str().unwrap(), clock, vec![plugin]).await;
 
         // create tables for Foo and insert one row
         db.create_table_and_indexes::<Foo>().unwrap();
         db.put(Foo { id: 1 }).await.unwrap();
 
-        // middleware must have run exactly once
-        assert_eq!(*counter.lock().unwrap(), 1);
+        // Hook must have run exactly once
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
     }
 }

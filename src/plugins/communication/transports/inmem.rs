@@ -4,7 +4,7 @@ use std::{
 };
 use tokio::sync::{RwLock, mpsc};
 
-use crate::communication::transports::{
+use crate::plugins::communication::transports::{
     Connector, PeerId, PeerResolver, TransportConn, TransportError,
 };
 

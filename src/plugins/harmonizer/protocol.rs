@@ -3,12 +3,11 @@ use bincode::{Decode, Encode};
 use std::sync::Arc;
 
 use crate::{
-    KuramotoDb,
-    communication::{
-        router::{Handler, Router},
-        transports::PeerId,
-    },
-    middlewares::{
+    plugins::{
+        communication::{
+            router::{Handler, Router},
+            transports::PeerId,
+        },
         fnv1a_16,
         harmonizer::{child_set::Cell, range_cube::RangeCube},
     },
@@ -114,15 +113,10 @@ pub enum HarmonizerResp {
 
 /*──────── Handler wiring ───────*/
 pub struct HarmonizerProto {
-    db: Arc<KuramotoDb>,
     // add watchlist/LRU here later if you want; keep v1 minimal
 }
 
 impl HarmonizerProto {
-    pub fn new(db: Arc<KuramotoDb>) -> Self {
-        Self { db }
-    }
-
     // helper: encode a response
     fn ok(resp: HarmonizerResp) -> Result<Vec<u8>, String> {
         bincode::encode_to_vec(resp, bincode::config::standard()).map_err(|e| e.to_string())
@@ -178,6 +172,6 @@ impl Handler for HarmonizerProto {
 }
 
 /*──────── Public helper: register with router ───────*/
-pub fn register_harmonizer_protocol(db: Arc<KuramotoDb>, router: Arc<Router>) {
-    router.set_handler(PROTO_HARMONIZER, Arc::new(HarmonizerProto::new(db)));
+pub fn register_harmonizer_protocol(router: Arc<Router>) {
+    router.set_handler(PROTO_HARMONIZER, Arc::new(HarmonizerProto {}));
 }

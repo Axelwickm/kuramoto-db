@@ -4,7 +4,7 @@ use redb::TableDefinition;
 
 use crate::{
     StaticTableDef,
-    middlewares::harmonizer::{child_set::ChildSet, range_cube::RangeCube},
+    plugins::harmonizer::{child_set::ChildSet, range_cube::RangeCube},
     storage_entity::{IndexSpec, StorageEntity},
     storage_error::StorageError,
     uuid_bytes::UuidBytes,

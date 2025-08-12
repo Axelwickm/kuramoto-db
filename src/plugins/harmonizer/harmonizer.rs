@@ -5,17 +5,22 @@ use redb::{TableHandle, WriteTransaction};
 use std::{
     collections::{HashSet, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
+    sync::Arc,
 };
 
 use smallvec::smallvec;
 
-use crate::middlewares::harmonizer::availability::{
-    AVAILABILITIES_META_TABLE, AVAILABILITIES_TABLE, Availability,
+use crate::plugins::harmonizer::range_cube::RangeCube;
+use crate::plugins::harmonizer::{
+    child_set::{ChildSet, Sym},
+    protocol::register_harmonizer_protocol,
 };
-use crate::middlewares::harmonizer::child_set::{ChildSet, Sym};
-use crate::middlewares::harmonizer::range_cube::RangeCube;
+use crate::plugins::{
+    communication::router::Router,
+    harmonizer::availability::{AVAILABILITIES_META_TABLE, AVAILABILITIES_TABLE, Availability},
+};
 use crate::{
-    KuramotoDb, StaticTableDef, WriteBatch, database::WriteRequest, middlewares::Middleware,
+    KuramotoDb, StaticTableDef, WriteBatch, database::WriteRequest, plugins::Plugin,
     storage_entity::StorageEntity, storage_error::StorageError, uuid_bytes::UuidBytes,
 };
 
@@ -38,7 +43,8 @@ pub struct Harmonizer {
 }
 
 impl Harmonizer {
-    pub fn new(scorer: Box<dyn Scorer>) -> Self {
+    pub fn new(scorer: Box<dyn Scorer>, router: Arc<Router>) -> Self {
+        register_harmonizer_protocol(router);
         Self {
             scorer,
             watched: HashSet::new(),
@@ -186,16 +192,17 @@ impl Harmonizer {
     }
 }
 
-/*──────────────────────── middleware impl (batch-based) ─────────────────────*/
+/*──────────────────────── plugin impl (batch-based) ─────────────────────*/
 
 #[async_trait]
-impl Middleware for Harmonizer {
+impl Plugin for Harmonizer {
     /// Called once per top-level write after the DB opened a write transaction.
     /// We *append* a secondary Availability write into the same batch/txn.
-    async fn before_write(
+    // #[async_trait]
+    async fn before_update(
         &self,
         db: &KuramotoDb,
-        _txn: &WriteTransaction,
+        txn: &WriteTransaction,
         batch: &mut WriteBatch,
     ) -> Result<(), StorageError> {
         // Only the primary request should drive middleware planning
@@ -285,7 +292,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::{clock::MockClock, communication::router::Router, storage_entity::*};
+    use crate::{clock::MockClock, plugins::communication::router::Router, storage_entity::*};
     use redb::TableDefinition;
     use tempfile::tempdir;
 
@@ -343,22 +350,22 @@ mod tests {
             }
         }
 
+        let clock = Arc::new(MockClock::new(0));
+        let router = Router::new(Default::default(), clock.clone());
+
         /* -- build middleware first (DB handle comes later) -- */
         let h = Arc::new({
-            let mut h = Harmonizer::new(Box::new(NullScore));
+            let mut h = Harmonizer::new(Box::new(NullScore), router);
             h.watch::<Foo>();
             h
         });
 
         /* -- build DB, then inject real Arc<KuramotoDb> -- */
         let dir = tempdir().unwrap();
-        let clock = Arc::new(MockClock::new(0));
-        let router = Router::new(Default::default(), clock.clone());
         let db = KuramotoDb::new(
             dir.path().join("t.redb").to_str().unwrap(),
             clock,
             vec![h.clone()],
-            router,
         )
         .await;
 

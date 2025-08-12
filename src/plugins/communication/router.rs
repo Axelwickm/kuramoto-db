@@ -1,3 +1,5 @@
+use async_trait::async_trait;
+use redb::WriteTransaction;
 use std::{
     collections::HashMap,
     fmt,
@@ -13,11 +15,16 @@ use tokio::sync::{Semaphore, mpsc, oneshot};
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::{
+    KuramotoDb, WriteBatch,
     clock::Clock,
-    communication::{
-        rate_limiter::RateLimiter,
-        transports::{PeerId, TransportConn},
+    plugins::{
+        Plugin,
+        communication::{
+            rate_limiter::RateLimiter,
+            transports::{PeerId, TransportConn},
+        },
     },
+    storage_error::StorageError,
 };
 
 /*──────────────────────── framing ───────────────────────*/
@@ -136,7 +143,7 @@ impl Default for RouterConfig {
 
 /*──────────────────────── handler API ──────────────────*/
 
-#[async_trait::async_trait]
+#[async_trait]
 pub trait Handler: Send + Sync + 'static {
     /// Handle a request and return encoded response bytes.
     async fn on_request(&self, peer: PeerId, body: &[u8]) -> Result<Vec<u8>, String>;
@@ -723,13 +730,25 @@ impl Router {
     }
 }
 
+#[async_trait]
+impl Plugin for Router {
+    async fn before_update(
+        &self,
+        db: &KuramotoDb,
+        txn: &WriteTransaction,
+        batch: &mut WriteBatch,
+    ) -> Result<(), StorageError> {
+        Ok(())
+    }
+}
+
 /*──────────────────────────────────────────────────────────────────────────────*/
 /* Tests (uses in-memory transport + MockClock)                                  */
 /*──────────────────────────────────────────────────────────────────────────────*/
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::communication::transports::{
+    use crate::plugins::communication::transports::{
         Connector, PeerResolver,
         inmem::{InMemConnector, InMemResolver},
     };
