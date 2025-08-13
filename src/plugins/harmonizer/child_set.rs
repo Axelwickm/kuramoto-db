@@ -318,6 +318,8 @@ mod tests {
         ) -> Result<(), StorageError> {
             Ok(())
         }
+
+        fn attach_db(&self, _db: std::sync::Arc<KuramotoDb>) {}
     }
 
     fn fresh_db(rt: &Runtime) -> Arc<KuramotoDb> {

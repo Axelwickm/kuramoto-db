@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use redb::WriteTransaction;
 
@@ -21,6 +23,8 @@ pub const fn fnv1a_16(s: &str) -> u16 {
 
 #[async_trait]
 pub trait Plugin: Send + Sync + 'static {
+    fn attach_db(&self, db: Arc<KuramotoDb>);
+
     async fn before_update(
         &self,
         db: &KuramotoDb,
@@ -64,6 +68,8 @@ mod tests {
             self.count.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
+
+        fn attach_db(&self, _db: Arc<KuramotoDb>) {}
     }
 
     /* ───── Plugin that registers the counter hook ───── */
@@ -84,6 +90,8 @@ mod tests {
 
             Ok(())
         }
+
+        fn attach_db(&self, _db: Arc<KuramotoDb>) {}
     }
 
     /* ───── Minimal entity (no indexes) ───── */

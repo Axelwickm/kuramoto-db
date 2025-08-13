@@ -2,8 +2,14 @@ use redb::ReadableTable;
 use redb::TableHandle;
 use redb::{Database, TableDefinition};
 
-use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
+
+use std::{
+    collections::HashMap,
+    future::Future,
+    pin::Pin,
+    sync::{Arc, RwLock},
+};
 
 use crate::plugins::Plugin;
 use crate::storage_entity::IndexCardinality;
@@ -54,6 +60,13 @@ pub enum WriteRequest {
     },
 }
 
+type TablePutFn = dyn for<'a> Fn(
+        &'a KuramotoDb,
+        &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = Result<(), StorageError>> + Send + 'a>>
+    + Send
+    + Sync;
+
 fn encode_nonunique_key(idx_key: &[u8], pk: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(idx_key.len() + 1 + pk.len());
     out.extend_from_slice(idx_key);
@@ -78,6 +91,8 @@ pub struct KuramotoDb {
     write_tx: mpsc::Sender<WriteMsg>,
     clock: Arc<dyn Clock>,
     plugins: Vec<Arc<dyn Plugin>>,
+
+    entity_putters: RwLock<HashMap<String, Arc<TablePutFn>>>,
 }
 
 impl KuramotoDb {
@@ -95,7 +110,12 @@ impl KuramotoDb {
             write_tx,
             clock,
             plugins,
+            entity_putters: RwLock::new(HashMap::new()),
         });
+
+        for p in &sys.plugins {
+            p.attach_db(sys.clone());
+        }
 
         let sys2 = sys.clone();
         tokio::spawn(async move {
@@ -108,23 +128,40 @@ impl KuramotoDb {
 
     /// Manually create a table and its indexes. Returns error if already exists.
     pub fn create_table_and_indexes<E: StorageEntity>(&self) -> Result<(), StorageError> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| StorageError::Other(e.to_string()))?;
-        // Create main table
-        txn.open_table(E::table_def().clone())
-            .map_err(|e| StorageError::Other(e.to_string()))?;
-        // Create meta table
-        txn.open_table(E::meta_table_def().clone())
-            .map_err(|e| StorageError::Other(e.to_string()))?;
-        // Create index tables
-        for idx in E::indexes() {
-            txn.open_table(idx.table_def.clone())
+        {
+            // For decoding and putting bytes we gotta map to a type
+            let mut m = self.entity_putters.write().unwrap();
+            m.insert(
+                E::table_def().name().to_string(),
+                Arc::new(|db, bytes| {
+                    Box::pin(async move {
+                        // decode via E and call the normal typed put()
+                        let e = E::load_and_migrate(bytes)?;
+                        db.put::<E>(e).await
+                    })
+                }),
+            );
+        }
+        {
+            // Create the table
+            let txn = self
+                .db
+                .begin_write()
+                .map_err(|e| StorageError::Other(e.to_string()))?;
+            // Create main table
+            txn.open_table(E::table_def().clone())
+                .map_err(|e| StorageError::Other(e.to_string()))?;
+            // Create meta table
+            txn.open_table(E::meta_table_def().clone())
+                .map_err(|e| StorageError::Other(e.to_string()))?;
+            // Create index tables
+            for idx in E::indexes() {
+                txn.open_table(idx.table_def.clone())
+                    .map_err(|e| StorageError::Other(e.to_string()))?;
+            }
+            txn.commit()
                 .map_err(|e| StorageError::Other(e.to_string()))?;
         }
-        txn.commit()
-            .map_err(|e| StorageError::Other(e.to_string()))?;
         Ok(())
     }
 
@@ -209,6 +246,28 @@ impl KuramotoDb {
             }
         }
         Ok(out)
+    }
+
+    pub async fn put_by_table_bytes(
+        &self,
+        table_name: &str,
+        bytes: &[u8],
+    ) -> Result<(), StorageError> {
+        // Take a clone of the Arc<putter> while holding the read lock,
+        // then drop the lock before we .await, so the future is Send.
+        let putter = {
+            let m = self.entity_putters.read().unwrap();
+            m.get(table_name).cloned()
+        };
+
+        let Some(put) = putter else {
+            return Err(StorageError::Other(format!(
+                "no entity registered for table '{table_name}'"
+            )));
+        };
+
+        // Now no lock/guard is live across this await.
+        put(self, bytes).await
     }
 
     pub async fn put<E: StorageEntity>(&self, entity: E) -> Result<(), StorageError> {
@@ -761,6 +820,7 @@ mod tests {
     use async_trait::async_trait;
     use bincode::{Decode, Encode};
     use redb::TableDefinition;
+    use redb::TableHandle;
     use redb::WriteTransaction;
     use std::sync::Arc;
     use tempfile::tempdir;
@@ -1168,6 +1228,8 @@ mod tests {
             }
             Ok(())
         }
+
+        fn attach_db(&self, db: Arc<KuramotoDb>) {}
     }
 
     struct DoublePlugin;
@@ -1192,6 +1254,8 @@ mod tests {
             }
             Ok(())
         }
+
+        fn attach_db(&self, db: Arc<KuramotoDb>) {}
     }
 
     #[tokio::test]
@@ -1353,6 +1417,71 @@ mod tests {
         for ((e, meta), expected) in got.iter().zip(rows.iter()) {
             assert_eq!(e, expected);
             assert_eq!(meta.created_at, 999);
+        }
+    }
+
+    #[tokio::test]
+    async fn put_by_table_bytes_decodes_and_indexes() {
+        // Arrange: fresh DB with TestEntity registered
+        let dir = tempdir().unwrap();
+        let clock = Arc::new(MockClock::new(1_234));
+        let db = KuramotoDb::new(
+            dir.path().join("raw_put.redb").to_str().unwrap(),
+            clock.clone(),
+            vec![],
+        )
+        .await;
+
+        db.create_table_and_indexes::<TestEntity>().unwrap();
+
+        // Build a TestEntity and encode it using its StorageEntity format (version byte + bincode)
+        let e = TestEntity {
+            id: 42,
+            name: "Alice".into(),
+            value: 7,
+        };
+        let raw = e.to_bytes();
+
+        // Act: write by table name + raw bytes (no Arc self, just &self)
+        db.put_by_table_bytes(TEST_TABLE.name(), &raw)
+            .await
+            .unwrap();
+
+        // Assert: data is present and equals original
+        let got = db
+            .get_data::<TestEntity>(&e.id.to_be_bytes())
+            .await
+            .expect("entity should exist");
+        assert_eq!(got, e);
+
+        // Assert: UNIQUE index ("name") points to the PK
+        let main = db
+            .get_index(&TEST_NAME_INDEX, b"Alice")
+            .await
+            .expect("index read should succeed")
+            .expect("unique index row should exist");
+        assert_eq!(main, e.id.to_be_bytes());
+
+        // Assert: NON-UNIQUE index ("value") can fetch back this entity
+        let by_value = db
+            .get_by_index_all::<TestEntity>(&TEST_VALUE_INDEX, &7i32.to_be_bytes())
+            .await
+            .expect("non-unique lookup should succeed");
+        assert!(by_value.iter().any(|x| x == &e));
+
+        // Error case: unknown table name
+        let err = db
+            .put_by_table_bytes("no_such_table", &raw)
+            .await
+            .expect_err("unknown table should error");
+        match err {
+            StorageError::Other(msg) => {
+                assert!(
+                    msg.contains("no entity registered for table"),
+                    "unexpected message: {msg}"
+                )
+            }
+            other => panic!("unexpected error variant: {other:?}"),
         }
     }
 }

@@ -1,8 +1,8 @@
 use async_recursion::async_recursion;
 use async_trait::async_trait;
 use bincode::{Decode, Encode};
-use rand::Rng;
 use redb::{TableHandle, WriteTransaction};
+use std::sync::{OnceLock, Weak};
 use std::{collections::HashSet, sync::Arc};
 use tokio::sync::mpsc;
 
@@ -40,57 +40,58 @@ pub trait Scorer: Send + Sync {
 
 enum OutboxItem {
     Notify { peer: PeerId, msg: HarmonizerMsg },
-    // You can add request/response items later if needed
 }
 
 /*────────────────────────────────────────────────────────────────────────────*/
 
 pub struct Harmonizer {
+    db: OnceLock<Weak<KuramotoDb>>,
     scorer: Box<dyn Scorer>,
-    watched: HashSet<&'static str>,
+    watched_tables: HashSet<&'static str>,
     router: Arc<Router>,
-
-    // inbox for protocol requests/notifications
     inbox_tx: mpsc::Sender<ProtoCommand>,
-    // outbox for network sends driven by Harmonizer logic
     outbox_tx: mpsc::Sender<OutboxItem>,
-
-    // test-only: simple list of peers to notify for v0 flow
-    bootstrap_peers: Vec<PeerId>,
+    peers: tokio::sync::RwLock<Vec<PeerId>>, // dynamic peers
 }
 
 impl Harmonizer {
-    pub fn new(scorer: Box<dyn Scorer>, router: Arc<Router>) -> Self {
-        // queues
-        let (inbox_tx, mut inbox_rx) = mpsc::channel::<ProtoCommand>(256);
-        let (outbox_tx, mut outbox_rx) = mpsc::channel::<OutboxItem>(256);
+    pub fn new(
+        scorer: Box<dyn Scorer>,
+        router: Arc<Router>,
+        watched_tables: HashSet<&'static str>,
+    ) -> Arc<Self> {
+        let (inbox_tx, inbox_rx) = mpsc::channel::<ProtoCommand>(256);
+        let (outbox_tx, outbox_rx) = mpsc::channel::<OutboxItem>(256);
 
-        // register protocol handler with a clone of inbox sender
         register_harmonizer_protocol(router.clone(), inbox_tx.clone());
 
-        let this_router = router.clone();
-
-        // spawn: outbox network worker
-        tokio::spawn(async move {
-            while let Some(item) = outbox_rx.recv().await {
-                match item {
-                    OutboxItem::Notify { peer, msg } => {
-                        // fire-and-forget; errors are OK for v0
-                        let _ = this_router.notify_on(PROTO_HARMONIZER, peer, &msg).await;
-                    }
-                }
-            }
+        let hz = Arc::new(Self {
+            scorer,
+            watched_tables: watched_tables,
+            router: router.clone(),
+            inbox_tx,
+            outbox_tx,
+            peers: tokio::sync::RwLock::new(Vec::new()),
+            db: OnceLock::new(),
         });
 
-        // spawn: inbox command worker (serialize Harmonizer protocol handling)
+        hz.start_inbox_worker(inbox_rx);
+        hz.start_outbox_worker(outbox_rx);
+
+        hz
+    }
+
+    pub async fn add_peer(&self, p: PeerId) {
+        self.peers.write().await.push(p);
+    }
+
+    fn start_inbox_worker(self: &Arc<Self>, mut inbox_rx: mpsc::Receiver<ProtoCommand>) {
+        let this = Arc::clone(self);
         tokio::spawn(async move {
             while let Some(cmd) = inbox_rx.recv().await {
-                // For now, we don’t have access to DB here; the actual Harmonizer
-                // instance will spawn its own loop that replaces this placeholder.
-                // This placeholder simply responds minimally so wiring compiles.
                 match cmd {
                     ProtoCommand::HandleRequest { respond, msg, .. } => {
-                        // Minimal, empty responses. Replace with real logic later.
+                        // (unchanged placeholder response)
                         let resp = match msg {
                             HarmonizerMsg::GetChildrenByRange(_)
                             | HarmonizerMsg::GetChildrenByAvailability(_) => {
@@ -119,37 +120,53 @@ impl Harmonizer {
                         };
                         let _ = respond.send(Ok(resp));
                     }
-                    ProtoCommand::HandleNotify { .. } => {
-                        // swallow for now
+
+                    ProtoCommand::HandleNotify { peer: _peer, msg } => {
+                        match msg {
+                            HarmonizerMsg::UpdateWithAttestation(req) => {
+                                // upgrade DB handle
+                                let db = match this.db.get().and_then(|w| w.upgrade()) {
+                                    Some(db) => db,
+                                    None => {
+                                        tracing::warn!(
+                                            "harmonizer: no DB attached; dropping update"
+                                        );
+                                        continue;
+                                    }
+                                };
+
+                                // apply raw bytes to the named table (this will trigger our own before_update)
+                                if let Err(e) =
+                                    db.put_by_table_bytes(&req.table, &req.entity_bytes).await
+                                {
+                                    tracing::warn!(error = %e, "harmonizer: put_by_table_bytes failed");
+                                }
+                                // v0: do nothing else (no drift check, no reply, no rebroadcast)
+                            }
+                            _ => {
+                                // ignore other notify types in v0
+                            }
+                        }
                     }
                 }
             }
         });
-
-        Self {
-            scorer,
-            watched: HashSet::new(),
-            router,
-            inbox_tx,
-            outbox_tx,
-            bootstrap_peers: Vec::new(),
-        }
     }
 
-    /// test-only: tell the harmonizer who to notify
-    pub fn add_peer(&mut self, p: crate::plugins::communication::transports::PeerId) {
-        self.bootstrap_peers.push(p);
-    }
-
-    pub fn watch<E: StorageEntity>(&mut self) {
-        self.watched.insert(E::table_def().name());
+    fn start_outbox_worker(&self, mut outbox_rx: mpsc::Receiver<OutboxItem>) {
+        let router = self.router.clone();
+        tokio::spawn(async move {
+            while let Some(item) = outbox_rx.recv().await {
+                if let OutboxItem::Notify { peer, msg } = item {
+                    let _ = router.notify_on(PROTO_HARMONIZER, peer, &msg).await;
+                }
+            }
+        });
     }
 
     fn is_watched(&self, tbl: StaticTableDef) -> bool {
-        self.watched.contains(tbl.name())
+        self.watched_tables.contains(tbl.name())
     }
-
-    /*──────── stable symbol & small digest helpers ───────*/
 
     #[inline]
     fn splitmix64(mut x: u64) -> u64 {
@@ -184,8 +201,6 @@ impl Harmonizer {
         }
         v
     }
-
-    /*──────────────────── range cover (async DFS) ─────────────────────────*/
 
     pub async fn range_cover<F>(
         &self,
@@ -293,8 +308,6 @@ impl Harmonizer {
     }
 }
 
-/*──────────────────────── Plugin: append leaf + emit v0 update ───────────*/
-
 #[async_trait]
 impl Plugin for Harmonizer {
     async fn before_update(
@@ -307,7 +320,6 @@ impl Plugin for Harmonizer {
             return Ok(());
         };
 
-        // copy out what we need, then drop the borrow on `batch`
         let (data_table, key_owned, entity_bytes) = match first {
             WriteRequest::Put {
                 data_table,
@@ -322,7 +334,7 @@ impl Plugin for Harmonizer {
         let sym = self.child_sym(data_table, &key_owned);
 
         let avail_id = UuidBytes::new();
-        let peer_id = UuidBytes::new(); // TODO: supply real peer id
+        let peer_id = UuidBytes::new(); // TODO: real peer id
 
         let avail = Availability {
             key: avail_id,
@@ -343,7 +355,6 @@ impl Plugin for Harmonizer {
             complete: true,
         };
 
-        // serialize availability + meta
         let value = avail.to_bytes();
 
         #[derive(Encode, Decode)]
@@ -360,7 +371,6 @@ impl Plugin for Harmonizer {
         )
         .map_err(|e| StorageError::Bincode(e.to_string()))?;
 
-        // append availability write
         batch.push(WriteRequest::Put {
             data_table: AVAILABILITIES_TABLE,
             meta_table: AVAILABILITIES_META_TABLE,
@@ -371,8 +381,9 @@ impl Plugin for Harmonizer {
             index_puts: Vec::new(),
         });
 
-        // v0: broadcast direct UpdateWithAttestation to any bootstrapped peers
-        if !self.bootstrap_peers.is_empty() {
+        let peers = { self.peers.read().await.clone() }; // drop lock before awaits
+
+        if !peers.is_empty() {
             let att = UpdateWithAttestation {
                 table: data_table.name().to_string(),
                 pk: key_owned.clone(),
@@ -389,7 +400,7 @@ impl Plugin for Harmonizer {
             };
             let msg = HarmonizerMsg::UpdateWithAttestation(att);
 
-            for &peer in &self.bootstrap_peers {
+            for &peer in &peers {
                 let _ = self
                     .outbox_tx
                     .send(OutboxItem::Notify {
@@ -401,6 +412,10 @@ impl Plugin for Harmonizer {
         }
 
         Ok(())
+    }
+
+    fn attach_db(&self, db: Arc<KuramotoDb>) {
+        self.db.set(Arc::downgrade(&db)).unwrap();
     }
 }
 
@@ -416,9 +431,10 @@ mod tests {
         Connector, PeerId, PeerResolver,
         inmem::{InMemConnector, InMemResolver},
     };
-    use crate::plugins::fnv1a_16;
     use crate::storage_entity::*;
+
     use bincode::{Decode, Encode};
+    use rand::Rng;
     use redb::TableDefinition;
     use std::sync::Arc;
     use tempfile::tempdir;
@@ -493,9 +509,11 @@ mod tests {
         let clock = Arc::new(MockClock::new(0));
         let router = Router::new(RouterConfig::default(), clock.clone());
 
-        let mut hz = Harmonizer::new(Box::new(NullScore), router);
-        hz.watch::<Foo>();
-        let hz = Arc::new(hz);
+        let hz = Harmonizer::new(
+            Box::new(NullScore),
+            router,
+            HashSet::from([Foo::table_def().name()]),
+        );
 
         let dir = tempdir().unwrap();
         let db = KuramotoDb::new(
@@ -567,10 +585,12 @@ mod tests {
         rtr_b.connect_peer(pid_a, b_to_a);
 
         // Build Harmonizer on A (will register its protocol on A’s router)
-        let mut hz_a = Harmonizer::new(Box::new(NullScore), rtr_a.clone());
-        hz_a.watch::<Foo>();
-        hz_a.add_peer(pid_b); // tell A to notify B
-        let hz_a = Arc::new(hz_a);
+        let hz_a = Harmonizer::new(
+            Box::new(NullScore),
+            rtr_a,
+            HashSet::from([Foo::table_def().name()]),
+        );
+        hz_a.add_peer(pid_b).await; // tell A to notify B
 
         // DB A
         let dir_a = tempdir().unwrap();
@@ -588,6 +608,7 @@ mod tests {
         struct Probe {
             tx: mpsc::Sender<UpdateWithAttestation>,
         }
+
         #[async_trait::async_trait]
         impl Handler for Probe {
             async fn on_request(&self, _peer: PeerId, _body: &[u8]) -> Result<Vec<u8>, String> {

@@ -735,11 +735,15 @@ impl Router {
 impl Plugin for Router {
     async fn before_update(
         &self,
-        db: &KuramotoDb,
-        txn: &WriteTransaction,
-        batch: &mut WriteBatch,
+        _db: &KuramotoDb,
+        _txn: &WriteTransaction,
+        _batch: &mut WriteBatch,
     ) -> Result<(), StorageError> {
         Ok(())
+    }
+
+    fn attach_db(&self, _db: std::sync::Arc<KuramotoDb>) {
+        // DB not needed, so skipping saving here
     }
 }
 
