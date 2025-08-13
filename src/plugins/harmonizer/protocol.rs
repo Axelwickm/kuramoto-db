@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use bincode::{Decode, Encode};
 use std::sync::Arc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::{
     plugins::{
@@ -15,6 +16,8 @@ use crate::{
 };
 
 pub const PROTO_HARMONIZER: u16 = fnv1a_16("kuramoto.middleware.harmonizer.v1");
+
+/*────────────────────────── Types on the wire ─────────────────────────*/
 
 #[derive(Clone, Debug, Encode, Decode)]
 pub struct AvailabilityHeader {
@@ -111,67 +114,70 @@ pub enum HarmonizerResp {
     Update(UpdateResponse),
 }
 
-/*──────── Handler wiring ───────*/
+/*────────────────────────── Inbox interface ──────────────────────────*/
+/* The protocol handler forwards into this channel owned by Harmonizer */
+
+pub enum ProtoCommand {
+    /// Router made a request. We forward the decoded message and expect a response.
+    HandleRequest {
+        peer: PeerId,
+        msg: HarmonizerMsg,
+        respond: oneshot::Sender<Result<HarmonizerResp, String>>,
+    },
+    /// Router delivered a notify. No response path.
+    HandleNotify { peer: PeerId, msg: HarmonizerMsg },
+}
+
+/*──────────────────────── Protocol handler ───────────────────────────*/
+
 pub struct HarmonizerProto {
-    // add watchlist/LRU here later if you want; keep v1 minimal
+    inbox: mpsc::Sender<ProtoCommand>,
 }
 
 impl HarmonizerProto {
-    // helper: encode a response
-    fn ok(resp: HarmonizerResp) -> Result<Vec<u8>, String> {
+    pub fn new(inbox: mpsc::Sender<ProtoCommand>) -> Self {
+        Self { inbox }
+    }
+
+    fn ok_bytes(resp: HarmonizerResp) -> Result<Vec<u8>, String> {
         bincode::encode_to_vec(resp, bincode::config::standard()).map_err(|e| e.to_string())
     }
 }
 
 #[async_trait]
 impl Handler for HarmonizerProto {
-    async fn on_request(&self, _peer: PeerId, body: &[u8]) -> Result<Vec<u8>, String> {
+    async fn on_request(&self, peer: PeerId, body: &[u8]) -> Result<Vec<u8>, String> {
         let (msg, _) =
             bincode::decode_from_slice::<HarmonizerMsg, _>(body, bincode::config::standard())
                 .map_err(|e| e.to_string())?;
 
-        match msg {
-            HarmonizerMsg::GetChildrenByRange(req) => {
-                // TODO: implement paging + headers; placeholder empty result
-                Self::ok(HarmonizerResp::Children(ChildrenResponse {
-                    items: vec![],
-                    next: None,
-                    headers: vec![],
-                }))
-            }
-            HarmonizerMsg::GetChildrenByAvailability(req) => {
-                // TODO: stream direct children for availability_id
-                Self::ok(HarmonizerResp::Children(ChildrenResponse {
-                    items: vec![],
-                    next: None,
-                    headers: vec![],
-                }))
-            }
-            HarmonizerMsg::GetSymbolsByAvailability(req) => {
-                // TODO: return coded cells (RIBLT) for availability_id
-                Self::ok(HarmonizerResp::Symbols(SymbolsResponse {
-                    cells: vec![],
-                    next: None,
-                    header: None,
-                }))
-            }
-            HarmonizerMsg::UpdateWithAttestation(req) => {
-                // TODO: apply entity; compute targeted reconcile ask + headers
-                Self::ok(HarmonizerResp::Update(UpdateResponse {
-                    accepted: true,
-                    need: None,
-                    headers: vec![],
-                }))
-            }
-        }
+        let (tx, rx) = oneshot::channel();
+        self.inbox
+            .send(ProtoCommand::HandleRequest {
+                peer,
+                msg,
+                respond: tx,
+            })
+            .await
+            .map_err(|_| "inbox closed".to_string())?;
+
+        let resp = rx.await.map_err(|_| "inbox dropped".to_string())??;
+        Self::ok_bytes(resp)
     }
 
-    async fn on_notify(&self, _peer: PeerId, _body: &[u8]) -> Result<(), String> {
-        Ok(())
+    async fn on_notify(&self, peer: PeerId, body: &[u8]) -> Result<(), String> {
+        let (msg, _) =
+            bincode::decode_from_slice::<HarmonizerMsg, _>(body, bincode::config::standard())
+                .map_err(|e| e.to_string())?;
+
+        self.inbox
+            .send(ProtoCommand::HandleNotify { peer, msg })
+            .await
+            .map_err(|_| "inbox closed".to_string())
     }
 }
 
 /*──────── Public helper: register with router ───────*/
-pub fn register_harmonizer_protocol(router: Arc<Router>) {
-    router.set_handler(PROTO_HARMONIZER, Arc::new(HarmonizerProto {}));
+pub fn register_harmonizer_protocol(router: Arc<Router>, inbox: mpsc::Sender<ProtoCommand>) {
+    router.set_handler(PROTO_HARMONIZER, Arc::new(HarmonizerProto::new(inbox)));
 }

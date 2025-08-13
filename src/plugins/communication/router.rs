@@ -125,6 +125,7 @@ pub struct RouterConfig {
     pub burst: u32,        // used for both in/out buckets (for now)
     pub strike_limit: u32,
 }
+
 impl Default for RouterConfig {
     fn default() -> Self {
         Self {
