@@ -654,4 +654,97 @@ mod tests {
             "v0 pushes entity bytes inline"
         );
     }
+
+    /// End-to-end: A inserts, Harmonizer sends UpdateWithAttestation,
+    /// B ingests via proto handler and writes to its DB.
+    #[tokio::test(start_paused = true)]
+    async fn empty_to_sync_single_insert() {
+        struct NullScore;
+        impl Scorer for NullScore {
+            fn score(&self, _: &PeerContext, _: &Availability) -> f32 {
+                0.0
+            }
+        }
+
+        // shared clock + two routers
+        let clock = Arc::new(MockClock::new(0));
+        let rtr_a = Router::new(RouterConfig::default(), clock.clone());
+        let rtr_b = Router::new(RouterConfig::default(), clock.clone());
+
+        // connect peers via in-mem transport
+        let ns: u64 = rand::rng().random();
+        let pid_a = pid(1);
+        let pid_b = pid(2);
+        let conn_a = InMemConnector::with_namespace(pid_a, ns);
+        let conn_b = InMemConnector::with_namespace(pid_b, ns);
+        let resolver = InMemResolver;
+
+        let a_to_b = conn_a
+            .dial(&resolver.resolve(pid_b).await.unwrap())
+            .await
+            .unwrap();
+        let b_to_a = conn_b
+            .dial(&resolver.resolve(pid_a).await.unwrap())
+            .await
+            .unwrap();
+        rtr_a.connect_peer(pid_b, a_to_b);
+        rtr_b.connect_peer(pid_a, b_to_a);
+
+        // Harmonizers on both sides (register their protocol with their routers)
+        let hz_a = Harmonizer::new(
+            Box::new(NullScore),
+            rtr_a.clone(),
+            HashSet::from([Foo::table_def().name()]),
+        );
+        let hz_b = Harmonizer::new(
+            Box::new(NullScore),
+            rtr_b.clone(),
+            HashSet::from([Foo::table_def().name()]),
+        );
+
+        // Tell A to notify B for this v0 flow (hacky bootstrap)
+        hz_a.add_peer(pid_b).await;
+
+        // DBs with harmonizer plugin installed
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+        let db_a = KuramotoDb::new(
+            dir_a.path().join("a.redb").to_str().unwrap(),
+            clock.clone(),
+            vec![hz_a.clone()],
+        )
+        .await;
+        let db_b = KuramotoDb::new(
+            dir_b.path().join("b.redb").to_str().unwrap(),
+            clock.clone(),
+            vec![hz_b.clone()],
+        )
+        .await;
+
+        db_a.create_table_and_indexes::<Foo>().unwrap();
+        db_b.create_table_and_indexes::<Foo>().unwrap();
+        db_a.create_table_and_indexes::<Availability>().unwrap();
+        db_b.create_table_and_indexes::<Availability>().unwrap();
+
+        // Insert on A → should arrive on B through UpdateWithAttestation path
+        db_a.put(Foo { id: 7 }).await.unwrap();
+
+        // Drive the async machinery deterministically
+        spin().await;
+
+        // Assert Foo exists on B
+        let got_b: Foo = db_b.get_data::<Foo>(&7u32.to_le_bytes()).await.unwrap();
+        assert_eq!(got_b, Foo { id: 7 });
+
+        // (Optional) sanity: B produced at least one leaf availability
+        let av_b: Vec<Availability> = db_b
+            .range_by_pk::<Availability>(&[], &[0xFF], None)
+            .await
+            .unwrap();
+        assert!(
+            !av_b.is_empty(),
+            "receiver should materialize a leaf availability for the ingested entity"
+        );
+        assert!(av_b.iter().any(|a| a.level == 0 && a.children.count() >= 1));
+    }
 }

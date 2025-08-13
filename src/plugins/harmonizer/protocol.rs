@@ -1,3 +1,4 @@
+// protocol.rs
 use async_trait::async_trait;
 use bincode::{Decode, Encode};
 use std::sync::Arc;
@@ -17,8 +18,7 @@ use crate::{
 
 pub const PROTO_HARMONIZER: u16 = fnv1a_16("kuramoto.middleware.harmonizer.v1");
 
-/*────────────────────────── Types on the wire ─────────────────────────*/
-
+/*──────── Types on the wire ───────*/
 #[derive(Clone, Debug, Encode, Decode)]
 pub struct AvailabilityHeader {
     pub availability_id: UuidBytes,
@@ -29,7 +29,6 @@ pub struct AvailabilityHeader {
     pub complete: bool,
 }
 
-/*──────── Requests ────────*/
 #[derive(Clone, Debug, Encode, Decode)]
 pub struct GetChildrenByRange {
     pub range: RangeCube,
@@ -63,10 +62,9 @@ pub struct UpdateWithAttestation {
     pub entity_bytes: Vec<u8>,
 }
 
-/*──────── Responses ───────*/
 #[derive(Clone, Debug, Encode, Decode)]
 pub struct ChildrenResponse {
-    pub items: Vec<(u64 /*Sym*/, Vec<u8>)>,
+    pub items: Vec<(u64, Vec<u8>)>,
     pub next: Option<Vec<u8>>,
     pub headers: Vec<AvailabilityHeader>,
 }
@@ -98,7 +96,6 @@ pub struct UpdateResponse {
     pub headers: Vec<AvailabilityHeader>,
 }
 
-/*──────── Envelope payloads ───────*/
 #[derive(Clone, Debug, Encode, Decode)]
 pub enum HarmonizerMsg {
     GetChildrenByRange(GetChildrenByRange),
@@ -114,22 +111,20 @@ pub enum HarmonizerResp {
     Update(UpdateResponse),
 }
 
-/*────────────────────────── Inbox interface ──────────────────────────*/
-/* The protocol handler forwards into this channel owned by Harmonizer */
-
+/*──────── Domain inbox (owned by Harmonizer) ───────*/
 pub enum ProtoCommand {
-    /// Router made a request. We forward the decoded message and expect a response.
     HandleRequest {
         peer: PeerId,
         msg: HarmonizerMsg,
         respond: oneshot::Sender<Result<HarmonizerResp, String>>,
     },
-    /// Router delivered a notify. No response path.
-    HandleNotify { peer: PeerId, msg: HarmonizerMsg },
+    HandleNotify {
+        peer: PeerId,
+        msg: HarmonizerMsg,
+    },
 }
 
-/*──────────────────────── Protocol handler ───────────────────────────*/
-
+/*──────── Protocol handler: decode/encode + forward ───────*/
 pub struct HarmonizerProto {
     inbox: mpsc::Sender<ProtoCommand>,
 }
@@ -138,7 +133,6 @@ impl HarmonizerProto {
     pub fn new(inbox: mpsc::Sender<ProtoCommand>) -> Self {
         Self { inbox }
     }
-
     fn ok_bytes(resp: HarmonizerResp) -> Result<Vec<u8>, String> {
         bincode::encode_to_vec(resp, bincode::config::standard()).map_err(|e| e.to_string())
     }
@@ -177,7 +171,7 @@ impl Handler for HarmonizerProto {
     }
 }
 
-/*──────── Public helper: register with router ───────*/
+/*──────── Register with router ───────*/
 pub fn register_harmonizer_protocol(router: Arc<Router>, inbox: mpsc::Sender<ProtoCommand>) {
     router.set_handler(PROTO_HARMONIZER, Arc::new(HarmonizerProto::new(inbox)));
 }
