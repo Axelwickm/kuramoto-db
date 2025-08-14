@@ -1,4 +1,3 @@
-// protocol.rs
 use async_trait::async_trait;
 use bincode::{Decode, Encode};
 use std::sync::Arc;
