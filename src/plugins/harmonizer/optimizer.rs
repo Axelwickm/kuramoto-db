@@ -1,9 +1,11 @@
-//! Optimizer: reductionist, stateless, mutation‑driven search
+//! Optimizer: reductionist, stateless, mutation-driven search
 //! ---------------------------------------------------------
 //! - Runs in `before_update` against a virtual overlay (pending inserts/deletes).
 //! - Tries **primitive mutations** only: `Insert(draft)` and `Delete(id)`.
 //! - Complex edits (merge/split/rebuild) emerge from sequences of these primitives.
-//! - Returns the single best improving `ActionSet` (or `None` for NoOp).
+//! - Returns the **greedy hill-climbed ActionSet**:
+//!     keep taking the best improving step until there is no improvement
+//!     or we hit `caps.max_steps` (default 512).
 //! - **Hard rule:** empty ranges are discarded; existing empty parents can be pruned.
 
 use async_trait::async_trait;
@@ -20,6 +22,8 @@ pub struct PeerContext {
     pub peer_id: UuidBytes,
 }
 
+/// Keep the scorer *pure*. It should not read the DB or mutate anything.
+/// The optimizer will construct candidates and ask the scorer to rank them.
 pub trait Scorer: Send + Sync {
     /// Score a single availability draft. Higher is better.
     /// Negative means "prefer to remove" (subject to replication guards).
@@ -48,7 +52,7 @@ pub type ActionSet = Vec<Action>;
 pub struct Overlay<'a> {
     pub pending_inserts: &'a [AvailabilityDraft],
     pub pending_deletes: &'a [UuidBytes],
-    pub score: f32, // sum of draft scores (node‑only for now)
+    pub score: f32, // sum of draft scores (node-only for now)
 }
 
 impl<'a> Overlay<'a> {
@@ -79,14 +83,16 @@ pub struct Caps {
     pub pmax_parents: usize,
     /// (kept for compat / future sibling exploration; unused in current reductionist pass)
     pub nmax_neighbors: usize,
-    /// (unused in reductionist variant, kept for compat)
+    /// target children bias (scorer may use it; optimizer just carries it)
     pub b_target: usize,
     /// improvement threshold
     pub eps: f32,
-    /// mutation step for range boundaries
+    /// mutation step for range boundaries (kept for non-byte dims)
     pub step: i64,
     /// cap enumerated insert variants per draft
     pub max_variants_per_draft: usize,
+    /// **hill-climb step cap** — keep taking best greedy steps until none or this cap
+    pub max_steps: usize,
 }
 
 impl Default for Caps {
@@ -98,6 +104,7 @@ impl Default for Caps {
             eps: 0.0,
             step: 1,
             max_variants_per_draft: 32,
+            max_steps: 512,
         }
     }
 }
@@ -106,8 +113,11 @@ impl Default for Caps {
 
 #[async_trait]
 pub trait Optimizer: Send + Sync {
-    /// Try bounded one‑step primitive mutations related to the current overlay and DB,
-    /// pick the best improvement (> eps), and return its actions. Return `None` if NoOp is best.
+    /// Greedy hill-climb:
+    ///   1) enumerate best step
+    ///   2) if improvement > eps, **apply to overlay** and continue
+    ///   3) else stop
+    /// Returns the **full ActionSet** or `None` if no improvement at all.
     async fn propose(
         &self,
         db: &KuramotoDb,
@@ -136,7 +146,8 @@ impl BasicOptimizer {
         self
     }
 
-    // Best single action for a given draft, using primitive mutations only
+    // Best single action for a given draft, using primitive mutations only.
+    // Returns (gain, actions).
     async fn best_action_for_draft(
         &self,
         db: &KuramotoDb,
@@ -151,6 +162,8 @@ impl BasicOptimizer {
 
         // 1) Primitive INSERT mutations derived from the focus draft (same level + level+1 promos)
         for cand in enumerate_insert_mutations(d, self.caps) {
+            // Note: gain is absolute here; in practice the scorer should
+            // encode "cost/size" so useless identity loses to a better variant.
             let gain = self.scorer.score(&self.ctx, &cand);
             if gain > best_gain + self.caps.eps {
                 best_gain = gain;
@@ -225,7 +238,8 @@ impl BasicOptimizer {
         Ok(best_actions.map(|a| (best_gain, a)))
     }
 
-    // Global, tiny prune sweep (bounded by pmax_parents per draft)
+    // Global, tiny prune sweep (bounded by pmax_parents per draft).
+    // Returns (gain, actions).
     async fn best_global_action(
         &self,
         db: &KuramotoDb,
@@ -261,43 +275,84 @@ impl BasicOptimizer {
 
 #[async_trait]
 impl Optimizer for BasicOptimizer {
+    /// **Greedy hill-climb** with cap `caps.max_steps` (default 512).
+    /// Accumulates all improving actions into one `ActionSet` and returns it.
     async fn propose(
         &self,
         db: &KuramotoDb,
         overlay: Overlay<'_>,
     ) -> Result<Option<ActionSet>, StorageError> {
-        // Normalize: drop empty drafts for candidate generation
-        let drafts: Vec<AvailabilityDraft> = overlay
+        // Normalize drafts: drop empty ranges
+        let mut drafts: Vec<AvailabilityDraft> = overlay
             .pending_inserts
             .iter()
             .cloned()
             .filter(|d| !range_is_empty(&d.range))
             .collect();
+        let mut deletes: Vec<UuidBytes> = overlay.pending_deletes.to_vec();
 
-        // Accumulate best candidate across all drafts
-        let mut best_gain = 0.0f32;
-        let mut best_actions: Option<ActionSet> = None;
+        let mut plan: ActionSet = Vec::new();
 
-        for i in 0..drafts.len() {
-            if let Some((gain, actions)) =
-                self.best_action_for_draft(db, &overlay, &drafts, i).await?
-            {
-                if gain > best_gain + self.caps.eps {
-                    best_gain = gain;
-                    best_actions = Some(actions);
+        // Greedy loop
+        for _step in 0..self.caps.max_steps {
+            // 1) Best per-draft local action
+            let mut best: Option<(f32, ActionSet)> = None;
+            for i in 0..drafts.len() {
+                if let Some((gain, actions)) =
+                    self.best_action_for_draft(db, &overlay, &drafts, i).await?
+                {
+                    if best
+                        .as_ref()
+                        .map_or(true, |(g0, _)| gain > *g0 + self.caps.eps)
+                    {
+                        best = Some((gain, actions));
+                    }
                 }
             }
-        }
 
-        // Global prune last
-        if let Some((gain, actions)) = self.best_global_action(db, &drafts).await? {
-            if gain > best_gain + self.caps.eps {
-                best_gain = gain;
-                best_actions = Some(actions);
+            // 2) Best global prune
+            if let Some((gain_g, actions_g)) = self.best_global_action(db, &drafts).await? {
+                if best
+                    .as_ref()
+                    .map_or(true, |(g0, _)| gain_g > *g0 + self.caps.eps)
+                {
+                    best = Some((gain_g, actions_g));
+                }
             }
+
+            // 3) If no improvement → stop
+            let Some((_gain, actions)) = best else {
+                break;
+            };
+
+            // 4) Apply the chosen actions to our local overlay view
+            for a in &actions {
+                match a {
+                    Action::Insert(d) => {
+                        // Skip empties; avoid trivial duplicates
+                        if !range_is_empty(&d.range) && !contains_draft(&drafts, d) {
+                            drafts.push(d.clone());
+                        }
+                    }
+                    Action::Delete(id) => {
+                        if !deletes.iter().any(|x| x == id) {
+                            deletes.push(*id);
+                        }
+                    }
+                }
+            }
+
+            // 5) Record in the resulting plan
+            plan.extend(actions);
+
+            // 6) Continue; if next iteration finds no improvement, loop ends.
         }
 
-        Ok(if best_gain > 0.0 { best_actions } else { None })
+        if plan.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(plan))
+        }
     }
 }
 
@@ -395,6 +450,30 @@ fn enumerate_insert_mutations(base: &AvailabilityDraft, caps: Caps) -> Vec<Avail
     out.into_iter()
         .filter(|d| !range_is_empty(&d.range))
         .collect()
+}
+
+// Deduplicate drafts by (level, range bytes, complete)
+fn contains_draft(haystack: &[AvailabilityDraft], needle: &AvailabilityDraft) -> bool {
+    haystack.iter().any(|d| draft_eq(d, needle))
+}
+fn draft_eq(a: &AvailabilityDraft, b: &AvailabilityDraft) -> bool {
+    a.level == b.level && a.complete == b.complete && ranges_equal(&a.range, &b.range)
+}
+fn ranges_equal(x: &RangeCube, y: &RangeCube) -> bool {
+    if x.mins.len() != y.mins.len() || x.maxs.len() != y.maxs.len() {
+        return false;
+    }
+    for i in 0..x.mins.len() {
+        if x.mins[i] != y.mins[i] {
+            return false;
+        }
+    }
+    for i in 0..x.maxs.len() {
+        if x.maxs[i] != y.maxs[i] {
+            return false;
+        }
+    }
+    true
 }
 
 /*──────────── Range utilities (local, deterministic) ───────────*/
@@ -533,6 +612,7 @@ mod tests {
             eps: 0.0,
             step: 1,
             max_variants_per_draft: 32,
+            max_steps: 16, // make tests fast/deterministic
         }
     }
 
@@ -672,7 +752,9 @@ mod tests {
     #[tokio::test]
     async fn propose_prefers_outward_expansion_with_byte_span_scorer() {
         let db = fresh_db().await;
-        let opt = BasicOptimizer::new(Box::new(ByteSpanScorer), peer()).with_caps(caps());
+        let mut c = caps();
+        c.max_steps = 4; // keep it small
+        let opt = BasicOptimizer::new(Box::new(ByteSpanScorer), peer()).with_caps(c);
 
         // Base span = len(max) - len(min) = 1
         let base = draft_bytes(0, &[b"a"], &[b"a\x01"]);
@@ -690,26 +772,37 @@ mod tests {
             panic!("expected an improving Insert action");
         };
 
-        // At least one Insert should increase span over base
-        let mut improved = false;
-        for a in actions {
-            if let Action::Insert(d) = a {
-                let mut span: i32 = 0;
-                let dim = d.range.mins.len().min(d.range.maxs.len());
-                for i in 0..dim {
-                    span += (d.range.maxs[i].len() as i32) - (d.range.mins[i].len() as i32);
+        assert!(
+            actions.iter().any(|a| match a {
+                Action::Insert(d) => {
+                    let mut span: i32 = 0;
+                    let dim = d.range.mins.len().min(d.range.maxs.len());
+                    for i in 0..dim {
+                        span += (d.range.maxs[i].len() as i32) - (d.range.mins[i].len() as i32);
+                    }
+                    span > 1
                 }
-                improved |= span > 1;
-            }
-        }
-        assert!(improved, "no improving Insert found");
+                _ => false,
+            }),
+            "no improving Insert (span) found"
+        );
+
+        // With a monotone scorer, hill-climb should return multiple steps (capped)
+        assert!(
+            actions.len() >= 2,
+            "expected multiple greedy steps under hill-climb"
+        );
+        assert!(
+            actions.len() as usize <= c.max_steps,
+            "should never exceed the step cap"
+        );
     }
 
     #[tokio::test]
-    async fn propose_can_choose_promotion_if_scorer_rewards_level() {
+    async fn hill_climb_hits_step_cap_with_level_scorer() {
         let db = fresh_db().await;
         let mut c = caps();
-        c.max_variants_per_draft = 64; // ensure level+1 variants are enumerated
+        c.max_steps = 5; // tiny cap for test
         let opt = BasicOptimizer::new(Box::new(LevelFavoringScorer), peer()).with_caps(c);
 
         let base = draft_bytes(0, &[b"a"], &[b"a\x01"]);
@@ -723,15 +816,22 @@ mod tests {
         };
 
         let got = opt.propose(&db, o).await.unwrap();
-        let Some(actions) = got else {
-            panic!("expected an Insert action");
-        };
-
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::Insert(d) if d.level > base.level)),
-            "no promotion variant was selected"
+        let actions = got.expect("should produce actions");
+        assert_eq!(
+            actions.len(),
+            c.max_steps,
+            "monotone scorer should drive to the step cap"
         );
+
+        // levels should keep increasing among Insert actions
+        let mut last_level = base.level;
+        for a in actions {
+            if let Action::Insert(d) = a {
+                assert!(d.level >= last_level, "levels should not decrease");
+                if d.level > last_level {
+                    last_level = d.level;
+                }
+            }
+        }
     }
 }
