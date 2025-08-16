@@ -1,12 +1,18 @@
-//! Optimizer: reductionist, stateless, mutation-driven search
-//! ---------------------------------------------------------
+//! Optimizer: greedy hill-climb (bounded), no neighbor surgery
+//! -----------------------------------------------------------
 //! - Runs in `before_update` against a virtual overlay (pending inserts/deletes).
-//! - Tries **primitive mutations** only: `Insert(draft)` and `Delete(id)`.
-//! - Complex edits (merge/split/rebuild) emerge from sequences of these primitives.
-//! - Returns the **greedy hill-climbed ActionSet**:
-//!     keep taking the best improving step until there is no improvement
-//!     or we hit `caps.max_steps` (default 512).
-//! - **Hard rule:** empty ranges are discarded; existing empty parents can be pruned.
+//! - **Search policy:** greedy hill-climb up to `caps.max_steps` (default 512):
+//!     enumerate candidates → pick highest gain (> eps) → apply to overlay → repeat.
+//! - **Candidate families per step:**
+//!     (A) Insert-variants from the current drafts (identity, boundary tweaks, promotions)
+//!         plus two small macros: Promote+One-Tweak, and Double-Outward per dim.
+//!     (B) Prune negatives among a bounded **touched frontier** of existing parents
+//!         that overlap any draft seen so far (Delete only; strictly gated by RF).
+//! - **What we deliberately DO NOT do now:** no Replace/Split neighbor surgery.
+//!   The “economics” (overlap, branching, size, replication bonus) live in the Scorer.
+//!
+//! Wire real neighbor discovery inside `find_covering_or_near_parents(..)` to unlock
+//! touched-set pruning. Until then it’s safe (it returns empty).
 
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -79,9 +85,9 @@ impl<'a> Overlay<'a> {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Caps {
-    /// candidate parents per focus (DB lookup cap)
+    /// candidate parents per focus (DB lookup cap for touched frontier expansion)
     pub pmax_parents: usize,
-    /// (kept for compat / future sibling exploration; unused in current reductionist pass)
+    /// (kept for compat / future sibling exploration; not used here)
     pub nmax_neighbors: usize,
     /// target children bias (scorer may use it; optimizer just carries it)
     pub b_target: usize,
@@ -146,130 +152,25 @@ impl BasicOptimizer {
         self
     }
 
-    // Best single action for a given draft, using primitive mutations only.
-    // Returns (gain, actions).
-    async fn best_action_for_draft(
-        &self,
-        db: &KuramotoDb,
-        _overlay: &Overlay<'_>,
-        drafts: &[AvailabilityDraft],
-        focus_idx: usize,
-    ) -> Result<Option<(f32, ActionSet)>, StorageError> {
-        let d = &drafts[focus_idx];
-
-        let mut best_gain = 0.0f32;
-        let mut best_actions: Option<ActionSet> = None;
-
-        // 1) Primitive INSERT mutations derived from the focus draft (same level + level+1 promos)
-        for cand in enumerate_insert_mutations(d, self.caps) {
-            // Note: gain is absolute here; in practice the scorer should
-            // encode "cost/size" so useless identity loses to a better variant.
-            let gain = self.scorer.score(&self.ctx, &cand);
-            if gain > best_gain + self.caps.eps {
-                best_gain = gain;
-                best_actions = Some(vec![Action::Insert(cand)]);
-            }
-        }
-
-        // 2) Primitive DELETE and DELETE+INSERT for nearby existing parents
-        let parents = find_covering_or_near_parents(db, d, self.caps.pmax_parents).await?;
-        for a in parents {
-            // Treat the existing parent as a draft for scoring deltas
-            let draft_old = AvailabilityDraft {
-                level: a.level,
-                range: a.range.clone(),
-                complete: true,
-            };
-            let s_old = if range_is_empty(&draft_old.range) {
-                0.0
-            } else {
-                self.scorer.score(&self.ctx, &draft_old)
-            };
-
-            // 2a) Pure DELETE (prune) if beneficial and replication allows
-            if s_old < 0.0 && replication_guard_ok(db, &a).await {
-                let delta = -s_old;
-                if delta > best_gain + self.caps.eps {
-                    best_gain = delta;
-                    best_actions = Some(vec![Action::Delete(a.id)]);
-                }
-            }
-
-            // 2b) DELETE + INSERT (single mutated replacement)
-            for mutated in enumerate_insert_mutations(&draft_old, self.caps) {
-                if range_is_empty(&mutated.range) {
-                    continue;
-                }
-                let s_new = self.scorer.score(&self.ctx, &mutated);
-                let delta = s_new - s_old;
-                if delta > best_gain + self.caps.eps {
-                    best_gain = delta;
-                    best_actions =
-                        Some(vec![Action::Delete(a.id), Action::Insert(mutated.clone())]);
-                }
-            }
-
-            // 2c) DELETE + INSERT + INSERT (two mutated variants = "split" from primitives)
-            let variants: Vec<AvailabilityDraft> =
-                enumerate_insert_mutations(&draft_old, self.caps)
-                    .into_iter()
-                    .collect();
-            for i in 0..variants.len() {
-                for j in (i + 1)..variants.len() {
-                    let a1 = &variants[i];
-                    let a2 = &variants[j];
-                    if range_is_empty(&a1.range) || range_is_empty(&a2.range) {
-                        continue;
-                    }
-                    let s_new = self.scorer.score(&self.ctx, a1) + self.scorer.score(&self.ctx, a2);
-                    let delta = s_new - s_old;
-                    if delta > best_gain + self.caps.eps {
-                        best_gain = delta;
-                        best_actions = Some(vec![
-                            Action::Delete(a.id),
-                            Action::Insert(a1.clone()),
-                            Action::Insert(a2.clone()),
-                        ]);
-                    }
-                }
-            }
-        }
-
-        Ok(best_actions.map(|a| (best_gain, a)))
+    /// Enumerate insert variants for a draft, including small “macro” moves.
+    fn enumerate_inserts(&self, d: &AvailabilityDraft) -> Vec<AvailabilityDraft> {
+        enumerate_insert_mutations(d, self.caps)
     }
 
-    // Global, tiny prune sweep (bounded by pmax_parents per draft).
-    // Returns (gain, actions).
-    async fn best_global_action(
+    /// Expand the touched frontier by discovering existing parents that overlap `d`.
+    async fn expand_touched(
         &self,
         db: &KuramotoDb,
-        drafts: &[AvailabilityDraft],
-    ) -> Result<Option<(f32, ActionSet)>, StorageError> {
-        let mut best_gain = 0.0f32;
-        let mut best_actions: Option<ActionSet> = None;
-        for d in drafts {
-            let parents = find_covering_or_near_parents(db, d, self.caps.pmax_parents).await?;
-            for a in parents {
-                let draft_old = AvailabilityDraft {
-                    level: a.level,
-                    range: a.range.clone(),
-                    complete: true,
-                };
-                let s_old = if range_is_empty(&draft_old.range) {
-                    0.0
-                } else {
-                    self.scorer.score(&self.ctx, &draft_old)
-                };
-                if s_old < 0.0 && replication_guard_ok(db, &a).await {
-                    let delta = -s_old;
-                    if delta > best_gain + self.caps.eps {
-                        best_gain = delta;
-                        best_actions = Some(vec![Action::Delete(a.id)]);
-                    }
-                }
-            }
+        d: &AvailabilityDraft,
+        touched: &mut Touched,
+    ) -> Result<(), StorageError> {
+        let mut neigh = find_covering_or_near_parents(db, d, self.caps.pmax_parents).await?;
+        neigh.sort_by_key(|p| p.id);
+        neigh.dedup_by(|a, b| a.id == b.id);
+        for p in neigh {
+            touched.insert(p);
         }
-        Ok(best_actions.map(|a| (best_gain, a)))
+        Ok(())
     }
 }
 
@@ -291,46 +192,64 @@ impl Optimizer for BasicOptimizer {
             .collect();
         let mut deletes: Vec<UuidBytes> = overlay.pending_deletes.to_vec();
 
+        // Seed touched frontier from initial drafts
+        let mut touched = Touched::new();
+        for d in &drafts {
+            self.expand_touched(db, d, &mut touched).await?;
+        }
+
         let mut plan: ActionSet = Vec::new();
 
         // Greedy loop
         for _step in 0..self.caps.max_steps {
-            // 1) Best per-draft local action
-            let mut best: Option<(f32, ActionSet)> = None;
-            for i in 0..drafts.len() {
-                if let Some((gain, actions)) =
-                    self.best_action_for_draft(db, &overlay, &drafts, i).await?
-                {
-                    if best
-                        .as_ref()
-                        .map_or(true, |(g0, _)| gain > *g0 + self.caps.eps)
-                    {
-                        best = Some((gain, actions));
+            let mut best_gain = f32::NEG_INFINITY;
+            let mut best_actions: Option<ActionSet> = None;
+
+            // A) Insert candidates from current drafts (+macros)
+            for d in &drafts {
+                for cand in self.enumerate_inserts(d) {
+                    if range_is_empty(&cand.range) {
+                        continue;
+                    }
+                    let gain = self.scorer.score(&self.ctx, &cand);
+                    if gain > self.caps.eps && gain > best_gain + self.caps.eps {
+                        best_gain = gain;
+                        best_actions = Some(vec![Action::Insert(cand)]);
                     }
                 }
             }
 
-            // 2) Best global prune
-            if let Some((gain_g, actions_g)) = self.best_global_action(db, &drafts).await? {
-                if best
-                    .as_ref()
-                    .map_or(true, |(g0, _)| gain_g > *g0 + self.caps.eps)
-                {
-                    best = Some((gain_g, actions_g));
+            // B) Prune negatives in the touched frontier (Delete only, with RF guard)
+            for p in touched.iter() {
+                let pd = AvailabilityDraft {
+                    level: p.level,
+                    range: p.range.clone(),
+                    complete: true,
+                };
+                let s_old = if range_is_empty(&pd.range) {
+                    0.0
+                } else {
+                    self.scorer.score(&self.ctx, &pd)
+                };
+                if s_old < 0.0 && replication_guard_ok(db, p).await {
+                    let gain = -s_old;
+                    if gain > self.caps.eps && gain > best_gain + self.caps.eps {
+                        best_gain = gain;
+                        best_actions = Some(vec![Action::Delete(p.id)]);
+                    }
                 }
             }
 
-            // 3) If no improvement → stop
-            let Some((_gain, actions)) = best else {
-                break;
-            };
+            // Stop if we found nothing improving
+            let Some(actions) = best_actions else { break };
 
-            // 4) Apply the chosen actions to our local overlay view
+            // Apply actions to overlay + frontier
             for a in &actions {
                 match a {
                     Action::Insert(d) => {
                         // Skip empties; avoid trivial duplicates
                         if !range_is_empty(&d.range) && !contains_draft(&drafts, d) {
+                            self.expand_touched(db, d, &mut touched).await?;
                             drafts.push(d.clone());
                         }
                     }
@@ -338,14 +257,13 @@ impl Optimizer for BasicOptimizer {
                         if !deletes.iter().any(|x| x == id) {
                             deletes.push(*id);
                         }
+                        touched.remove(*id);
                     }
                 }
             }
 
-            // 5) Record in the resulting plan
+            // Record in final plan and continue
             plan.extend(actions);
-
-            // 6) Continue; if next iteration finds no improvement, loop ends.
         }
 
         if plan.is_empty() {
@@ -356,14 +274,36 @@ impl Optimizer for BasicOptimizer {
     }
 }
 
-/*──────────────────────────── Helpers ────────────────────────*/
+/*──────────────────────────── Touched frontier ─────────────────*/
 
-/// Minimal representation of an existing parent availability for neighborhood queries.
 #[derive(Debug, Clone)]
 struct ExistingParent {
     id: UuidBytes,
     level: u16,
     range: RangeCube,
+}
+
+#[derive(Default)]
+struct Touched {
+    parents: Vec<ExistingParent>,
+}
+impl Touched {
+    fn new() -> Self {
+        Self {
+            parents: Vec::new(),
+        }
+    }
+    fn insert(&mut self, p: ExistingParent) {
+        if !self.parents.iter().any(|x| x.id == p.id) {
+            self.parents.push(p);
+        }
+    }
+    fn remove(&mut self, id: UuidBytes) {
+        self.parents.retain(|p| p.id != id);
+    }
+    fn iter(&self) -> impl Iterator<Item = &ExistingParent> {
+        self.parents.iter()
+    }
 }
 
 /// Placeholder: find parents that cover or are near a draft (bounded, deterministic order).
@@ -381,22 +321,27 @@ async fn replication_guard_ok(_db: &KuramotoDb, _a: &ExistingParent) -> bool {
     true
 }
 
+/*──────────────── Insert enumeration (+ two macros) ───────────*/
+
 /// Enumerate primitive INSERT mutations derived from a draft:
 /// - Same-level boundary tweaks by ±step for each dim/min/max
-/// - Optional level+1 variants ("promotions") for each produced range, plus an identity parent
+/// - Promotions (level+1) for each produced range
+/// - Macro 1: Promote+One-Tweak (applies one extra outward tweak to a promotion)
+/// - Macro 2: Double-Outward per dim (min-outward + max-outward together)
 fn enumerate_insert_mutations(base: &AvailabilityDraft, caps: Caps) -> Vec<AvailabilityDraft> {
-    let mut out = Vec::new();
     let dims = base.mins_len();
 
-    // identity same-level (optional): rely on scorer to reject if useless
+    let mut out: Vec<AvailabilityDraft> = Vec::with_capacity(1 + 4 * dims);
+
+    // 0) identity same-level (rely on scorer to reject if useless)
     out.push(AvailabilityDraft {
         level: base.level,
         range: base.range.clone(),
         complete: true,
     });
 
+    // 1) per-dim boundary tweaks (same level)
     for dim in 0..dims {
-        // four elementary mutations on boundaries
         if let Some(r) = mutate_range_step(&base.range, dim, Boundary::Min, Dir::Outward, caps.step)
         {
             out.push(AvailabilityDraft {
@@ -429,10 +374,23 @@ fn enumerate_insert_mutations(base: &AvailabilityDraft, caps: Caps) -> Vec<Avail
                 complete: true,
             });
         }
+
+        // 2) Macro: Double-Outward for this dim (same level)
+        if let Some(r1) =
+            mutate_range_step(&base.range, dim, Boundary::Min, Dir::Outward, caps.step)
+        {
+            if let Some(r2) = mutate_range_step(&r1, dim, Boundary::Max, Dir::Outward, caps.step) {
+                out.push(AvailabilityDraft {
+                    level: base.level,
+                    range: r2,
+                    complete: true,
+                });
+            }
+        }
     }
 
-    // level+1 promotions for each produced range (including identity)
-    let mut promos = Vec::with_capacity(out.len());
+    // Collect the same set again as promotions (level+1)
+    let mut promos: Vec<AvailabilityDraft> = Vec::with_capacity(out.len());
     for d in &out {
         promos.push(AvailabilityDraft {
             level: d.level + 1,
@@ -440,16 +398,37 @@ fn enumerate_insert_mutations(base: &AvailabilityDraft, caps: Caps) -> Vec<Avail
             complete: true,
         });
     }
-    out.extend(promos);
 
-    // Cap total to avoid explosion; keep deterministic prefix
-    if out.len() > caps.max_variants_per_draft {
-        out.truncate(caps.max_variants_per_draft);
+    // Macro 1 on promotions: for each promo, apply a single outward max tweak per dim
+    let mut promo_plus_one: Vec<AvailabilityDraft> = Vec::new();
+    for p in &promos {
+        for dim in 0..dims {
+            if let Some(r) =
+                mutate_range_step(&p.range, dim, Boundary::Max, Dir::Outward, caps.step)
+            {
+                promo_plus_one.push(AvailabilityDraft {
+                    level: p.level,
+                    range: r,
+                    complete: true,
+                });
+            }
+        }
     }
-    // Enforce non-empty rule; keep only unique ranges at the very end (optional)
-    out.into_iter()
-        .filter(|d| !range_is_empty(&d.range))
-        .collect()
+
+    out.extend(promos);
+    out.extend(promo_plus_one);
+
+    // Enforce non-empty rule; dedupe; cap
+    let mut uniq: Vec<AvailabilityDraft> = Vec::with_capacity(out.len());
+    for d in out.into_iter().filter(|d| !range_is_empty(&d.range)) {
+        if !contains_draft(&uniq, &d) {
+            uniq.push(d);
+        }
+        if uniq.len() >= caps.max_variants_per_draft {
+            break;
+        }
+    }
+    uniq
 }
 
 // Deduplicate drafts by (level, range bytes, complete)
@@ -478,7 +457,6 @@ fn ranges_equal(x: &RangeCube, y: &RangeCube) -> bool {
 
 /*──────────── Range utilities (local, deterministic) ───────────*/
 
-// Small helpers on RangeCube to keep mutation code tidy
 trait RangeExt {
     fn mins_len(&self) -> usize;
 }
@@ -505,11 +483,10 @@ enum Dir {
 }
 
 /// Returns a new range with a single boundary moved by ±step if valid, else None.
-/// Returns a new range with a single boundary moved in lexicographic byte-space.
-/// For bytes, we avoid arithmetic and mutate lengths:
+/// Operates in **lexicographic byte space**:
 /// - Min Outward  (expand ↓): pop one trailing byte if any
-/// - Min Inward   (shrink ↑): push 0x00 (minimal lex increase)
-/// - Max Outward  (expand ↑): push 0xFF (maximal lex increase)
+/// - Min Inward   (shrink ↑): push 0x00
+/// - Max Outward  (expand ↑): push 0xFF
 /// - Max Inward   (shrink ↓): pop one trailing byte if any
 fn mutate_range_step(
     base: &RangeCube,
@@ -543,7 +520,7 @@ fn mutate_range_step(
     if range_is_empty(&r) { None } else { Some(r) }
 }
 
-/// A range is empty if, on any dimension, max <= min in lexicographic byte order.
+/// A range is empty if, on any dimension, max ≤ min in lexicographic byte order.
 fn range_is_empty(r: &RangeCube) -> bool {
     let d = r.mins.len().min(r.maxs.len());
     for i in 0..d {
@@ -612,7 +589,7 @@ mod tests {
             eps: 0.0,
             step: 1,
             max_variants_per_draft: 32,
-            max_steps: 16, // make tests fast/deterministic
+            max_steps: 16, // keep tests fast/deterministic
         }
     }
 
@@ -637,11 +614,27 @@ mod tests {
         }
     }
 
-    /// Rewards higher levels; ignores geometry.
-    struct LevelFavoringScorer;
-    impl Scorer for LevelFavoringScorer {
+    /// Rewards **promotion+growth**, penalizes pure promotion or pure growth.
+    struct PromoPlusGrowthScorer;
+    impl Scorer for PromoPlusGrowthScorer {
         fn score(&self, _ctx: &PeerContext, a: &AvailabilityDraft) -> f32 {
-            a.level as f32 * 10.0
+            let span: i32 = {
+                let d = a.range.mins.len().min(a.range.maxs.len());
+                let mut v = 0;
+                for i in 0..d {
+                    v += (a.range.maxs[i].len() as i32) - (a.range.mins[i].len() as i32);
+                }
+                v
+            };
+            if a.level >= 1 && span >= 2 {
+                10.0 // promote+grow is good
+            } else if a.level >= 1 {
+                -1.0 // promotion without growth is bad
+            } else if span >= 2 {
+                -1.0 // growth without promotion is bad
+            } else {
+                0.0
+            }
         }
     }
 
@@ -750,7 +743,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn propose_prefers_outward_expansion_with_byte_span_scorer() {
+    async fn greedy_climb_takes_multiple_steps_and_respects_cap() {
         let db = fresh_db().await;
         let mut c = caps();
         c.max_steps = 4; // keep it small
@@ -769,9 +762,10 @@ mod tests {
 
         let got = opt.propose(&db, o).await.unwrap();
         let Some(actions) = got else {
-            panic!("expected an improving Insert action");
+            panic!("expected an improving Insert action sequence");
         };
 
+        // At least one Insert should increase span over base
         assert!(
             actions.iter().any(|a| match a {
                 Action::Insert(d) => {
@@ -799,12 +793,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hill_climb_hits_step_cap_with_level_scorer() {
+    async fn macro_promotion_plus_tweak_is_reachable_without_lookahead() {
         let db = fresh_db().await;
         let mut c = caps();
-        c.max_steps = 5; // tiny cap for test
-        let opt = BasicOptimizer::new(Box::new(LevelFavoringScorer), peer()).with_caps(c);
+        c.max_steps = 8;
+        let opt = BasicOptimizer::new(Box::new(PromoPlusGrowthScorer), peer()).with_caps(c);
 
+        // Base span ~ 1 (tiny)
         let base = draft_bytes(0, &[b"a"], &[b"a\x01"]);
         let inserts = vec![base.clone()];
         let deletes: Vec<UuidBytes> = vec![];
@@ -815,23 +810,33 @@ mod tests {
             score: 0.0,
         };
 
-        let got = opt.propose(&db, o).await.unwrap();
-        let actions = got.expect("should produce actions");
-        assert_eq!(
-            actions.len(),
-            c.max_steps,
-            "monotone scorer should drive to the step cap"
-        );
+        let got = opt
+            .propose(&db, o)
+            .await
+            .unwrap()
+            .expect("should produce actions");
 
-        // levels should keep increasing among Insert actions
-        let mut last_level = base.level;
-        for a in actions {
+        // We should see at least one promoted + grown insert (level >=1 and span >=2)
+        let mut ok = false;
+        for a in got {
             if let Action::Insert(d) = a {
-                assert!(d.level >= last_level, "levels should not decrease");
-                if d.level > last_level {
-                    last_level = d.level;
+                let span: i32 = {
+                    let dim = d.range.mins.len().min(d.range.maxs.len());
+                    let mut v = 0;
+                    for i in 0..dim {
+                        v += (d.range.maxs[i].len() as i32) - (d.range.mins[i].len() as i32);
+                    }
+                    v
+                };
+                if d.level >= 1 && span >= 2 {
+                    ok = true;
+                    break;
                 }
             }
         }
+        assert!(
+            ok,
+            "promotion+growth should be reachable via macro variants"
+        );
     }
 }

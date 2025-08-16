@@ -1,7 +1,7 @@
 use bincode::{Decode, Encode};
 use uuid::Uuid;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Encode, Decode)]
+#[derive(Clone, Copy, Debug, PartialOrd, Ord, Eq, PartialEq, Hash, Encode, Decode)]
 #[repr(transparent)]
 pub struct UuidBytes([u8; 16]);
 
