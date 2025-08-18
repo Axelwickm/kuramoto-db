@@ -1,4 +1,3 @@
-use async_recursion::async_recursion;
 use async_trait::async_trait;
 use bincode::{Decode, Encode};
 use redb::{TableHandle, WriteTransaction};
@@ -9,7 +8,11 @@ use tokio::sync::mpsc;
 use smallvec::smallvec;
 
 use crate::plugins::communication::transports::PeerId;
+use crate::plugins::harmonizer::child_set::{Child, DigestChunk};
+use crate::plugins::harmonizer::optimizer::{BasicOptimizer, Optimizer, PeerContext};
 use crate::plugins::harmonizer::range_cube::RangeCube;
+use crate::plugins::harmonizer::scorers::Scorer;
+use crate::plugins::harmonizer::scorers::server_scorer::{ServerScorer, ServerScorerParams};
 use crate::plugins::harmonizer::{
     child_set::{ChildSet, Sym},
     protocol::{
@@ -25,16 +28,6 @@ use crate::{
     KuramotoDb, StaticTableDef, WriteBatch, database::WriteRequest, plugins::Plugin,
     storage_entity::StorageEntity, storage_error::StorageError, uuid_bytes::UuidBytes,
 };
-
-/*────────────────────────────────────────────────────────────────────────────*/
-
-pub struct PeerContext {
-    pub peer_id: UuidBytes,
-}
-
-pub trait Scorer: Send + Sync {
-    fn score(&self, ctx: &PeerContext, avail: &Availability) -> f32;
-}
 
 /*──────────────────────── Outbox (network side-effects) ───────────────────*/
 
@@ -202,109 +195,137 @@ impl Harmonizer {
         v
     }
 
+    /// Find a small (containment-minimal) set of Availability nodes that
+    /// together *touch* `target`. The `peer_filter` lets you restrict to
+    /// local or to a set of gossip peers. `level_limit` currently acts as
+    /// a simple filter: keep nodes with `level <= limit`.
+    ///
+    /// Returns:
+    ///   - Vec<Availability>: an antichain by containment (no element is
+    ///     strictly contained by another in the result). Sorted by
+    ///     descending level, then by an approximate "volume".
+    ///   - bool: `true` iff **no candidates overlapped** `target`
+    ///           (kept for API compatibility).
     pub async fn range_cover<F>(
         &self,
         db: &KuramotoDb,
         target: &RangeCube,
-        root_ids: &[UuidBytes],
+        _root_ids: &[UuidBytes],
         peer_filter: F,
         level_limit: Option<usize>,
     ) -> Result<(Vec<Availability>, bool), StorageError>
     where
         F: Fn(&Availability) -> bool + Sync,
     {
-        async fn load_avail(
-            db: &KuramotoDb,
-            id: &UuidBytes,
-        ) -> Result<Option<Availability>, StorageError> {
-            match db.get_data::<Availability>(id.as_bytes()).await {
-                Ok(a) => Ok(Some(a)),
-                Err(StorageError::NotFound) => Ok(None),
-                Err(e) => Err(e),
-            }
-        }
+        // 1) Load all availabilities (MVP: table scan; we can introduce indexes later)
+        let mut all: Vec<Availability> = db.range_by_pk::<Availability>(&[], &[0xFF], None).await?;
 
-        async fn resolve_child_avail(
-            _db: &KuramotoDb,
-            _sym: Sym,
-        ) -> Result<Option<Availability>, StorageError> {
-            Ok(None)
-        }
-
-        #[async_recursion]
-        async fn dfs<F>(
-            db: &KuramotoDb,
-            acc: &mut Vec<Availability>,
-            cube: &RangeCube,
-            id: UuidBytes,
-            peer_filter: &F,
-            level_left: Option<usize>,
-            any_overlap: &mut bool,
-        ) -> Result<(), StorageError>
-        where
-            F: Fn(&Availability) -> bool + Sync,
-        {
-            if level_left == Some(0) {
-                return Ok(());
-            }
-            let level_next = level_left.map(|d| d - 1);
-
-            let Some(av) = load_avail(db, &id).await? else {
-                return Ok(());
-            };
-            if !peer_filter(&av) {
-                return Ok(());
-            }
-            if av.range.intersect(cube).is_none() {
-                return Ok(());
-            }
-            *any_overlap = true;
-
-            let is_leaf = av.children.count() == 0;
-            if !av.complete || is_leaf {
-                acc.push(av);
-                return Ok(());
-            }
-
-            for sym in &av.children.children {
-                if let Some(child_av) = resolve_child_avail(db, *sym).await? {
-                    dfs(
-                        db,
-                        acc,
-                        cube,
-                        child_av.key,
-                        peer_filter,
-                        level_next,
-                        any_overlap,
-                    )
-                    .await?;
-                } else {
-                    acc.push(av.clone());
-                    return Ok(());
+        // 2) Filter by (peer, overlap, level_limit)
+        all.retain(|a| {
+            if let Some(max_level) = level_limit {
+                if a.level as usize > max_level {
+                    return false;
                 }
             }
-            Ok(())
+            peer_filter(a) && a.range.overlaps(target)
+        });
+
+        // Early out: nothing touches the target
+        if all.is_empty() {
+            return Ok((Vec::new(), true)); // second == "no overlap"
         }
 
-        let mut results = Vec::<Availability>::new();
-        let mut any_overlap = false;
-        for rid in root_ids {
-            dfs(
-                db,
-                &mut results,
-                target,
-                *rid,
-                &peer_filter,
-                level_limit,
-                &mut any_overlap,
-            )
-            .await?;
+        // 3) Optional tightening: prefer candidates fully inside target.
+        //    If at least one Availability *contains* the target, keep only
+        //    the "smallest" such (min-approx-volume). That’s the strongest
+        //    single-node cover we can get right now.
+        let mut inside: Vec<&Availability> =
+            all.iter().filter(|a| a.range.contains(target)).collect();
+        if !inside.is_empty() {
+            inside.sort_by_key(|a| (a.level, a.range.approx_volume()));
+            // Pick the smallest-by-volume on the lowest level that still contains target
+            let pick = inside[0].clone();
+            return Ok((vec![pick.clone()], false));
         }
 
-        let mut seen = std::collections::HashSet::<UuidBytes>::new();
-        results.retain(|a| seen.insert(a.key));
+        // 4) Build a containment-minimal antichain among overlapping candidates:
+        //    drop any candidate whose range is strictly contained by another.
+        //    (This keeps results small without geometry subtraction.)
+        //    O(N^2) for now; fine for MVP.
+        let mut keep = vec![true; all.len()];
+        for i in 0..all.len() {
+            if !keep[i] {
+                continue;
+            }
+            for j in 0..all.len() {
+                if i == j || !keep[i] {
+                    continue;
+                }
+                // If all[j] contains all[i], drop i
+                if all[j].range.contains(&all[i].range) {
+                    keep[i] = false;
+                }
+            }
+        }
+        let mut result: Vec<Availability> = all
+            .into_iter()
+            .zip(keep.into_iter())
+            .filter_map(|(a, k)| if k { Some(a) } else { None })
+            .collect();
 
-        Ok((results, !any_overlap))
+        // 5) Sort for determinism: prefer higher level (coarser) then larger volume
+        result.sort_by(|a, b| {
+            b.level
+                .cmp(&a.level)
+                .then(b.range.approx_volume().cmp(&a.range.approx_volume()))
+        });
+
+        Ok((result, false))
+    }
+
+    /// Count how many distinct peers fully cover `target` with at least
+    /// one complete availability. Filtering (local vs peers) is entirely
+    /// driven by `peer_filter`. If `level_limit` is set, only nodes with
+    /// `level <= level_limit` are considered.
+    ///
+    /// Notes:
+    /// - “Fully cover” means `a.range.contains(target)` (not just overlap).
+    /// - Multiple availabilities from the same peer count as 1.
+    /// - This is a full-table scan MVP. We can index later if needed.
+    pub async fn count_replications<F>(
+        &self,
+        db: &KuramotoDb,
+        target: &RangeCube,
+        peer_filter: F,
+        level_limit: Option<usize>,
+    ) -> Result<usize, StorageError>
+    where
+        F: Fn(&Availability) -> bool + Sync,
+    {
+        let mut peers = HashSet::<UuidBytes>::new();
+
+        // MVP: scan all availabilities (local store), then filter
+        let all: Vec<Availability> = db.range_by_pk::<Availability>(&[], &[0xFF], None).await?;
+
+        for a in all {
+            if !a.complete {
+                continue;
+            }
+            if let Some(max_lvl) = level_limit {
+                if a.level as usize > max_lvl {
+                    continue;
+                }
+            }
+            if !peer_filter(&a) {
+                continue;
+            }
+            // strict 100% coverage for now (no partial-credit mode yet)
+            if a.range.contains(target) {
+                peers.insert(a.peer_id);
+            }
+        }
+
+        Ok(peers.len())
     }
 }
 
@@ -320,6 +341,7 @@ impl Plugin for Harmonizer {
             return Ok(());
         };
 
+        // Only act on writes to watched data tables
         let (data_table, key_owned, entity_bytes) = match first {
             WriteRequest::Put {
                 data_table,
@@ -333,9 +355,11 @@ impl Plugin for Harmonizer {
         let now = db.get_clock().now();
         let sym = self.child_sym(data_table, &key_owned);
 
-        let avail_id = UuidBytes::new();
-        let peer_id = UuidBytes::new(); // TODO: real peer id
+        // TODO: wire real peer id
+        let peer_id = UuidBytes::new();
 
+        // --- 1) materialize the leaf availability (level 0) ---
+        let avail_id = UuidBytes::new();
         let avail = Availability {
             key: avail_id,
             peer_id,
@@ -357,6 +381,7 @@ impl Plugin for Harmonizer {
 
         let value = avail.to_bytes();
 
+        // lightweight meta for Ava
         #[derive(Encode, Decode)]
         struct AvailMetaV0 {
             version: u32,
@@ -381,8 +406,8 @@ impl Plugin for Harmonizer {
             index_puts: Vec::new(),
         });
 
+        // --- 2) broadcast inline attestation (v0) to known peers ---
         let peers = { self.peers.read().await.clone() }; // drop lock before awaits
-
         if !peers.is_empty() {
             let att = UpdateWithAttestation {
                 table: data_table.name().to_string(),
@@ -411,12 +436,140 @@ impl Plugin for Harmonizer {
             }
         }
 
+        // --- 3) run optimizer and apply safe parent inserts / deletes ---
+        // Build a fresh scorer snapshot and optimizer
+        let scorer =
+            ServerScorer::from_db_snapshot(db, peer_id, ServerScorerParams::default()).await?;
+
+        let opt = BasicOptimizer::new(Box::new(scorer), PeerContext { peer_id });
+
+        // Seed with the tiny leaf draft we just created; optimizer will
+        // consider promotions/expansions as candidates.
+        use crate::plugins::harmonizer::optimizer::{
+            Action as OptAction, AvailabilityDraft, Overlay,
+        };
+
+        let seed = AvailabilityDraft {
+            level: 0,
+            range: RangeCube {
+                dims: smallvec![],
+                mins: smallvec![],
+                maxs: smallvec![],
+            },
+            complete: true,
+        };
+        let pending_inserts = vec![seed];
+        let pending_deletes: Vec<UuidBytes> = vec![];
+
+        let overlay =
+            Overlay::with_score(&pending_inserts, &pending_deletes, &*opt.scorer, &opt.ctx);
+
+        if let Some(plan) = opt.propose(db, overlay).await? {
+            for act in plan {
+                match act {
+                    // Only materialize parents here; leaf (level 0) already inserted above
+                    OptAction::Insert(d) => {
+                        if d.level == 0 {
+                            continue;
+                        }
+                        let id = UuidBytes::new();
+                        let now2 = db.get_clock().now();
+                        let parent = Availability {
+                            key: id,
+                            peer_id,
+                            range: d.range.clone(),
+                            level: d.level,
+                            // Adoption can be filled later; empty child set is fine for a summary node
+                            children: ChildSet {
+                                parent: id,
+                                children: vec![],
+                            },
+                            schema_hash: 0,
+                            version: 0,
+                            updated_at: now2,
+                            complete: true,
+                        };
+
+                        let meta2 = bincode::encode_to_vec(
+                            AvailMetaV0 {
+                                version: 0,
+                                updated_at: now2,
+                            },
+                            bincode::config::standard(),
+                        )
+                        .map_err(|e| StorageError::Bincode(e.to_string()))?;
+
+                        batch.push(WriteRequest::Put {
+                            data_table: AVAILABILITIES_TABLE,
+                            meta_table: AVAILABILITIES_META_TABLE,
+                            key: parent.primary_key(),
+                            value: parent.to_bytes(),
+                            meta: meta2,
+                            index_removes: Vec::new(),
+                            index_puts: Vec::new(),
+                        });
+                    }
+
+                    OptAction::Delete(id) => {
+                        // Double-safety: skip if this is a leaf (coverage constraint).
+                        if let Ok(existing) = db.get_data::<Availability>(id.as_bytes()).await {
+                            if existing.level == 0 {
+                                continue;
+                            }
+                        }
+                        let now2 = db.get_clock().now();
+                        let meta2 = bincode::encode_to_vec(
+                            AvailMetaV0 {
+                                version: 1,
+                                updated_at: now2,
+                            },
+                            bincode::config::standard(),
+                        )
+                        .map_err(|e| StorageError::Bincode(e.to_string()))?;
+
+                        batch.push(WriteRequest::Delete {
+                            data_table: AVAILABILITIES_TABLE,
+                            meta_table: AVAILABILITIES_META_TABLE,
+                            key: id.as_bytes().to_vec(),
+                            meta: meta2,
+                            index_removes: Vec::new(), // no secondary indexes on Availability
+                        });
+
+                        // NOTE: We do not cascade-delete Child rows / DigestChunks here yet.
+                        // When parent adoption is wired, add a small helper to purge those, too.
+                    }
+                }
+            }
+        }
+
+        // (Completeness loop for complete=false nodes will live here later.)
+
         Ok(())
     }
 
     fn attach_db(&self, db: Arc<KuramotoDb>) {
+        db.create_table_and_indexes::<Availability>().unwrap();
+        db.create_table_and_indexes::<Child>().unwrap();
+        db.create_table_and_indexes::<DigestChunk>().unwrap();
         self.db.set(Arc::downgrade(&db)).unwrap();
     }
+
+    // async fn try_complete_incomplete_nodes(&self, db: &KuramotoDb) -> Result<(), StorageError> {
+    //     let self_peer = /* TODO: real peer id */;
+    //     let locals: Vec<Availability> = db.range_by_pk::<Availability>(&[], &[0xFF], None).await?;
+    //     for a in locals.into_iter().filter(|x| x.peer_id == self_peer && !x.complete) {
+    //         let peer_filter = |av: &Availability| av.peer_id != self_peer;
+    //         let (helpers, _no_overlap) = self.range_cover(db, &a.range, &[], peer_filter, None).await?;
+    //         if helpers.is_empty() {
+    //             // nobody to ask; keep incomplete for now
+    //             continue;
+    //         }
+    //         // TODO: issue RPCs to helpers to fetch children/symbols/data and reconcile.
+    //         // Once local fill is done:
+    //         // mark_complete(db, &a.key).await?;
+    //     }
+    //     Ok(())
+    // }
 }
 
 /*───────────────────────────────────────────────────────────────*/
@@ -431,6 +584,7 @@ mod tests {
         Connector, PeerId, PeerResolver,
         inmem::{InMemConnector, InMemResolver},
     };
+    use crate::plugins::harmonizer::optimizer::AvailabilityDraft;
     use crate::storage_entity::*;
 
     use bincode::{Decode, Encode};
@@ -501,7 +655,7 @@ mod tests {
     async fn inserts_one_availability_per_put() {
         struct NullScore;
         impl Scorer for NullScore {
-            fn score(&self, _: &PeerContext, _: &Availability) -> f32 {
+            fn score(&self, _: &PeerContext, _: &AvailabilityDraft) -> f32 {
                 0.0
             }
         }
@@ -524,7 +678,6 @@ mod tests {
         .await;
 
         db.create_table_and_indexes::<Foo>().unwrap();
-        db.create_table_and_indexes::<Availability>().unwrap();
 
         db.put(Foo { id: 1 }).await.unwrap();
 
@@ -552,7 +705,7 @@ mod tests {
     async fn outbox_emits_update_notify_to_peer() {
         struct NullScore;
         impl Scorer for NullScore {
-            fn score(&self, _: &PeerContext, _: &Availability) -> f32 {
+            fn score(&self, _: &PeerContext, _: &AvailabilityDraft) -> f32 {
                 0.0
             }
         }
@@ -601,7 +754,6 @@ mod tests {
         )
         .await;
         db_a.create_table_and_indexes::<Foo>().unwrap();
-        db_a.create_table_and_indexes::<Availability>().unwrap();
 
         // On B, install a probe handler (NO Harmonizer on B to avoid proto clash)
         #[derive(Clone)]
@@ -661,7 +813,7 @@ mod tests {
     async fn empty_to_sync_single_insert() {
         struct NullScore;
         impl Scorer for NullScore {
-            fn score(&self, _: &PeerContext, _: &Availability) -> f32 {
+            fn score(&self, _: &PeerContext, _: &AvailabilityDraft) -> f32 {
                 0.0
             }
         }
@@ -723,8 +875,6 @@ mod tests {
 
         db_a.create_table_and_indexes::<Foo>().unwrap();
         db_b.create_table_and_indexes::<Foo>().unwrap();
-        db_a.create_table_and_indexes::<Availability>().unwrap();
-        db_b.create_table_and_indexes::<Availability>().unwrap();
 
         // Insert on A → should arrive on B through UpdateWithAttestation path
         db_a.put(Foo { id: 7 }).await.unwrap();

@@ -118,6 +118,18 @@ impl RangeCube {
             maxs: out_maxs,
         })
     }
+
+    /// TODO: test
+    /// Very rough "volume" proxy used only for tie-breaking.
+    /// Uses sum of per-dim (len(max) - len(min)) in lexicographic byte space.
+    pub fn approx_volume(&self) -> u128 {
+        let n = self.mins.len().min(self.maxs.len());
+        let mut acc: i128 = 0;
+        for i in 0..n {
+            acc += (self.maxs[i].len() as i128) - (self.mins[i].len() as i128);
+        }
+        if acc < 0 { 0 } else { acc as u128 }
+    }
 }
 
 #[cfg(test)]
@@ -323,5 +335,42 @@ mod tests {
         assert_eq!(inter.dims, c.dims);
         assert_eq!(inter.mins, c.mins);
         assert_eq!(inter.maxs, c.maxs);
+    }
+
+    #[test]
+    fn approx_volume_adds_across_dims_and_clamps_negative() {
+        use smallvec::smallvec;
+
+        // 1) Single-dimension: span = len(max) - len(min) = 3 - 1 = 2
+        let one = RangeCube {
+            dims: smallvec![],
+            mins: smallvec![b"a".to_vec()],
+            maxs: smallvec![b"a\x02\x00".to_vec()],
+        };
+        assert_eq!(one.approx_volume(), 2);
+
+        // 2) Two dims: (1 - 0) + (2 - 1) = 2 total
+        let two = RangeCube {
+            dims: smallvec![],
+            mins: smallvec![vec![], b"a".to_vec()],
+            maxs: smallvec![vec![0xFF], b"a\x01".to_vec()],
+        };
+        assert_eq!(two.approx_volume(), 2);
+
+        // 3) Negative span should clamp to 0
+        let neg = RangeCube {
+            dims: smallvec![],
+            mins: smallvec![b"abc".to_vec()], // len = 3
+            maxs: smallvec![b"a".to_vec()],   // len = 1 → 1 - 3 = -2 → clamp to 0
+        };
+        assert_eq!(neg.approx_volume(), 0);
+
+        // 4) Equal lengths → 0
+        let eq = RangeCube {
+            dims: smallvec![],
+            mins: smallvec![b"a".to_vec()],
+            maxs: smallvec![b"a".to_vec()],
+        };
+        assert_eq!(eq.approx_volume(), 0);
     }
 }

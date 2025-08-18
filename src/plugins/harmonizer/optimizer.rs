@@ -15,25 +15,16 @@
 //! touched-set pruning. Until then it’s safe (it returns empty).
 
 use async_trait::async_trait;
-use std::sync::Arc;
 
+use crate::plugins::harmonizer::availability::Availability;
 use crate::plugins::harmonizer::range_cube::RangeCube;
+use crate::plugins::harmonizer::scorers::Scorer;
 use crate::uuid_bytes::UuidBytes;
 use crate::{KuramotoDb, storage_error::StorageError};
-
-/*────────────────────────── Scorer ───────────────────────────*/
 
 #[derive(Clone, Debug)]
 pub struct PeerContext {
     pub peer_id: UuidBytes,
-}
-
-/// Keep the scorer *pure*. It should not read the DB or mutate anything.
-/// The optimizer will construct candidates and ask the scorer to rank them.
-pub trait Scorer: Send + Sync {
-    /// Score a single availability draft. Higher is better.
-    /// Negative means "prefer to remove" (subject to replication guards).
-    fn score(&self, ctx: &PeerContext, avail: &AvailabilityDraft) -> f32;
 }
 
 /*──────────────────────────── Types ───────────────────────────*/
@@ -43,6 +34,16 @@ pub struct AvailabilityDraft {
     pub level: u16,
     pub range: RangeCube,
     pub complete: bool,
+}
+
+impl From<&Availability> for AvailabilityDraft {
+    fn from(a: &Availability) -> Self {
+        AvailabilityDraft {
+            level: a.level,
+            range: a.range.clone(),
+            complete: a.complete,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -219,8 +220,13 @@ impl Optimizer for BasicOptimizer {
                 }
             }
 
-            // B) Prune negatives in the touched frontier (Delete only, with RF guard)
+            // B) Prune negatives in the touched frontier (Delete only; coverage-safe)
             for p in touched.iter() {
+                // Coverage constraint: never delete leaves until eviction is implemented
+                if p.level == 0 {
+                    continue;
+                }
+
                 let pd = AvailabilityDraft {
                     level: p.level,
                     range: p.range.clone(),
@@ -231,7 +237,8 @@ impl Optimizer for BasicOptimizer {
                 } else {
                     self.scorer.score(&self.ctx, &pd)
                 };
-                if s_old < 0.0 && replication_guard_ok(db, p).await {
+
+                if s_old < 0.0 {
                     let gain = -s_old;
                     if gain > self.caps.eps && gain > best_gain + self.caps.eps {
                         best_gain = gain;
@@ -281,6 +288,7 @@ struct ExistingParent {
     id: UuidBytes,
     level: u16,
     range: RangeCube,
+    peer_id: UuidBytes,
 }
 
 #[derive(Default)]
@@ -308,17 +316,34 @@ impl Touched {
 
 /// Placeholder: find parents that cover or are near a draft (bounded, deterministic order).
 async fn find_covering_or_near_parents(
-    _db: &KuramotoDb,
-    _d: &AvailabilityDraft,
+    db: &KuramotoDb,
+    d: &AvailabilityDraft,
     cap: usize,
 ) -> Result<Vec<ExistingParent>, StorageError> {
-    let _ = cap; // TODO: wire real lookup (range index / cover ledger)
-    Ok(Vec::new())
-}
-
-/// Placeholder replication guard; implement against your replica ledger.
-async fn replication_guard_ok(_db: &KuramotoDb, _a: &ExistingParent) -> bool {
-    true
+    let mut out = Vec::<ExistingParent>::new();
+    let all: Vec<Availability> = db.range_by_pk::<Availability>(&[], &[0xFF], None).await?;
+    for a in all {
+        // Consider same-level or higher "parents" that overlap the draft
+        if a.level >= d.level && a.range.overlaps(&d.range) {
+            out.push(ExistingParent {
+                id: a.key,
+                level: a.level,
+                range: a.range.clone(),
+                peer_id: a.peer_id,
+            });
+        }
+    }
+    // Prefer coarser nodes first (so pruning considers bigger wins), then larger volume
+    out.sort_by(|x, y| {
+        y.level
+            .cmp(&x.level)
+            .then(y.range.approx_volume().cmp(&x.range.approx_volume()))
+            .then(y.id.as_bytes().cmp(x.id.as_bytes())) // deterministic tie-break
+    });
+    if out.len() > cap {
+        out.truncate(cap);
+    }
+    Ok(out)
 }
 
 /*──────────────── Insert enumeration (+ two macros) ───────────*/
@@ -572,7 +597,18 @@ mod tests {
     async fn fresh_db() -> Arc<KuramotoDb> {
         let dir = tempdir().unwrap();
         let clock = Arc::new(MockClock::new(0));
-        KuramotoDb::new(dir.path().join("opt.redb").to_str().unwrap(), clock, vec![]).await
+        let db = KuramotoDb::new(
+            dir.path().join("opt.redb").to_str().unwrap(),
+            clock,
+            vec![], // tests don't need plugins here
+        )
+        .await;
+
+        // IMPORTANT: the optimizer scans Availability; make sure the table exists.
+        db.create_table_and_indexes::<Availability>()
+            .expect("create Availability tables");
+
+        db
     }
 
     fn peer() -> PeerContext {
