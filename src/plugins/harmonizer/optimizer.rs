@@ -227,6 +227,10 @@ impl Optimizer for BasicOptimizer {
                     continue;
                 }
 
+                if p.peer_id != self.ctx.peer_id {
+                    continue;
+                }
+
                 let pd = AvailabilityDraft {
                     level: p.level,
                     range: p.range.clone(),

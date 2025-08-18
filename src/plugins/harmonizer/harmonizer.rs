@@ -586,6 +586,7 @@ mod tests {
     };
     use crate::plugins::harmonizer::optimizer::AvailabilityDraft;
     use crate::storage_entity::*;
+    use crate::tables::TableHash;
 
     use bincode::{Decode, Encode};
     use rand::Rng;
@@ -633,6 +634,13 @@ mod tests {
         }
     }
 
+    struct NullScore;
+    impl Scorer for NullScore {
+        fn score(&self, _: &PeerContext, _: &AvailabilityDraft) -> f32 {
+            0.0
+        }
+    }
+
     /* ---------------------- Helpers ---------------------- */
 
     fn pid(x: u8) -> PeerId {
@@ -653,13 +661,6 @@ mod tests {
     /// Local effect: inserting a watched entity appends exactly one leaf Availability.
     #[tokio::test(start_paused = true)]
     async fn inserts_one_availability_per_put() {
-        struct NullScore;
-        impl Scorer for NullScore {
-            fn score(&self, _: &PeerContext, _: &AvailabilityDraft) -> f32 {
-                0.0
-            }
-        }
-
         let clock = Arc::new(MockClock::new(0));
         let router = Router::new(RouterConfig::default(), clock.clone());
 
@@ -703,13 +704,6 @@ mod tests {
     /// We attach a tiny probe handler on the peer to capture the notify.
     #[tokio::test(start_paused = true)]
     async fn outbox_emits_update_notify_to_peer() {
-        struct NullScore;
-        impl Scorer for NullScore {
-            fn score(&self, _: &PeerContext, _: &AvailabilityDraft) -> f32 {
-                0.0
-            }
-        }
-
         // shared clock
         let clock = Arc::new(MockClock::new(0));
 
@@ -811,13 +805,6 @@ mod tests {
     /// B ingests via proto handler and writes to its DB.
     #[tokio::test(start_paused = true)]
     async fn empty_to_sync_single_insert() {
-        struct NullScore;
-        impl Scorer for NullScore {
-            fn score(&self, _: &PeerContext, _: &AvailabilityDraft) -> f32 {
-                0.0
-            }
-        }
-
         // shared clock + two routers
         let clock = Arc::new(MockClock::new(0));
         let rtr_a = Router::new(RouterConfig::default(), clock.clone());
@@ -896,5 +883,268 @@ mod tests {
             "receiver should materialize a leaf availability for the ingested entity"
         );
         assert!(av_b.iter().any(|a| a.level == 0 && a.children.count() >= 1));
+    }
+
+    // --- paste inside harmonizer.rs #[cfg(test)] mod tests ---
+
+    #[tokio::test]
+    async fn range_cover_antichain_and_single_container_pick() {
+        let clock = Arc::new(MockClock::new(0));
+        let router = Router::new(RouterConfig::default(), clock.clone());
+        let hz = Harmonizer::new(Box::new(NullScore), router, HashSet::new());
+
+        let dir = tempdir().unwrap();
+        let db = KuramotoDb::new(
+            dir.path().join("cover.redb").to_str().unwrap(),
+            clock,
+            vec![],
+        )
+        .await;
+        db.create_table_and_indexes::<Availability>().unwrap();
+
+        let dim = TableHash { hash: 1 };
+
+        // Helper to build a cube on one axis
+        let cube = |min: &[u8], max: &[u8]| RangeCube {
+            dims: smallvec![dim],
+            mins: smallvec![min.to_vec()],
+            maxs: smallvec![max.to_vec()],
+        };
+
+        // Seed 3 overlapping parents (same level)
+        let peer = UuidBytes::new();
+        let a_big = Availability {
+            key: UuidBytes::new(),
+            peer_id: peer,
+            range: cube(b"a", b"z"), // contains target
+            level: 2,
+            children: ChildSet {
+                parent: UuidBytes::new(),
+                children: vec![],
+            },
+            schema_hash: 0,
+            version: 0,
+            updated_at: 0,
+            complete: true,
+        };
+        let a_left = Availability {
+            key: UuidBytes::new(),
+            peer_id: peer,
+            range: cube(b"a", b"h"), // overlap only
+            level: 2,
+            children: ChildSet {
+                parent: UuidBytes::new(),
+                children: vec![],
+            },
+            schema_hash: 0,
+            version: 0,
+            updated_at: 0,
+            complete: true,
+        };
+        let a_right = Availability {
+            key: UuidBytes::new(),
+            peer_id: peer,
+            range: cube(b"p", b"z"), // overlap only
+            level: 2,
+            children: ChildSet {
+                parent: UuidBytes::new(),
+                children: vec![],
+            },
+            schema_hash: 0,
+            version: 0,
+            updated_at: 0,
+            complete: true,
+        };
+        db.put(a_big.clone()).await.unwrap();
+        db.put(a_left).await.unwrap();
+        db.put(a_right).await.unwrap();
+
+        // Target is inside [g, p]
+        let target = cube(b"g", b"p");
+
+        // Filter: allow everyone (local-only view is fine here)
+        let allow_all = |_a: &Availability| true;
+
+        let (cover, no_overlap) = hz
+            .range_cover(&db, &target, &[], allow_all, None)
+            .await
+            .unwrap();
+        assert!(!no_overlap, "we seeded overlaps; should be false");
+
+        // Because there is at least one container, result should collapse to a single best container
+        assert_eq!(
+            cover.len(),
+            1,
+            "should prefer single tight container when present"
+        );
+        assert!(cover[0].range.contains(&target));
+    }
+
+    #[tokio::test]
+    async fn range_cover_builds_containment_antichain() {
+        let clock = Arc::new(MockClock::new(0));
+        let router = Router::new(RouterConfig::default(), clock.clone());
+        let hz = Harmonizer::new(Box::new(NullScore), router, HashSet::new());
+
+        let dir = tempdir().unwrap();
+        let db = KuramotoDb::new(
+            dir.path().join("antichain.redb").to_str().unwrap(),
+            clock,
+            vec![],
+        )
+        .await;
+        db.create_table_and_indexes::<Availability>().unwrap();
+
+        let dim = TableHash { hash: 1 };
+        let cube = |min: &[u8], max: &[u8]| RangeCube {
+            dims: smallvec![dim],
+            mins: smallvec![min.to_vec()],
+            maxs: smallvec![max.to_vec()],
+        };
+
+        // B1 covers [a..m], B3 is strictly inside B1 → B3 should be pruned
+        let peer = UuidBytes::new();
+        let b1 = Availability {
+            key: UuidBytes::new(),
+            peer_id: peer,
+            range: cube(b"a", b"m"),
+            level: 1,
+            children: ChildSet {
+                parent: UuidBytes::new(),
+                children: vec![],
+            },
+            schema_hash: 0,
+            version: 0,
+            updated_at: 0,
+            complete: true,
+        };
+        let b2 = Availability {
+            key: UuidBytes::new(),
+            peer_id: peer,
+            range: cube(b"h", b"t"),
+            level: 1,
+            children: ChildSet {
+                parent: UuidBytes::new(),
+                children: vec![],
+            },
+            schema_hash: 0,
+            version: 0,
+            updated_at: 0,
+            complete: true,
+        };
+        let b3 = Availability {
+            key: UuidBytes::new(),
+            peer_id: peer,
+            range: cube(b"b", b"l"),
+            level: 1, // contained in b1
+            children: ChildSet {
+                parent: UuidBytes::new(),
+                children: vec![],
+            },
+            schema_hash: 0,
+            version: 0,
+            updated_at: 0,
+            complete: true,
+        };
+        db.put(b1.clone()).await.unwrap();
+        db.put(b2.clone()).await.unwrap();
+        db.put(b3).await.unwrap();
+
+        let target = cube(b"g", b"p");
+        let (cover, _) = hz
+            .range_cover(&db, &target, &[], |_a| true, None)
+            .await
+            .unwrap();
+
+        // Expect antichain {b1, b2} (order not guaranteed; we'll check set membership)
+        let ids: HashSet<UuidBytes> = cover.into_iter().map(|a| a.key).collect();
+        assert!(
+            ids.contains(&b1.key) && ids.contains(&b2.key),
+            "b1 and b2 should remain"
+        );
+    }
+
+    #[tokio::test]
+    async fn count_replications_counts_unique_peers_that_contain_target() {
+        let clock = Arc::new(MockClock::new(0));
+        let router = Router::new(RouterConfig::default(), clock.clone());
+        let hz = Harmonizer::new(Box::new(NullScore), router, HashSet::new());
+
+        let dir = tempdir().unwrap();
+        let db =
+            KuramotoDb::new(dir.path().join("rep.redb").to_str().unwrap(), clock, vec![]).await;
+        db.create_table_and_indexes::<Availability>().unwrap();
+
+        let dim = crate::tables::TableHash { hash: 1 };
+        let cube = |min: &[u8], max: &[u8]| RangeCube {
+            dims: smallvec![dim],
+            mins: smallvec![min.to_vec()],
+            maxs: smallvec![max.to_vec()],
+        };
+        let target = cube(b"g", b"p");
+
+        // Two distinct peers that fully contain target
+        let p1 = UuidBytes::new();
+        let p2 = UuidBytes::new();
+        db.put(Availability {
+            key: UuidBytes::new(),
+            peer_id: p1,
+            range: cube(b"a", b"z"),
+            level: 3,
+            children: ChildSet {
+                parent: UuidBytes::new(),
+                children: vec![],
+            },
+            schema_hash: 0,
+            version: 0,
+            updated_at: 0,
+            complete: true,
+        })
+        .await
+        .unwrap();
+        db.put(Availability {
+            key: UuidBytes::new(),
+            peer_id: p2,
+            range: cube(b"f", b"q"),
+            level: 2,
+            children: ChildSet {
+                parent: UuidBytes::new(),
+                children: vec![],
+            },
+            schema_hash: 0,
+            version: 0,
+            updated_at: 0,
+            complete: true,
+        })
+        .await
+        .unwrap();
+
+        // One peer that only overlaps (should NOT count)
+        let p3 = UuidBytes::new();
+        db.put(Availability {
+            key: UuidBytes::new(),
+            peer_id: p3,
+            range: cube(b"p", b"z"),
+            level: 2, // starts at p == target.max → not containing
+            children: ChildSet {
+                parent: UuidBytes::new(),
+                children: vec![],
+            },
+            schema_hash: 0,
+            version: 0,
+            updated_at: 0,
+            complete: true,
+        })
+        .await
+        .unwrap();
+
+        let cnt = hz
+            .count_replications(&db, &target, |_a| true, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            cnt, 2,
+            "should count unique peers with full containment only"
+        );
     }
 }
