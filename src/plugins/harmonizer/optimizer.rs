@@ -2,17 +2,19 @@
 //! -----------------------------------------------------------
 //! - Runs in `before_update` against a virtual overlay (pending inserts/deletes).
 //! - **Search policy:** greedy hill-climb up to `caps.max_steps` (default 512):
-//!     enumerate candidates → pick highest gain (> eps) → apply to overlay → repeat.
+//!     enumerate candidates (with adaptive momentum over prefix orders)
+//!     → pick highest gain (> eps) → apply to overlay → repeat.
 //! - **Candidate families per step:**
-//!     (A) Insert-variants from the current drafts (identity, boundary tweaks, promotions)
-//!         plus two small macros: Promote+One-Tweak, and Double-Outward per dim.
+//!     (A) Insert-variants from the current drafts (identity + prefix-succ buckets,
+//!         promotions).
 //!     (B) Prune negatives among a bounded **touched frontier** of existing parents
-//!         that overlap any draft seen so far (Delete only; strictly gated by RF).
-//! - **What we deliberately DO NOT do now:** no Replace/Split neighbor surgery.
-//!   The “economics” (overlap, branching, size, replication bonus) live in the Scorer.
+//!         that overlap any draft seen so far (Delete only; coverage-gated).
+//! - **No neighbor surgery yet** (no Replace/Split).
 //!
-//! Wire real neighbor discovery inside `find_covering_or_near_parents(..)` to unlock
-//! touched-set pruning. Until then it’s safe (it returns empty).
+//! Range mutation no longer relies on push/pop of 0x00/0xFF (which gets stuck in lexicographic
+//! buckets). Instead we jump via **prefix successor**:
+//!   [P, succ(P))  where P is a truncated prefix of the current min.
+//! This allows coarse hops like  [ [0x0f], [0x10) )  (i.e., "a" → "b"), spanning siblings.
 
 use async_trait::async_trait;
 
@@ -94,12 +96,14 @@ pub struct Caps {
     pub b_target: usize,
     /// improvement threshold
     pub eps: f32,
-    /// mutation step for range boundaries (kept for non-byte dims)
+    /// mutation step (kept for API compat; unused in prefix mode)
     pub step: i64,
     /// cap enumerated insert variants per draft
     pub max_variants_per_draft: usize,
-    /// **hill-climb step cap** — keep taking best greedy steps until none or this cap
+    /// hill-climb step cap — keep taking best greedy steps until none or this cap
     pub max_steps: usize,
+    /// Max number of sibling buckets to span per dimension (≥1). 6–8 works well.
+    pub max_bucket_span: usize,
 }
 
 impl Default for Caps {
@@ -112,6 +116,29 @@ impl Default for Caps {
             step: 1,
             max_variants_per_draft: 32,
             max_steps: 512,
+            max_bucket_span: 6,
+        }
+    }
+}
+
+/*──────────────────────── Momentum (adaptive order) ──────────*/
+
+#[derive(Clone, Debug)]
+pub struct Momentum {
+    /// 0 = micro (no truncation), 1 = hop at 1-byte prefix, 2 = hop at 2-byte prefix, ...
+    pub order: usize,
+    /// EMA smoothing for accepted actions (0..1]; higher = adapt faster.
+    pub alpha: f32,
+    /// Safety cap on order.
+    pub max_order: usize,
+}
+
+impl Default for Momentum {
+    fn default() -> Self {
+        Self {
+            order: 0,
+            alpha: 0.35,
+            max_order: 8,
         }
     }
 }
@@ -138,6 +165,7 @@ pub struct BasicOptimizer {
     pub scorer: Box<dyn Scorer>,
     pub ctx: PeerContext,
     pub caps: Caps,
+    pub momentum: Momentum,
 }
 
 impl BasicOptimizer {
@@ -146,16 +174,16 @@ impl BasicOptimizer {
             scorer,
             ctx,
             caps: Caps::default(),
+            momentum: Momentum::default(),
         }
     }
     pub fn with_caps(mut self, caps: Caps) -> Self {
         self.caps = caps;
         self
     }
-
-    /// Enumerate insert variants for a draft, including small “macro” moves.
-    fn enumerate_inserts(&self, d: &AvailabilityDraft) -> Vec<AvailabilityDraft> {
-        enumerate_insert_mutations(d, self.caps)
+    pub fn with_momentum(mut self, m: Momentum) -> Self {
+        self.momentum = m;
+        self
     }
 
     /// Expand the touched frontier by discovering existing parents that overlap `d`.
@@ -175,10 +203,248 @@ impl BasicOptimizer {
     }
 }
 
+/*──────────────────────── prefix utilities ───────────────────*/
+
+/// Return the length of the common prefix of two byte strings.
+fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
+    let n = a.len().min(b.len());
+    for i in 0..n {
+        if a[i] != b[i] {
+            return i;
+        }
+    }
+    n
+}
+
+/// The minimal byte vector strictly greater than any string starting with `p`.
+/// Example: succ_prefix([0x0f]) = [0x10]; succ_prefix([0xff]) = None (overflow).
+fn succ_prefix(p: &[u8]) -> Option<Vec<u8>> {
+    if p.is_empty() {
+        return Some(vec![0x01]); // [] → [0x01] (arbitrary but monotone)
+    }
+    let mut out = p.to_vec();
+    for i in (0..out.len()).rev() {
+        if out[i] != 0xff {
+            out[i] = out[i].wrapping_add(1);
+            out.truncate(i + 1); // drop lower-order suffix → minimal successor
+            return Some(out);
+        }
+    }
+    None // all 0xff → no finite successor
+}
+
+/// immediate predecessor of a prefix (mirror of succ_prefix)
+fn pred_prefix(p: &[u8]) -> Option<Vec<u8>> {
+    if p.is_empty() {
+        return None;
+    }
+    let mut out = p.to_vec();
+    for i in (0..out.len()).rev() {
+        if out[i] != 0x00 {
+            out[i] = out[i].wrapping_sub(1);
+            out.truncate(i + 1);
+            return Some(out);
+        }
+    }
+    None
+}
+
+/// apply succ_prefix n times
+fn succ_n(mut p: Vec<u8>, n: usize) -> Option<Vec<u8>> {
+    for _ in 0..n {
+        p = succ_prefix(&p)?;
+    }
+    Some(p)
+}
+
+/// apply pred_prefix n times
+fn pred_n(mut p: Vec<u8>, n: usize) -> Option<Vec<u8>> {
+    for _ in 0..n {
+        p = pred_prefix(&p)?;
+    }
+    Some(p)
+}
+
+/// Truncate to the first `keep` bytes.
+fn prefix_truncate(v: &[u8], keep: usize) -> Vec<u8> {
+    if keep >= v.len() {
+        v.to_vec()
+    } else {
+        v[..keep].to_vec()
+    }
+}
+
+/*──────────────────── candidate enumeration ───────────────────*/
+
+/// Enumerate INSERT mutations at a given **prefix order** (0 = micro).
+/// For each dim:
+///   - Build the coarse bucket: let P = min truncated by `ord` bytes; candidate = [P, succ(P)).
+///     Also include a promoted version (level+1).
+///   - Add a conservative shrink on max via truncation (for scorer to reject/accept).
+fn enumerate_insert_mutations_with_order(
+    base: &AvailabilityDraft,
+    ord: usize,
+    caps: Caps,
+) -> Vec<AvailabilityDraft> {
+    let dims = base.mins_len();
+    let mut out: Vec<AvailabilityDraft> = Vec::with_capacity(1 + 16 * dims);
+
+    // Identity (so we can early-exit if it's the argmax)
+    out.push(AvailabilityDraft {
+        level: base.level,
+        range: base.range.clone(),
+        complete: true,
+    });
+
+    let max_span = caps.max_bucket_span.max(1); // default 6 if you added the cap
+
+    for dim in 0..dims {
+        let min0 = &base.range.mins[dim];
+        let max0 = &base.range.maxs[dim];
+
+        // Truncate MIN by 'ord' to get the anchor prefix P
+        let keep = min0.len().saturating_sub(ord);
+        let p = prefix_truncate(min0, keep);
+
+        // Basic coarse bucket [P, succ(P))
+        if let Some(p_succ) = succ_prefix(&p) {
+            let mut r = base.range.clone();
+            r.mins[dim] = p.clone();
+            r.maxs[dim] = p_succ.clone();
+            if !range_is_empty(&r) {
+                out.push(AvailabilityDraft {
+                    level: base.level,
+                    range: r.clone(),
+                    complete: true,
+                });
+                out.push(AvailabilityDraft {
+                    level: base.level + 1,
+                    range: r,
+                    complete: true,
+                });
+            }
+        }
+
+        // Immediate left neighbor [pred(P), P)
+        if let Some(p_pred) = pred_prefix(&p) {
+            let mut r = base.range.clone();
+            r.mins[dim] = p_pred.clone();
+            r.maxs[dim] = p.clone();
+            if !range_is_empty(&r) {
+                out.push(AvailabilityDraft {
+                    level: base.level,
+                    range: r.clone(),
+                    complete: true,
+                });
+                out.push(AvailabilityDraft {
+                    level: base.level + 1,
+                    range: r,
+                    complete: true,
+                });
+            }
+        }
+
+        // Multi-bucket spans:
+        //  - right-wide:  [P, succ^w(P))              (covers P .. P+w-1)
+        //  - left-wide:   [pred^(w-1)(P), P)          (covers P-w+1 .. P-1)
+        //  - symmetric:   [pred^t(P), succ^t(P))      (covers P-t .. P+t-1)  (width = 2t)
+        for w in 2..=max_span {
+            // Right-wide
+            if let Some(p_right) = succ_n(p.clone(), w) {
+                let mut r = base.range.clone();
+                r.mins[dim] = p.clone();
+                r.maxs[dim] = p_right.clone();
+                if !range_is_empty(&r) {
+                    out.push(AvailabilityDraft {
+                        level: base.level,
+                        range: r.clone(),
+                        complete: true,
+                    });
+                    out.push(AvailabilityDraft {
+                        level: base.level + 1,
+                        range: r,
+                        complete: true,
+                    });
+                }
+            }
+            // Left-wide
+            if let Some(p_left) = pred_n(p.clone(), w - 1) {
+                let mut r = base.range.clone();
+                r.mins[dim] = p_left.clone();
+                r.maxs[dim] = p.clone();
+                if !range_is_empty(&r) {
+                    out.push(AvailabilityDraft {
+                        level: base.level,
+                        range: r.clone(),
+                        complete: true,
+                    });
+                    out.push(AvailabilityDraft {
+                        level: base.level + 1,
+                        range: r,
+                        complete: true,
+                    });
+                }
+            }
+        }
+
+        // Symmetric widening (even widths 2,4,6...)
+        for t in 1..=((max_span) / 2) {
+            if let (Some(left), Some(right)) = (pred_n(p.clone(), t), succ_n(p.clone(), t)) {
+                let mut r = base.range.clone();
+                r.mins[dim] = left.clone();
+                r.maxs[dim] = right.clone();
+                if !range_is_empty(&r) {
+                    out.push(AvailabilityDraft {
+                        level: base.level,
+                        range: r.clone(),
+                        complete: true,
+                    });
+                    out.push(AvailabilityDraft {
+                        level: base.level + 1,
+                        range: r,
+                        complete: true,
+                    });
+                }
+            }
+        }
+
+        // (Optional) conservative shrink on max, as you had before
+        let keep_max = max0.len().saturating_sub(ord);
+        let max_trunc = prefix_truncate(max0, keep_max);
+        if max_trunc > *min0 {
+            let mut r = base.range.clone();
+            r.maxs[dim] = max_trunc.clone();
+            if !range_is_empty(&r) {
+                out.push(AvailabilityDraft {
+                    level: base.level,
+                    range: r.clone(),
+                    complete: true,
+                });
+                out.push(AvailabilityDraft {
+                    level: base.level + 1,
+                    range: r,
+                    complete: true,
+                });
+            }
+        }
+    }
+
+    // Dedupe & cap
+    let mut uniq: Vec<AvailabilityDraft> = Vec::with_capacity(out.len());
+    for d in out.into_iter().filter(|d| !range_is_empty(&d.range)) {
+        if !contains_draft(&uniq, &d) {
+            uniq.push(d);
+        }
+        if uniq.len() >= caps.max_variants_per_draft {
+            break;
+        }
+    }
+    uniq
+}
+
 #[async_trait]
 impl Optimizer for BasicOptimizer {
-    /// **Greedy hill-climb** with cap `caps.max_steps` (default 512).
-    /// Accumulates all improving actions into one `ActionSet` and returns it.
+    /// **Greedy hill-climb** with adaptive momentum over prefix order.
     async fn propose(
         &self,
         db: &KuramotoDb,
@@ -192,6 +458,13 @@ impl Optimizer for BasicOptimizer {
             .filter(|d| !range_is_empty(&d.range))
             .collect();
         let mut deletes: Vec<UuidBytes> = overlay.pending_deletes.to_vec();
+        eprintln!(
+            "opt.start: drafts={} deletes={} max_steps={} ord0={}",
+            drafts.len(),
+            deletes.len(),
+            self.caps.max_steps,
+            self.momentum.order.min(self.momentum.max_order)
+        );
 
         // Seed touched frontier from initial drafts
         let mut touched = Touched::new();
@@ -201,58 +474,97 @@ impl Optimizer for BasicOptimizer {
 
         let mut plan: ActionSet = Vec::new();
 
+        // Momentum state (per climb)
+        let mut ord_ema = self.momentum.order as f32;
+        let alpha = self.momentum.alpha;
+        let mut ord = self.momentum.order.min(self.momentum.max_order);
+        let mut neighborhood_radius: usize = 1;
+
         // Greedy loop
         for _step in 0..self.caps.max_steps {
             let mut best_gain = f32::NEG_INFINITY;
-            let mut best_actions: Option<ActionSet> = None;
+            let mut best: Option<(ActionSet, usize)> = None; // (actions, order_used)
 
-            // A) Insert candidates from current drafts (+macros)
-            for d in &drafts {
-                for cand in self.enumerate_inserts(d) {
-                    if range_is_empty(&cand.range) {
+            // Try orders around current momentum (symmetric neighborhood)
+            let mut orders_to_try = Vec::<usize>::new();
+            for delta in 0..=neighborhood_radius {
+                if ord >= delta {
+                    orders_to_try.push(ord - delta);
+                }
+                if delta != 0 && ord + delta <= self.momentum.max_order {
+                    orders_to_try.push(ord + delta);
+                }
+            }
+            orders_to_try.sort_unstable();
+            orders_to_try.dedup();
+
+            for &ord_try in &orders_to_try {
+                // A) Insert candidates from current drafts (+ promotions)
+                for d in &drafts {
+                    for cand in enumerate_insert_mutations_with_order(d, ord_try, self.caps) {
+                        if range_is_empty(&cand.range) {
+                            continue;
+                        }
+                        let gain = self.scorer.score(&self.ctx, &cand);
+                        if gain > self.caps.eps && gain > best_gain + self.caps.eps {
+                            best_gain = gain;
+                            best = Some((vec![Action::Insert(cand)], ord_try));
+                        }
+                    }
+                }
+
+                // B) Prune negatives in touched frontier (Delete only; coverage-safe)
+                for p in touched.iter() {
+                    // Coverage constraint: never delete leaves until eviction is implemented
+                    if p.level == 0 {
                         continue;
                     }
-                    let gain = self.scorer.score(&self.ctx, &cand);
-                    if gain > self.caps.eps && gain > best_gain + self.caps.eps {
-                        best_gain = gain;
-                        best_actions = Some(vec![Action::Insert(cand)]);
+                    if p.peer_id != self.ctx.peer_id {
+                        continue;
+                    }
+
+                    let pd = AvailabilityDraft {
+                        level: p.level,
+                        range: p.range.clone(),
+                        complete: true,
+                    };
+                    let s_old = if range_is_empty(&pd.range) {
+                        0.0
+                    } else {
+                        self.scorer.score(&self.ctx, &pd)
+                    };
+
+                    if s_old < 0.0 {
+                        let gain = -s_old;
+                        if gain > self.caps.eps && gain > best_gain + self.caps.eps {
+                            best_gain = gain;
+                            best = Some((vec![Action::Delete(p.id)], ord_try));
+                        }
                     }
                 }
             }
 
-            // B) Prune negatives in the touched frontier (Delete only; coverage-safe)
-            for p in touched.iter() {
-                // Coverage constraint: never delete leaves until eviction is implemented
-                if p.level == 0 {
+            // No improvement with current neighborhood → widen search a bit; if already wide, stop.
+            let Some((actions, ord_used)) = best else {
+                if neighborhood_radius < 3 && ord < self.momentum.max_order {
+                    neighborhood_radius += 1;
                     continue;
                 }
+                break;
+            };
 
-                if p.peer_id != self.ctx.peer_id {
-                    continue;
-                }
-
-                let pd = AvailabilityDraft {
-                    level: p.level,
-                    range: p.range.clone(),
-                    complete: true,
-                };
-                let s_old = if range_is_empty(&pd.range) {
-                    0.0
-                } else {
-                    self.scorer.score(&self.ctx, &pd)
-                };
-
-                if s_old < 0.0 {
-                    let gain = -s_old;
-                    if gain > self.caps.eps && gain > best_gain + self.caps.eps {
-                        best_gain = gain;
-                        best_actions = Some(vec![Action::Delete(p.id)]);
+            if actions.len() == 1 {
+                if let Action::Insert(ref d) = actions[0] {
+                    if is_identity(d, &drafts) {
+                        // Nothing left to do; return whatever we’ve accumulated so far
+                        return if plan.is_empty() {
+                            Ok(None)
+                        } else {
+                            Ok(Some(plan))
+                        };
                     }
                 }
             }
-
-            // Stop if we found nothing improving
-            let Some(actions) = best_actions else { break };
 
             // Apply actions to overlay + frontier
             for a in &actions {
@@ -272,6 +584,11 @@ impl Optimizer for BasicOptimizer {
                     }
                 }
             }
+
+            // Update momentum (EMA) toward the order that produced the accepted step
+            ord_ema = alpha * (ord_used as f32) + (1.0 - alpha) * ord_ema;
+            ord = ord_ema.round().clamp(0.0, self.momentum.max_order as f32) as usize;
+            neighborhood_radius = 1; // reset after a successful step
 
             // Record in final plan and continue
             plan.extend(actions);
@@ -350,123 +667,22 @@ async fn find_covering_or_near_parents(
     Ok(out)
 }
 
-/*──────────────── Insert enumeration (+ two macros) ───────────*/
+/*──────────────────── Helpers: equality/dedup ─────────────────*/
 
-/// Enumerate primitive INSERT mutations derived from a draft:
-/// - Same-level boundary tweaks by ±step for each dim/min/max
-/// - Promotions (level+1) for each produced range
-/// - Macro 1: Promote+One-Tweak (applies one extra outward tweak to a promotion)
-/// - Macro 2: Double-Outward per dim (min-outward + max-outward together)
-fn enumerate_insert_mutations(base: &AvailabilityDraft, caps: Caps) -> Vec<AvailabilityDraft> {
-    let dims = base.mins_len();
-
-    let mut out: Vec<AvailabilityDraft> = Vec::with_capacity(1 + 4 * dims);
-
-    // 0) identity same-level (rely on scorer to reject if useless)
-    out.push(AvailabilityDraft {
-        level: base.level,
-        range: base.range.clone(),
-        complete: true,
-    });
-
-    // 1) per-dim boundary tweaks (same level)
-    for dim in 0..dims {
-        if let Some(r) = mutate_range_step(&base.range, dim, Boundary::Min, Dir::Outward, caps.step)
-        {
-            out.push(AvailabilityDraft {
-                level: base.level,
-                range: r,
-                complete: true,
-            });
-        }
-        if let Some(r) = mutate_range_step(&base.range, dim, Boundary::Min, Dir::Inward, caps.step)
-        {
-            out.push(AvailabilityDraft {
-                level: base.level,
-                range: r,
-                complete: true,
-            });
-        }
-        if let Some(r) = mutate_range_step(&base.range, dim, Boundary::Max, Dir::Outward, caps.step)
-        {
-            out.push(AvailabilityDraft {
-                level: base.level,
-                range: r,
-                complete: true,
-            });
-        }
-        if let Some(r) = mutate_range_step(&base.range, dim, Boundary::Max, Dir::Inward, caps.step)
-        {
-            out.push(AvailabilityDraft {
-                level: base.level,
-                range: r,
-                complete: true,
-            });
-        }
-
-        // 2) Macro: Double-Outward for this dim (same level)
-        if let Some(r1) =
-            mutate_range_step(&base.range, dim, Boundary::Min, Dir::Outward, caps.step)
-        {
-            if let Some(r2) = mutate_range_step(&r1, dim, Boundary::Max, Dir::Outward, caps.step) {
-                out.push(AvailabilityDraft {
-                    level: base.level,
-                    range: r2,
-                    complete: true,
-                });
-            }
-        }
-    }
-
-    // Collect the same set again as promotions (level+1)
-    let mut promos: Vec<AvailabilityDraft> = Vec::with_capacity(out.len());
-    for d in &out {
-        promos.push(AvailabilityDraft {
-            level: d.level + 1,
-            range: d.range.clone(),
-            complete: true,
-        });
-    }
-
-    // Macro 1 on promotions: for each promo, apply a single outward max tweak per dim
-    let mut promo_plus_one: Vec<AvailabilityDraft> = Vec::new();
-    for p in &promos {
-        for dim in 0..dims {
-            if let Some(r) =
-                mutate_range_step(&p.range, dim, Boundary::Max, Dir::Outward, caps.step)
-            {
-                promo_plus_one.push(AvailabilityDraft {
-                    level: p.level,
-                    range: r,
-                    complete: true,
-                });
-            }
-        }
-    }
-
-    out.extend(promos);
-    out.extend(promo_plus_one);
-
-    // Enforce non-empty rule; dedupe; cap
-    let mut uniq: Vec<AvailabilityDraft> = Vec::with_capacity(out.len());
-    for d in out.into_iter().filter(|d| !range_is_empty(&d.range)) {
-        if !contains_draft(&uniq, &d) {
-            uniq.push(d);
-        }
-        if uniq.len() >= caps.max_variants_per_draft {
-            break;
-        }
-    }
-    uniq
-}
-
-// Deduplicate drafts by (level, range bytes, complete)
 fn contains_draft(haystack: &[AvailabilityDraft], needle: &AvailabilityDraft) -> bool {
     haystack.iter().any(|d| draft_eq(d, needle))
 }
+
 fn draft_eq(a: &AvailabilityDraft, b: &AvailabilityDraft) -> bool {
     a.level == b.level && a.complete == b.complete && ranges_equal(&a.range, &b.range)
 }
+
+#[inline]
+fn is_identity(cand: &AvailabilityDraft, drafts: &[AvailabilityDraft]) -> bool {
+    // identity = same (level, range, complete) as something already in `drafts`
+    contains_draft(drafts, cand)
+}
+
 fn ranges_equal(x: &RangeCube, y: &RangeCube) -> bool {
     if x.mins.len() != y.mins.len() || x.maxs.len() != y.maxs.len() {
         return false;
@@ -498,55 +714,6 @@ impl RangeExt for RangeCube {
     fn mins_len(&self) -> usize {
         self.mins.len()
     }
-}
-
-#[derive(Copy, Clone)]
-enum Boundary {
-    Min,
-    Max,
-}
-#[derive(Copy, Clone)]
-enum Dir {
-    Inward,
-    Outward,
-}
-
-/// Returns a new range with a single boundary moved by ±step if valid, else None.
-/// Operates in **lexicographic byte space**:
-/// - Min Outward  (expand ↓): pop one trailing byte if any
-/// - Min Inward   (shrink ↑): push 0x00
-/// - Max Outward  (expand ↑): push 0xFF
-/// - Max Inward   (shrink ↓): pop one trailing byte if any
-fn mutate_range_step(
-    base: &RangeCube,
-    dim: usize,
-    which: Boundary,
-    dir: Dir,
-    _step: i64, // unused for bytes; kept for API consistency
-) -> Option<RangeCube> {
-    if dim >= base.mins_len() {
-        return None;
-    }
-    let mut r = base.clone();
-    match (which, dir) {
-        (Boundary::Min, Dir::Outward) => {
-            if !r.mins[dim].is_empty() {
-                r.mins[dim].pop();
-            }
-        }
-        (Boundary::Min, Dir::Inward) => {
-            r.mins[dim].push(0x00);
-        }
-        (Boundary::Max, Dir::Outward) => {
-            r.maxs[dim].push(0xFF);
-        }
-        (Boundary::Max, Dir::Inward) => {
-            if !r.maxs[dim].is_empty() {
-                r.maxs[dim].pop();
-            }
-        }
-    }
-    if range_is_empty(&r) { None } else { Some(r) }
 }
 
 /// A range is empty if, on any dimension, max ≤ min in lexicographic byte order.
@@ -628,12 +795,13 @@ mod tests {
             b_target: 6,
             eps: 0.0,
             step: 1,
-            max_variants_per_draft: 32,
+            max_variants_per_draft: 64,
             max_steps: 16, // keep tests fast/deterministic
+            max_bucket_span: 6,
         }
     }
 
-    // ---------- scorers ----------
+    // ---------- test scorers ----------
     struct ZeroScorer;
     impl Scorer for ZeroScorer {
         fn score(&self, _ctx: &PeerContext, _a: &AvailabilityDraft) -> f32 {
@@ -641,40 +809,20 @@ mod tests {
         }
     }
 
-    /// Favors larger (len(max) - len(min)) across dims. Pushes outward expansions.
-    struct ByteSpanScorer;
-    impl Scorer for ByteSpanScorer {
+    /// Rewards **coarser buckets** (smaller common prefix between min and max) and promotions.
+    struct CoarseBucketScorer;
+    impl Scorer for CoarseBucketScorer {
         fn score(&self, _ctx: &PeerContext, a: &AvailabilityDraft) -> f32 {
-            let mut s: i32 = 0;
             let d = a.range.mins.len().min(a.range.maxs.len());
+            let mut s = 0.0f32;
             for i in 0..d {
-                s += (a.range.maxs[i].len() as i32) - (a.range.mins[i].len() as i32);
+                let cp = super::common_prefix_len(&a.range.mins[i], &a.range.maxs[i]);
+                // Smaller cp → coarser bucket → higher reward
+                s += (16_i32 - (cp as i32)).max(0) as f32;
             }
-            s as f32
-        }
-    }
-
-    /// Rewards **promotion+growth**, penalizes pure promotion or pure growth.
-    struct PromoPlusGrowthScorer;
-    impl Scorer for PromoPlusGrowthScorer {
-        fn score(&self, _ctx: &PeerContext, a: &AvailabilityDraft) -> f32 {
-            let span: i32 = {
-                let d = a.range.mins.len().min(a.range.maxs.len());
-                let mut v = 0;
-                for i in 0..d {
-                    v += (a.range.maxs[i].len() as i32) - (a.range.mins[i].len() as i32);
-                }
-                v
-            };
-            if a.level >= 1 && span >= 2 {
-                10.0 // promote+grow is good
-            } else if a.level >= 1 {
-                -1.0 // promotion without growth is bad
-            } else if span >= 2 {
-                -1.0 // growth without promotion is bad
-            } else {
-                0.0
-            }
+            // Prefer higher levels a bit
+            s += (a.level as f32) * 0.5;
+            s
         }
     }
 
@@ -716,49 +864,30 @@ mod tests {
     }
 
     #[test]
-    fn mutate_step_operates_in_byte_space() {
-        // Give dim0 extra slack so Max Inward won't collapse to equality
-        let base = RangeCube {
-            dims: smallvec![],
-            mins: smallvec![b"a".to_vec(), b"a".to_vec()],
-            // dim0 has two bytes of headroom ("a\x02\x00"); dim1 stays modest ("a\x01")
-            maxs: smallvec![b"a\x02\x00".to_vec(), b"a\x01".to_vec()],
-        };
-
-        // Min Inward: append 0x00 → len increases
-        let r = super::mutate_range_step(&base, 0, super::Boundary::Min, super::Dir::Inward, 1)
-            .unwrap();
-        assert_eq!(r.mins[0].len(), base.mins[0].len() + 1);
-        assert!(!super::range_is_empty(&r));
-
-        // Min Outward: pop → len decreases (if non-empty)
-        let r = super::mutate_range_step(&base, 1, super::Boundary::Min, super::Dir::Outward, 1)
-            .unwrap();
-        assert_eq!(r.mins[1].len() + 1, base.mins[1].len());
-        assert!(!super::range_is_empty(&r));
-
-        // Max Inward: pop → len decreases
-        let r = super::mutate_range_step(&base, 0, super::Boundary::Max, super::Dir::Inward, 1)
-            .unwrap();
-        assert_eq!(r.maxs[0].len() + 1, base.maxs[0].len());
-        assert!(!super::range_is_empty(&r));
-
-        // Max Outward: push 0xFF → len increases
-        let r = super::mutate_range_step(&base, 1, super::Boundary::Max, super::Dir::Outward, 1)
-            .unwrap();
-        assert_eq!(r.maxs[1].len(), base.maxs[1].len() + 1);
-        assert!(!super::range_is_empty(&r));
-    }
-
-    #[test]
-    fn enumerate_insert_mutations_filters_empties_and_caps() {
-        let d = draft_bytes(0, &[b"a"], &[b"a\x01"]);
+    fn order_one_enumeration_spans_adjacent_bucket() {
+        // Base leaf around 0x0f: [ [0x0f,0x00], [0x0f,0x01) )
+        let base = draft_bytes(0, &[&[0x0f, 0x00]], &[&[0x0f, 0x01]]);
         let mut c = caps();
-        c.max_variants_per_draft = 6; // force a small cap
-        let variants = super::enumerate_insert_mutations(&d, c);
-        assert!(!variants.is_empty());
-        assert!(variants.len() <= 6);
-        assert!(variants.iter().all(|v| !super::range_is_empty(&v.range)));
+        c.max_variants_per_draft = 64;
+
+        let variants = super::enumerate_insert_mutations_with_order(&base, 1, c);
+
+        // Expect a candidate that hops to [ [0x0f], [0x10) )
+        let wanted_min = vec![0x0f];
+        let wanted_max = vec![0x10];
+        assert!(
+            variants
+                .iter()
+                .any(|d| d.range.mins[0] == wanted_min && d.range.maxs[0] == wanted_max),
+            "expected a prefix-succ hop from [0x0f] to [0x10)"
+        );
+        // And at least one promoted version should exist too
+        assert!(
+            variants.iter().any(|d| d.level >= 1
+                && d.range.mins[0] == wanted_min
+                && d.range.maxs[0] == wanted_max),
+            "expected a promoted variant of the coarse bucket"
+        );
     }
 
     // ───────────────────── optimizer behavior ──────────────────
@@ -783,64 +912,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn greedy_climb_takes_multiple_steps_and_respects_cap() {
+    async fn greedy_climb_uses_coarse_buckets_and_respects_cap() {
         let db = fresh_db().await;
         let mut c = caps();
         c.max_steps = 4; // keep it small
-        let opt = BasicOptimizer::new(Box::new(ByteSpanScorer), peer()).with_caps(c);
+        let opt = BasicOptimizer::new(Box::new(CoarseBucketScorer), peer())
+            .with_caps(c)
+            .with_momentum(Momentum {
+                order: 0,
+                alpha: 0.5,
+                max_order: 8,
+            });
 
-        // Base span = len(max) - len(min) = 1
-        let base = draft_bytes(0, &[b"a"], &[b"a\x01"]);
-        let inserts = vec![base.clone()];
-        let deletes: Vec<UuidBytes> = vec![];
-
-        let o = Overlay {
-            pending_inserts: &inserts,
-            pending_deletes: &deletes,
-            score: 1.0,
-        };
-
-        let got = opt.propose(&db, o).await.unwrap();
-        let Some(actions) = got else {
-            panic!("expected an improving Insert action sequence");
-        };
-
-        // At least one Insert should increase span over base
-        assert!(
-            actions.iter().any(|a| match a {
-                Action::Insert(d) => {
-                    let mut span: i32 = 0;
-                    let dim = d.range.mins.len().min(d.range.maxs.len());
-                    for i in 0..dim {
-                        span += (d.range.maxs[i].len() as i32) - (d.range.mins[i].len() as i32);
-                    }
-                    span > 1
-                }
-                _ => false,
-            }),
-            "no improving Insert (span) found"
-        );
-
-        // With a monotone scorer, hill-climb should return multiple steps (capped)
-        assert!(
-            actions.len() >= 2,
-            "expected multiple greedy steps under hill-climb"
-        );
-        assert!(
-            actions.len() as usize <= c.max_steps,
-            "should never exceed the step cap"
-        );
-    }
-
-    #[tokio::test]
-    async fn macro_promotion_plus_tweak_is_reachable_without_lookahead() {
-        let db = fresh_db().await;
-        let mut c = caps();
-        c.max_steps = 8;
-        let opt = BasicOptimizer::new(Box::new(PromoPlusGrowthScorer), peer()).with_caps(c);
-
-        // Base span ~ 1 (tiny)
-        let base = draft_bytes(0, &[b"a"], &[b"a\x01"]);
+        // Base leaf ~ [15.00, 15.01)
+        let base = draft_bytes(0, &[&[15u8, 0x00]], &[&[15u8, 0x01]]);
         let inserts = vec![base.clone()];
         let deletes: Vec<UuidBytes> = vec![];
 
@@ -850,33 +935,58 @@ mod tests {
             score: 0.0,
         };
 
-        let got = opt
-            .propose(&db, o)
-            .await
-            .unwrap()
-            .expect("should produce actions");
+        let got = opt.propose(&db, o).await.unwrap();
+        let Some(actions) = got else {
+            panic!("expected an improving Insert action sequence");
+        };
 
-        // We should see at least one promoted + grown insert (level >=1 and span >=2)
-        let mut ok = false;
-        for a in got {
+        // We should see at least one insertion that spans the adjacent bucket [15]..[16)
+        let mut saw_bucket_hop = false;
+        for a in &actions {
             if let Action::Insert(d) = a {
-                let span: i32 = {
-                    let dim = d.range.mins.len().min(d.range.maxs.len());
-                    let mut v = 0;
-                    for i in 0..dim {
-                        v += (d.range.maxs[i].len() as i32) - (d.range.mins[i].len() as i32);
-                    }
-                    v
-                };
-                if d.level >= 1 && span >= 2 {
-                    ok = true;
-                    break;
+                if d.range.mins[0] == vec![15u8] && d.range.maxs[0] == vec![16u8] {
+                    saw_bucket_hop = true;
                 }
             }
         }
+        assert!(saw_bucket_hop, "expected a coarse bucket hop [15]..[16)");
+
+        // Greedy climb should return multiple steps (capped)
         assert!(
-            ok,
-            "promotion+growth should be reachable via macro variants"
+            actions.len() >= 1,
+            "expected at least one improving step under hill-climb"
         );
+        assert!(
+            actions.len() as usize <= c.max_steps,
+            "should never exceed the step cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn early_exit_on_identity_proposal() {
+        let db = fresh_db().await;
+
+        // Force the enumerator to offer only the identity variant
+        let mut c = caps();
+        c.max_steps = 8;
+        c.max_variants_per_draft = 1;
+
+        let opt = BasicOptimizer::new(Box::new(CoarseBucketScorer), peer()).with_caps(c);
+
+        // A simple 1D leaf; identity exists and is "good" under ByteSpanScorer
+        let base = draft_bytes(0, &[b"\x0f"], &[b"\x0f\x01"]); // [15]..[15,1)
+        let inserts = vec![base];
+        let deletes: Vec<UuidBytes> = vec![];
+
+        let o = Overlay {
+            pending_inserts: &inserts,
+            pending_deletes: &deletes,
+            score: 1.0,
+        };
+
+        // Before the fix this would return 512 identity inserts;
+        // now it should early-exit with None (no change).
+        let got = opt.propose(&db, o).await.unwrap();
+        assert!(got.is_none(), "should early-exit on identity proposal");
     }
 }

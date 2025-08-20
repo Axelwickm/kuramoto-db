@@ -24,10 +24,10 @@ pub type StaticTableDef = &'static TableDefinition<'static, &'static [u8], Vec<u
 pub trait PluginMarker: Send + Sync {}
 
 pub struct IndexPutRequest {
-    table: StaticTableDef,
-    key: Vec<u8>,   // index key (e.g., email as bytes)
-    value: Vec<u8>, // usually the main key (e.g., user_id)
-    unique: bool,
+    pub table: StaticTableDef,
+    pub key: Vec<u8>,   // index key (e.g., email as bytes)
+    pub value: Vec<u8>, // usually the main key (e.g., user_id)
+    pub unique: bool,
 }
 pub struct IndexRemoveRequest {
     table: StaticTableDef,

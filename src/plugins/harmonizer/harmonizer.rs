@@ -1,12 +1,14 @@
 use async_trait::async_trait;
 use bincode::{Decode, Encode};
 use redb::{TableHandle, WriteTransaction};
+use smallvec::smallvec;
+use std::collections::BTreeMap;
+use std::io::Write;
 use std::sync::{OnceLock, Weak};
 use std::{collections::HashSet, sync::Arc};
 use tokio::sync::mpsc;
 
-use smallvec::smallvec;
-
+use crate::database::{IndexPutRequest, WriteRequest};
 use crate::plugins::communication::transports::PeerId;
 use crate::plugins::harmonizer::child_set::{Child, DigestChunk};
 use crate::plugins::harmonizer::optimizer::{BasicOptimizer, Optimizer, PeerContext};
@@ -24,9 +26,10 @@ use crate::plugins::{
     communication::router::Router,
     harmonizer::availability::{AVAILABILITIES_META_TABLE, AVAILABILITIES_TABLE, Availability},
 };
+use crate::tables::TableHash;
 use crate::{
-    KuramotoDb, StaticTableDef, WriteBatch, database::WriteRequest, plugins::Plugin,
-    storage_entity::StorageEntity, storage_error::StorageError, uuid_bytes::UuidBytes,
+    KuramotoDb, StaticTableDef, WriteBatch, plugins::Plugin, storage_entity::StorageEntity,
+    storage_error::StorageError, uuid_bytes::UuidBytes,
 };
 
 /*──────────────────────── Outbox (network side-effects) ───────────────────*/
@@ -161,8 +164,78 @@ impl Harmonizer {
         self.watched_tables.contains(tbl.name())
     }
 
+    /// Build a multi-dim leaf: one dim for the PK axis + one per index table present in `index_puts`.
+    /// Each dim is the tightest half-open interval that contains *all* keys emitted for that index.
+    fn leaf_range_from_pk_and_indexes(
+        data_table: StaticTableDef,
+        pk: &[u8],
+        index_puts: &[IndexPutRequest],
+    ) -> RangeCube {
+        // By-dimension accumulator, sorted by hash for deterministic output.
+        // Value = (TableHash, raw_min_inclusive, raw_max_inclusive)
+        let mut by_dim: BTreeMap<u64, (TableHash, Vec<u8>, Vec<u8>)> = BTreeMap::new();
+
+        // 1) PK axis (always present)
+        let pk_dim = TableHash::from(data_table);
+        by_dim.insert(pk_dim.hash(), (pk_dim, pk.to_vec(), pk.to_vec()));
+
+        // 2) Every index row → fold into that index’s min/max
+        for ip in index_puts {
+            let dim = TableHash::from(ip.table);
+            let key_raw = Self::strip_pk_from_index_key(&ip.key, pk);
+
+            let h = dim.hash();
+            match by_dim.get_mut(&h) {
+                Some((_d, lo, hi)) => {
+                    if key_raw < *lo {
+                        *lo = key_raw.clone();
+                    }
+                    if key_raw > *hi {
+                        *hi = key_raw.clone();
+                    }
+                }
+                None => {
+                    by_dim.insert(h, (dim, key_raw.clone(), key_raw));
+                }
+            }
+        }
+
+        // 3) Materialize sorted dims/mins/maxs; make ranges half-open by bumping hi
+        let mut dims = smallvec![];
+        let mut mins = smallvec![];
+        let mut maxs = smallvec![];
+        for (_h, (dim, lo, mut hi_incl)) in by_dim.into_iter() {
+            // Ensure non-empty: [lo, hi_incl + 0x01)
+            if hi_incl <= lo {
+                // Equal is fine; bump hi to keep non-empty.
+                hi_incl = lo.clone();
+            }
+            let mut hi_excl = hi_incl.clone();
+            hi_excl.push(0x01);
+
+            dims.push(dim);
+            mins.push(lo);
+            maxs.push(hi_excl);
+        }
+
+        RangeCube { dims, mins, maxs }
+    }
+
+    /// Returns **owned** bytes (no lifetimes). If your index key encodes PK as suffix/prefix,
+    /// strip it so the coordinate lives only in index-key space.
+    fn strip_pk_from_index_key(stored: &[u8], pk: &[u8]) -> Vec<u8> {
+        if stored.len() >= pk.len() && stored.ends_with(pk) {
+            stored[..stored.len() - pk.len()].to_vec()
+        } else if stored.len() >= pk.len() && stored.starts_with(pk) {
+            stored[pk.len()..].to_vec()
+        } else {
+            stored.to_vec()
+        }
+    }
+
     #[inline]
     fn splitmix64(mut x: u64) -> u64 {
+        // TODO: We already have hashes in table.rs, so maybe remove
         x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
         x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
@@ -230,6 +303,21 @@ impl Harmonizer {
             peer_filter(a) && a.range.overlaps(target)
         });
 
+        println!(
+            "range_cover: target mins={:?} maxs={:?}",
+            target.mins, target.maxs
+        );
+        println!("range_cover: candidates after filter = {}", all.len());
+        for (i, a) in all.iter().enumerate() {
+            let contains = a.range.contains(target);
+            let overlaps = a.range.overlaps(target);
+            println!(
+                "  [{}] lvl={} peer={:?} mins={:?} maxs={:?} contains={} overlaps={}",
+                i, a.level, a.peer_id, a.range.mins, a.range.maxs, contains, overlaps
+            );
+        }
+        std::io::stdout().flush().unwrap();
+
         // Early out: nothing touches the target
         if all.is_empty() {
             return Ok((Vec::new(), true)); // second == "no overlap"
@@ -246,6 +334,14 @@ impl Harmonizer {
             // Pick the smallest-by-volume on the lowest level that still contains target
             let pick = inside[0].clone();
             return Ok((vec![pick.clone()], false));
+        }
+
+        println!("range_cover: inside.len()={}", inside.len());
+        for (i, a) in inside.iter().enumerate() {
+            println!(
+                "  inside[{}]: lvl={} mins={:?} maxs={:?}",
+                i, a.level, a.range.mins, a.range.maxs
+            );
         }
 
         // 4) Build a containment-minimal antichain among overlapping candidates:
@@ -341,14 +437,24 @@ impl Plugin for Harmonizer {
             return Ok(());
         };
 
+        println!("harm.before_update: incoming batch_len={}", batch.len());
+
         // Only act on writes to watched data tables
-        let (data_table, key_owned, entity_bytes) = match first {
+        let (data_table, key_owned, entity_bytes, index_puts) = match first {
             WriteRequest::Put {
                 data_table,
                 key,
                 value,
+                index_puts,
                 ..
-            } if self.is_watched(*data_table) => (*data_table, key.clone(), value.clone()),
+            } if self.is_watched(*data_table) => {
+                println!(
+                    "before_update: first table={} watched={}",
+                    data_table.name(),
+                    self.is_watched(*data_table)
+                );
+                (*data_table, key.clone(), value.clone(), index_puts)
+            }
             _ => return Ok(()),
         };
 
@@ -360,14 +466,12 @@ impl Plugin for Harmonizer {
 
         // --- 1) materialize the leaf availability (level 0) ---
         let avail_id = UuidBytes::new();
+        let leaf_range = Self::leaf_range_from_pk_and_indexes(data_table, &key_owned, &index_puts);
+
         let avail = Availability {
             key: avail_id,
             peer_id,
-            range: RangeCube {
-                dims: smallvec![],
-                mins: smallvec![],
-                maxs: smallvec![],
-            },
+            range: leaf_range,
             level: 0,
             children: ChildSet {
                 parent: avail_id,
@@ -396,6 +500,11 @@ impl Plugin for Harmonizer {
         )
         .map_err(|e| StorageError::Bincode(e.to_string()))?;
 
+        println!(
+            "before_update: enqueue avail id={:?} level={} mins={:?} maxs={:?}",
+            avail_id, avail.level, avail.range.mins, avail.range.maxs
+        );
+
         batch.push(WriteRequest::Put {
             data_table: AVAILABILITIES_TABLE,
             meta_table: AVAILABILITIES_META_TABLE,
@@ -406,17 +515,15 @@ impl Plugin for Harmonizer {
             index_puts: Vec::new(),
         });
 
+        println!("before_update: batch size after enqueue={}", batch.len());
+
         // --- 2) broadcast inline attestation (v0) to known peers ---
         let peers = { self.peers.read().await.clone() }; // drop lock before awaits
         if !peers.is_empty() {
             let att = UpdateWithAttestation {
                 table: data_table.name().to_string(),
                 pk: key_owned.clone(),
-                range: RangeCube {
-                    dims: smallvec![],
-                    mins: smallvec![],
-                    maxs: smallvec![],
-                },
+                range: avail.range.clone(),
                 local_availability_id: avail_id,
                 level: 0,
                 child_count: 1,
@@ -437,25 +544,18 @@ impl Plugin for Harmonizer {
         }
 
         // --- 3) run optimizer and apply safe parent inserts / deletes ---
-        // Build a fresh scorer snapshot and optimizer
+        // TODO: gotta use the self.scorer function instead
         let scorer =
             ServerScorer::from_db_snapshot(db, peer_id, ServerScorerParams::default()).await?;
-
         let opt = BasicOptimizer::new(Box::new(scorer), PeerContext { peer_id });
 
-        // Seed with the tiny leaf draft we just created; optimizer will
-        // consider promotions/expansions as candidates.
         use crate::plugins::harmonizer::optimizer::{
             Action as OptAction, AvailabilityDraft, Overlay,
         };
 
         let seed = AvailabilityDraft {
             level: 0,
-            range: RangeCube {
-                dims: smallvec![],
-                mins: smallvec![],
-                maxs: smallvec![],
-            },
+            range: avail.range.clone(),
             complete: true,
         };
         let pending_inserts = vec![seed];
@@ -464,7 +564,11 @@ impl Plugin for Harmonizer {
         let overlay =
             Overlay::with_score(&pending_inserts, &pending_deletes, &*opt.scorer, &opt.ctx);
 
+        println!("before_update: running optimizer.propose()");
+
         if let Some(plan) = opt.propose(db, overlay).await? {
+            println!("before_update: optimizer returned {} actions", plan.len());
+
             for act in plan {
                 match act {
                     // Only materialize parents here; leaf (level 0) already inserted above
@@ -479,7 +583,6 @@ impl Plugin for Harmonizer {
                             peer_id,
                             range: d.range.clone(),
                             level: d.level,
-                            // Adoption can be filled later; empty child set is fine for a summary node
                             children: ChildSet {
                                 parent: id,
                                 children: vec![],
@@ -511,7 +614,6 @@ impl Plugin for Harmonizer {
                     }
 
                     OptAction::Delete(id) => {
-                        // Double-safety: skip if this is a leaf (coverage constraint).
                         if let Ok(existing) = db.get_data::<Availability>(id.as_bytes()).await {
                             if existing.level == 0 {
                                 continue;
@@ -532,17 +634,12 @@ impl Plugin for Harmonizer {
                             meta_table: AVAILABILITIES_META_TABLE,
                             key: id.as_bytes().to_vec(),
                             meta: meta2,
-                            index_removes: Vec::new(), // no secondary indexes on Availability
+                            index_removes: Vec::new(),
                         });
-
-                        // NOTE: We do not cascade-delete Child rows / DigestChunks here yet.
-                        // When parent adoption is wired, add a small helper to purge those, too.
                     }
                 }
             }
         }
-
-        // (Completeness loop for complete=false nodes will live here later.)
 
         Ok(())
     }
@@ -591,6 +688,8 @@ mod tests {
     use bincode::{Decode, Encode};
     use rand::Rng;
     use redb::TableDefinition;
+    use smallvec::smallvec;
+    use std::collections::HashSet;
     use std::sync::Arc;
     use tempfile::tempdir;
     use tokio::sync::mpsc;
@@ -885,7 +984,7 @@ mod tests {
         assert!(av_b.iter().any(|a| a.level == 0 && a.children.count() >= 1));
     }
 
-    // --- paste inside harmonizer.rs #[cfg(test)] mod tests ---
+    // --- New cover/replication tests ---
 
     #[tokio::test]
     async fn range_cover_antichain_and_single_container_pick() {
@@ -897,7 +996,7 @@ mod tests {
         let db = KuramotoDb::new(
             dir.path().join("cover.redb").to_str().unwrap(),
             clock,
-            vec![],
+            vec![hz.clone()],
         )
         .await;
         db.create_table_and_indexes::<Availability>().unwrap();
@@ -1071,11 +1170,15 @@ mod tests {
         let hz = Harmonizer::new(Box::new(NullScore), router, HashSet::new());
 
         let dir = tempdir().unwrap();
-        let db =
-            KuramotoDb::new(dir.path().join("rep.redb").to_str().unwrap(), clock, vec![]).await;
+        let db = KuramotoDb::new(
+            dir.path().join("rep.redb").to_str().unwrap(),
+            clock,
+            vec![hz.clone()],
+        )
+        .await;
         db.create_table_and_indexes::<Availability>().unwrap();
 
-        let dim = crate::tables::TableHash { hash: 1 };
+        let dim = TableHash { hash: 1 };
         let cube = |min: &[u8], max: &[u8]| RangeCube {
             dims: smallvec![dim],
             mins: smallvec![min.to_vec()],
