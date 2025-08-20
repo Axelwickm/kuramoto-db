@@ -1,21 +1,24 @@
-//! Optimizer: greedy hill-climb (bounded), additive mutations only
-//! ---------------------------------------------------------------
+//! Optimizer: beam-search look-ahead over additive mutations
+//! ---------------------------------------------------------
 //! - No Overlay type. The API is propose(&db, &[AvailabilityDraft]) -> ActionSet.
+//! - Uses the generic BeamSearch (depth/beam configurable) where **AvailabilityDraft is the State**.
 //! - Candidate generation is *additive on bytes-as-big-endian integers*:
 //!     min  ← min  - step        (expand left)
 //!     max  ← max  + step        (expand right)
 //!     both ← (min - step, max + step)
-//!   with `step` tried from {1, EMA, 10*EMA} (deduped; EMA is a moving average of accepted steps).
-//! - We always include **promotion** variants (level+1) of each candidate.
-//! - Deletes: scan DB for same-peer parents (level ≥ 1) overlapping any current draft.
-//!   If their *standalone* score is negative, deleting yields positive gain.
-//! - Identity early-exit: if the best action is an Insert equal to an existing draft, we stop.
+//!   with `step` tried from {1, EMA, 10*EMA} (deduped; EMA is a moving average you can tune).
+//! - We always include **promotion** variants (level+1) for each candidate.
+//! - After beam planning INSERTs, we run a **delete pass**: scan DB for same-peer parents
+//!   (level ≥ 1) overlapping any seed draft; if their standalone score < 0, propose Delete.
+//! - Deterministic: no randomness in enumeration or selection.
 
 use async_trait::async_trait;
 
 use crate::plugins::harmonizer::availability::Availability;
 use crate::plugins::harmonizer::range_cube::RangeCube;
 use crate::plugins::harmonizer::scorers::Scorer;
+use crate::plugins::harmonizer::search::beam::{BeamConfig, BeamSearch};
+use crate::plugins::harmonizer::search::{CandidateGen, Evaluator, SearchAlgorithm, State};
 use crate::uuid_bytes::UuidBytes;
 use crate::{KuramotoDb, storage_error::StorageError};
 
@@ -48,25 +51,29 @@ pub enum Action {
     Insert(AvailabilityDraft),
     Delete(UuidBytes),
 }
+
 pub type ActionSet = Vec<Action>;
 
 /*──────────────────────── Config & Momentum ──────────────────────────*/
 
 #[derive(Debug, Clone, Copy)]
 pub struct Caps {
-    /// improvement threshold (strictly greater than this is “better”)
+    /// minimum improvement threshold
     pub eps: f32,
-    /// max greedy steps per call
-    pub max_steps: usize,
-    /// cap total variants per draft per iteration
+    /// cap total variants per draft per enumeration
     pub max_variants_per_draft: usize,
+    /// beam search depth (look-ahead)
+    pub depth: usize,
+    /// beam width
+    pub beam_width: usize,
 }
 impl Default for Caps {
     fn default() -> Self {
         Self {
             eps: 0.0,
-            max_steps: 512,
             max_variants_per_draft: 64,
+            depth: 2,
+            beam_width: 8,
         }
     }
 }
@@ -97,7 +104,22 @@ pub trait Optimizer: Send + Sync {
     ) -> Result<Option<ActionSet>, StorageError>;
 }
 
-/*──────────────────────── BasicOptimizer ─────────────────────────────*/
+/*──────────────────────── State impl for AvailabilityDraft ───────────*/
+
+impl State for AvailabilityDraft {
+    type Action = Action;
+
+    /// Applying an INSERT returns that draft (next state).
+    /// DELETE does not change the draft state (handled in a separate pass).
+    fn apply(&self, action: &Self::Action) -> Self {
+        match action {
+            Action::Insert(d) => d.clone(),
+            Action::Delete(_) => self.clone(),
+        }
+    }
+}
+
+/*──────────────────────── BasicOptimizer (beam by default) ───────────*/
 
 pub struct BasicOptimizer {
     pub scorer: Box<dyn Scorer>,
@@ -130,123 +152,108 @@ impl Optimizer for BasicOptimizer {
     async fn propose(
         &self,
         db: &KuramotoDb,
-        initial_drafts: &[AvailabilityDraft],
+        seeds: &[AvailabilityDraft],
     ) -> Result<Option<ActionSet>, StorageError> {
-        // Normalize drafts: drop empties
-        let mut drafts: Vec<AvailabilityDraft> = initial_drafts
+        let seeds: Vec<AvailabilityDraft> = seeds
             .iter()
             .cloned()
             .filter(|d| !range_is_empty(&d.range))
             .collect();
 
         println!(
-            "opt.start: drafts={} max_steps={} ema={:.3} alpha={:.2}",
-            drafts.len(),
-            self.caps.max_steps,
-            self.momentum.ema,
-            self.momentum.alpha
+            "opt.start: seeds={} depth={} beam={} eps={:.3} ema={:.3}",
+            seeds.len(),
+            self.caps.depth,
+            self.caps.beam_width,
+            self.caps.eps,
+            self.momentum.ema
         );
 
+        if seeds.is_empty() {
+            println!("opt.stop: no non-empty seeds");
+            return Ok(None);
+        }
+
+        // Step magnitudes to explore for additive mutations.
+        let step_base = self.momentum.ema.max(1.0).round() as u128;
+        // Broaden tiny steps so depth=2 can cover ≥4 leaves deterministically.
+        // Keeps determinism and still very small branching.
+        let mut step_candidates: Vec<u128> = vec![
+            1,
+            2,
+            3,
+            step_base,
+            step_base.saturating_mul(2),
+            step_base.saturating_mul(10),
+        ];
+        step_candidates.sort_unstable();
+        step_candidates.dedup();
+
+        // Per-seed beam plan; then we merge/dedupe.
         let mut plan: ActionSet = Vec::new();
-        let mut ema = self.momentum.ema;
 
-        for step_idx in 0..self.caps.max_steps {
-            let step_base = ema.max(1.0).round() as u128;
-            let mut step_candidates: Vec<u128> = vec![1, step_base, step_base.saturating_mul(10)];
-            step_candidates.sort_unstable();
-            step_candidates.dedup();
+        for (i, seed) in seeds.iter().enumerate() {
+            println!(
+                "opt.seed[{}]: lvl={} mins0={:?} maxs0={:?}",
+                i,
+                seed.level,
+                seed.range.mins.get(0).cloned().unwrap_or_default(),
+                seed.range.maxs.get(0).cloned().unwrap_or_default()
+            );
 
-            let mut best_gain = f32::NEG_INFINITY;
-            let mut best_action: Option<(Action, Option<u128>)> = None; // (action, used_step for EMA)
-
-            // A) INSERTS from current drafts with additive mutations (+ promotion)
-            for d in &drafts {
-                let variants = enumerate_additive_mutations(d, &step_candidates, self.caps);
-                for cand in variants {
-                    if range_is_empty(&cand.draft.range) {
-                        continue;
-                    }
-                    let s = self.scorer.score(&self.ctx, &cand.draft);
-                    if s > self.caps.eps && s > best_gain + self.caps.eps {
-                        best_gain = s;
-                        best_action = Some((Action::Insert(cand.draft), Some(cand.used_step)));
-                    }
-                }
-            }
-
-            // B) DELETEs: scan parents (same peer, level ≥ 1) that overlap any draft; delete negatives
-            {
-                let parents = db.range_by_pk::<Availability>(&[], &[0xFF], None).await?;
-                for p in parents {
-                    if p.peer_id != self.ctx.peer_id || p.level == 0 {
-                        continue;
-                    }
-                    if !overlaps_any(&p.range, &drafts) {
-                        continue;
-                    }
-                    let pd = AvailabilityDraft {
-                        level: p.level,
-                        range: p.range.clone(),
-                        complete: true,
-                    };
-                    let s_old = if range_is_empty(&pd.range) {
-                        0.0
-                    } else {
-                        self.scorer.score(&self.ctx, &pd)
-                    };
-                    if s_old < 0.0 {
-                        let gain = -s_old;
-                        if gain > self.caps.eps && gain > best_gain + self.caps.eps {
-                            best_gain = gain;
-                            best_action = Some((Action::Delete(p.key), None));
-                        }
-                    }
-                }
-            }
-
-            // Stop if no improving action
-            let Some((action, used_step)) = best_action else {
-                println!("opt.stop: no improving action at step {}", step_idx);
-                break;
+            let g = DraftCandidateGen {
+                caps: self.caps,
+                steps: &step_candidates,
+                ctx: &self.ctx,
+            };
+            let eval = DraftEvaluator {
+                scorer: &*self.scorer,
+                ctx: &self.ctx,
             };
 
-            // Early-exit on identity insert
-            if let Action::Insert(ref d) = action {
-                if is_identity(d, &drafts) {
-                    println!("opt.exit: identity chosen at step {}", step_idx);
-                    return if plan.is_empty() {
-                        Ok(None)
-                    } else {
-                        Ok(Some(plan))
-                    };
-                }
-            }
+            let mut search = BeamSearch::new(BeamConfig {
+                depth: self.caps.depth,
+                beam_width: self.caps.beam_width,
+                eps: self.caps.eps,
+                max_evals: 0, // unlimited in this MVP
+            });
 
-            // Apply action locally and track momentum
-            match &action {
-                Action::Insert(d) => {
-                    if !contains_draft(&drafts, d) && !range_is_empty(&d.range) {
-                        println!(
-                            "opt.accept: INSERT lvl={} mins0={:?} maxs0={:?}",
+            if let Some(seq) = search.propose_step(seed, &g, &eval) {
+                println!("opt.seed[{}]: beam proposed {} actions", i, seq.len());
+                for (k, a) in seq.iter().enumerate() {
+                    match a {
+                        Action::Insert(d) => println!(
+                            "  plan[{}].{} INSERT lvl={} min0={:?} max0={:?}",
+                            i,
+                            k,
                             d.level,
                             d.range.mins.get(0).cloned().unwrap_or_default(),
                             d.range.maxs.get(0).cloned().unwrap_or_default()
-                        );
-                        drafts.push(d.clone());
-                        if let Some(us) = used_step {
-                            // EMA update
-                            ema = self.momentum.alpha * (us as f64)
-                                + (1.0 - self.momentum.alpha) * ema;
-                        }
+                        ),
+                        Action::Delete(id) => println!("  plan[{}].{} DELETE id={:?}", i, k, id),
                     }
                 }
-                Action::Delete(id) => {
-                    println!("opt.accept: DELETE id={:?}", id);
-                    // We only *propose* deletions; the caller applies them atomically with inserts.
+                // Only keep INSERTs that are not duplicate of previously kept ones.
+                for a in seq {
+                    if let Action::Insert(ref d) = a {
+                        if contains_insert(&plan, d) {
+                            continue;
+                        }
+                    }
+                    plan.push(a);
                 }
+            } else {
+                println!("opt.seed[{}]: beam returned None (no improving seq)", i);
             }
+        }
 
-            plan.push(action);
+        // Post-pass: propose deletes for negative parents overlapping any seed.
+        // (Search cannot see deletions since they don't change draft state.)
+        let mut deletes =
+            propose_negative_parent_deletes(db, &self.ctx, &*self.scorer, &seeds).await?;
+        if !deletes.is_empty() {
+            println!("opt.delete_pass: proposing {} deletes", deletes.len());
+            plan.append(&mut deletes);
         }
 
         if plan.is_empty() {
@@ -257,12 +264,112 @@ impl Optimizer for BasicOptimizer {
     }
 }
 
+/*──────────────────────── Candidate generator & evaluator ───────────*/
+
+/// Generates INSERT mutations (additive) for the current draft, plus (enumerated-only)
+/// DELETEs for overlapping parents. Deletes won't be picked by the beam (state doesn't
+/// change), but we keep this here to make candidate production complete/deterministic.
+struct DraftCandidateGen<'a> {
+    caps: Caps,
+    steps: &'a [u128],
+    ctx: &'a PeerContext,
+}
+
+impl<'a> CandidateGen<AvailabilityDraft> for DraftCandidateGen<'a> {
+    fn candidates(&self, s: &AvailabilityDraft) -> Vec<Action> {
+        // INSERT candidates from additive enumeration (with promotions).
+        let mut out: Vec<Action> = Vec::new();
+        for c in enumerate_additive_mutations(s, self.steps, self.caps) {
+            if !range_is_empty(&c.draft.range) {
+                out.push(Action::Insert(c.draft));
+            }
+        }
+
+        // Dedupe & cap
+        let mut uniq: ActionSet = Vec::with_capacity(out.len());
+        for a in out.into_iter() {
+            match &a {
+                Action::Insert(d) => {
+                    if !contains_insert(&uniq, d) {
+                        uniq.push(a);
+                    }
+                }
+                Action::Delete(_) => {} // we no longer produce deletes here
+            }
+            if uniq.len() >= self.caps.max_variants_per_draft {
+                break;
+            }
+        }
+        uniq
+    }
+}
+
+/// Evaluates a draft using the provided scorer.
+struct DraftEvaluator<'a> {
+    scorer: &'a dyn Scorer,
+    ctx: &'a PeerContext,
+}
+impl<'a> Evaluator<AvailabilityDraft> for DraftEvaluator<'a> {
+    fn score(&self, s: &AvailabilityDraft) -> f32 {
+        if range_is_empty(&s.range) {
+            return f32::NEG_INFINITY; // never choose empties
+        }
+        self.scorer.score(self.ctx, s)
+    }
+    fn feasible(&self, _s: &AvailabilityDraft) -> bool {
+        true
+    }
+}
+
+/*──────────────────────── Delete post-pass ───────────────────────────*/
+
+async fn propose_negative_parent_deletes(
+    db: &KuramotoDb,
+    ctx: &PeerContext,
+    scorer: &dyn Scorer,
+    seeds: &[AvailabilityDraft],
+) -> Result<ActionSet, StorageError> {
+    let mut plan: ActionSet = Vec::new();
+    let parents = db.range_by_pk::<Availability>(&[], &[0xFF], None).await?;
+    'outer: for p in parents {
+        if p.level == 0 || p.peer_id != ctx.peer_id {
+            continue;
+        }
+        // Only consider if it overlaps ANY seed
+        if !seeds.iter().any(|s| p.range.overlaps(&s.range)) {
+            continue;
+        }
+        let pd = AvailabilityDraft {
+            level: p.level,
+            range: p.range.clone(),
+            complete: true,
+        };
+        let s_old = if range_is_empty(&pd.range) {
+            0.0
+        } else {
+            scorer.score(ctx, &pd)
+        };
+        if s_old < 0.0 {
+            // avoid duplicates
+            for a in &plan {
+                if let Action::Delete(id) = a {
+                    if *id == p.key {
+                        continue 'outer;
+                    }
+                }
+            }
+            plan.push(Action::Delete(p.key));
+        }
+    }
+    Ok(plan)
+}
+
 /*──────────────────────── Additive mutation helpers ──────────────────*/
 
 #[derive(Clone)]
 struct Cand {
     draft: AvailabilityDraft,
-    used_step: u128, // magnitude of the additive delta we applied
+    used_step: u128, // magnitude of the additive delta we applied (kept for future momentum)
 }
 
 /// For each step in `steps`, produce additive variants:
@@ -272,9 +379,9 @@ struct Cand {
 /// For each produced range we also add a **promoted** copy (level+1).
 fn enumerate_additive_mutations(base: &AvailabilityDraft, steps: &[u128], caps: Caps) -> Vec<Cand> {
     let dims = base.range.mins.len().min(base.range.maxs.len());
-    let mut out: Vec<Cand> = Vec::with_capacity(1 + 6 * dims);
+    let mut out: Vec<Cand> = Vec::with_capacity(2 + 6 * dims);
 
-    // Identity (kept so we can early-exit if it's the argmax)
+    // Identity (so the beam can see "no change" at depth-1 if it wants).
     out.push(Cand {
         draft: AvailabilityDraft {
             level: base.level,
@@ -283,7 +390,7 @@ fn enumerate_additive_mutations(base: &AvailabilityDraft, steps: &[u128], caps: 
         },
         used_step: 0,
     });
-
+    // Promotion without geometry change
     out.push(Cand {
         draft: AvailabilityDraft {
             level: base.level + 1,
@@ -363,8 +470,10 @@ fn push_both_levels(out: &mut Vec<Cand>, r: &RangeCube, level: u16, used: u128) 
 
 /*──────────────────────── Equality / identity ───────────────────────*/
 
-fn contains_draft(haystack: &[AvailabilityDraft], needle: &AvailabilityDraft) -> bool {
-    haystack.iter().any(|d| draft_eq(d, needle))
+fn contains_insert(haystack: &[Action], needle: &AvailabilityDraft) -> bool {
+    haystack
+        .iter()
+        .any(|a| matches!(a, Action::Insert(d) if draft_eq(d, needle)))
 }
 fn contains_draft_cand(haystack: &[Cand], needle: &AvailabilityDraft) -> bool {
     haystack.iter().any(|c| draft_eq(&c.draft, needle))
@@ -387,9 +496,6 @@ fn ranges_equal(x: &RangeCube, y: &RangeCube) -> bool {
         }
     }
     true
-}
-fn is_identity(cand: &AvailabilityDraft, drafts: &[AvailabilityDraft]) -> bool {
-    contains_draft(drafts, cand)
 }
 
 /*──────────────────────── Range utils (byte-lex) ────────────────────*/
@@ -430,7 +536,6 @@ fn be_add_signed(input: &[u8], delta: i128) -> Option<Vec<u8>> {
     }
 }
 fn be_add_in_place(a: &mut Vec<u8>, b: &mut Vec<u8>) {
-    // make both same length by pre-padding shorter with leading zeros
     let max_len = a.len().max(b.len());
     if a.len() < max_len {
         let mut pad = vec![0u8; max_len - a.len()];
@@ -520,7 +625,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let clock = Arc::new(MockClock::new(0));
         let db = KuramotoDb::new(
-            dir.path().join("opt_add.redb").to_str().unwrap(),
+            dir.path().join("opt_beam.redb").to_str().unwrap(),
             clock,
             vec![],
         )
@@ -532,8 +637,9 @@ mod tests {
     fn caps() -> Caps {
         Caps {
             eps: 0.0,
-            max_steps: 16,
             max_variants_per_draft: 64,
+            depth: 2,
+            beam_width: 8,
         }
     }
 
@@ -567,8 +673,6 @@ mod tests {
         }
     }
 
-    /*──────── unit tests ───────────*/
-
     #[test]
     fn be_add_signed_basic() {
         // add within same len
@@ -600,7 +704,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn identity_early_exit() {
+    async fn identity_early_exit_via_beam() {
         let db = fresh_db().await;
         let opt = BasicOptimizer::new(
             Box::new(IdentityLovesScorer),
@@ -641,7 +745,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn proposes_delete_of_negative_parent() {
+    async fn proposes_delete_of_negative_parent_in_post_pass() {
         // scorer that makes ANY parent (level ≥1) negative
         struct KillParents;
         impl Scorer for KillParents {
@@ -679,12 +783,12 @@ mod tests {
         };
         db.put(parent).await.unwrap();
 
-        // one tiny draft overlapping that parent
-        let draft = draft_bytes(0, &[&[15u8]], &[&[15u8, 1]]);
-        let plan = opt.propose(&db, &[draft]).await.unwrap().expect("plan");
+        // one tiny seed overlapping that parent
+        let seed = draft_bytes(0, &[&[15u8]], &[&[15u8, 1]]);
+        let plan = opt.propose(&db, &[seed]).await.unwrap().expect("plan");
         assert!(
             plan.iter().any(|a| matches!(a, Action::Delete(_))),
-            "expected at least one Delete action"
+            "expected at least one Delete action from post-pass"
         );
     }
 }

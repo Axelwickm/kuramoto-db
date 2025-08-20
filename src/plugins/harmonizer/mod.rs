@@ -6,3 +6,4 @@ mod protocol;
 mod range_cube;
 mod riblt;
 pub mod scorers;
+pub mod search;

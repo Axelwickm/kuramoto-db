@@ -142,7 +142,7 @@ mod emergence_via_plugin_tests {
     use crate::plugins::harmonizer::availability::Availability;
     use crate::plugins::harmonizer::harmonizer::Harmonizer;
     use crate::plugins::harmonizer::optimizer::{
-        AvailabilityDraft, BasicOptimizer, Optimizer, PeerContext,
+        Action, AvailabilityDraft, BasicOptimizer, Optimizer, PeerContext,
     };
     use crate::plugins::harmonizer::range_cube::RangeCube;
     use crate::plugins::harmonizer::scorers::Scorer;
@@ -280,13 +280,13 @@ mod emergence_via_plugin_tests {
         println!("plan.len()={}", plan.len());
         for (i, a) in plan.iter().enumerate() {
             match a {
-                crate::plugins::harmonizer::optimizer::Action::Insert(d) => {
+                Action::Insert(d) => {
                     println!(
                         "  plan[{}] INSERT level={} mins={:?} maxs={:?}",
                         i, d.level, d.range.mins, d.range.maxs
                     );
                 }
-                crate::plugins::harmonizer::optimizer::Action::Delete(id) => {
+                Action::Delete(id) => {
                     println!("  plan[{}] DELETE id={:?}", i, id);
                 }
             }
@@ -303,7 +303,7 @@ mod emergence_via_plugin_tests {
         let mut best_adopt = 0usize;
         let mut saw_parent = false;
         for act in plan {
-            if let crate::plugins::harmonizer::optimizer::Action::Insert(d) = act {
+            if let Action::Insert(d) = act {
                 if d.level >= 1 {
                     saw_parent = true;
                     let adopted = leaves
