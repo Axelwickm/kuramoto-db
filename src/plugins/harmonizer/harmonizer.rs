@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 use crate::database::{IndexPutRequest, WriteRequest};
 use crate::plugins::communication::transports::PeerId;
 use crate::plugins::harmonizer::child_set::{Child, DigestChunk};
+use crate::plugins::harmonizer::optimizer::{Action as OptAction, AvailabilityDraft};
 use crate::plugins::harmonizer::optimizer::{BasicOptimizer, Optimizer, PeerContext};
 use crate::plugins::harmonizer::range_cube::RangeCube;
 use crate::plugins::harmonizer::scorers::Scorer;
@@ -549,24 +550,16 @@ impl Plugin for Harmonizer {
             ServerScorer::from_db_snapshot(db, peer_id, ServerScorerParams::default()).await?;
         let opt = BasicOptimizer::new(Box::new(scorer), PeerContext { peer_id });
 
-        use crate::plugins::harmonizer::optimizer::{
-            Action as OptAction, AvailabilityDraft, Overlay,
-        };
-
         let seed = AvailabilityDraft {
             level: 0,
             range: avail.range.clone(),
             complete: true,
         };
-        let pending_inserts = vec![seed];
-        let pending_deletes: Vec<UuidBytes> = vec![];
-
-        let overlay =
-            Overlay::with_score(&pending_inserts, &pending_deletes, &*opt.scorer, &opt.ctx);
+        let inserts = vec![seed];
 
         println!("before_update: running optimizer.propose()");
 
-        if let Some(plan) = opt.propose(db, overlay).await? {
+        if let Some(plan) = opt.propose(db, &inserts).await? {
             println!("before_update: optimizer returned {} actions", plan.len());
 
             for act in plan {

@@ -68,7 +68,7 @@ impl ServerScorer {
             // leaf → one symbol (the new entity) by construction
             return 1;
         }
-        let want_child_level = 10; // TODO: don't hardcode
+        let want_child_level = cand.level.saturating_sub(1);
         self.view
             .iter()
             .filter(|a| a.complete)
@@ -142,7 +142,7 @@ mod emergence_via_plugin_tests {
     use crate::plugins::harmonizer::availability::Availability;
     use crate::plugins::harmonizer::harmonizer::Harmonizer;
     use crate::plugins::harmonizer::optimizer::{
-        AvailabilityDraft, BasicOptimizer, Optimizer, Overlay, PeerContext,
+        AvailabilityDraft, BasicOptimizer, Optimizer, PeerContext,
     };
     use crate::plugins::harmonizer::range_cube::RangeCube;
     use crate::plugins::harmonizer::scorers::Scorer;
@@ -264,16 +264,15 @@ mod emergence_via_plugin_tests {
         let opt = BasicOptimizer::new(Box::new(scorer), PeerContext { peer_id: self_peer });
 
         // Seed a tiny draft around the middle; optimizer must promote+expand.
-        let base = AvailabilityDraft {
+        let seed = AvailabilityDraft {
             level: 0,
             range: cube(&[15u8], &[15u8, 1]),
             complete: true,
         };
-        let binding = [base];
-        let overlay = Overlay::with_score(&binding, &[], &*opt.scorer, &opt.ctx);
+        let inserts = vec![seed];
 
         let plan = opt
-            .propose(&db, overlay)
+            .propose(&db, &inserts)
             .await
             .unwrap()
             .expect("should propose parents");
