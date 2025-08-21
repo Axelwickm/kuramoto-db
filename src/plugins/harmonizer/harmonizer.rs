@@ -12,10 +12,8 @@ use crate::database::{IndexPutRequest, WriteRequest};
 use crate::plugins::communication::transports::PeerId;
 use crate::plugins::harmonizer::child_set::{Child, DigestChunk};
 use crate::plugins::harmonizer::optimizer::{Action as OptAction, AvailabilityDraft};
-use crate::plugins::harmonizer::optimizer::{BasicOptimizer, Optimizer, PeerContext};
+use crate::plugins::harmonizer::optimizer::{BasicOptimizer, Optimizer};
 use crate::plugins::harmonizer::range_cube::RangeCube;
-use crate::plugins::harmonizer::scorers::Scorer;
-use crate::plugins::harmonizer::scorers::server_scorer::{ServerScorer, ServerScorerParams};
 use crate::plugins::harmonizer::{
     child_set::{ChildSet, Sym},
     protocol::{
@@ -33,6 +31,11 @@ use crate::{
     storage_error::StorageError, uuid_bytes::UuidBytes,
 };
 
+#[derive(Clone, Debug)]
+pub struct PeerContext {
+    pub peer_id: UuidBytes,
+}
+
 /*──────────────────────── Outbox (network side-effects) ───────────────────*/
 
 enum OutboxItem {
@@ -43,19 +46,21 @@ enum OutboxItem {
 
 pub struct Harmonizer {
     db: OnceLock<Weak<KuramotoDb>>,
-    scorer: Box<dyn Scorer>,
     watched_tables: HashSet<&'static str>,
     router: Arc<Router>,
+    optimizer: Arc<BasicOptimizer>,
     inbox_tx: mpsc::Sender<ProtoCommand>,
     outbox_tx: mpsc::Sender<OutboxItem>,
     peers: tokio::sync::RwLock<Vec<PeerId>>, // dynamic peers
+    peer_ctx: PeerContext,
 }
 
 impl Harmonizer {
     pub fn new(
-        scorer: Box<dyn Scorer>,
         router: Arc<Router>,
+        optimizer: Arc<BasicOptimizer>,
         watched_tables: HashSet<&'static str>,
+        peer_ctx: PeerContext,
     ) -> Arc<Self> {
         let (inbox_tx, inbox_rx) = mpsc::channel::<ProtoCommand>(256);
         let (outbox_tx, outbox_rx) = mpsc::channel::<OutboxItem>(256);
@@ -63,13 +68,14 @@ impl Harmonizer {
         register_harmonizer_protocol(router.clone(), inbox_tx.clone());
 
         let hz = Arc::new(Self {
-            scorer,
             watched_tables: watched_tables,
             router: router.clone(),
+            optimizer: optimizer.clone(),
             inbox_tx,
             outbox_tx,
             peers: tokio::sync::RwLock::new(Vec::new()),
             db: OnceLock::new(),
+            peer_ctx,
         });
 
         hz.start_inbox_worker(inbox_rx);
@@ -462,8 +468,7 @@ impl Plugin for Harmonizer {
         let now = db.get_clock().now();
         let sym = self.child_sym(data_table, &key_owned);
 
-        // TODO: wire real peer id
-        let peer_id = UuidBytes::new();
+        let peer_id = self.peer_ctx.peer_id;
 
         // --- 1) materialize the leaf availability (level 0) ---
         let avail_id = UuidBytes::new();
@@ -544,12 +549,6 @@ impl Plugin for Harmonizer {
             }
         }
 
-        // --- 3) run optimizer and apply safe parent inserts / deletes ---
-        // TODO: gotta use the self.scorer function instead
-        let scorer =
-            ServerScorer::from_db_snapshot(db, peer_id, ServerScorerParams::default()).await?;
-        let opt = BasicOptimizer::new(Box::new(scorer), PeerContext { peer_id });
-
         let seed = AvailabilityDraft {
             level: 0,
             range: avail.range.clone(),
@@ -559,7 +558,7 @@ impl Plugin for Harmonizer {
 
         println!("before_update: running optimizer.propose()");
 
-        if let Some(plan) = opt.propose(db, &inserts).await? {
+        if let Some(plan) = self.optimizer.propose(db, &inserts).await? {
             println!("before_update: optimizer returned {} actions", plan.len());
 
             for act in plan {
@@ -675,6 +674,7 @@ mod tests {
         inmem::{InMemConnector, InMemResolver},
     };
     use crate::plugins::harmonizer::optimizer::AvailabilityDraft;
+    use crate::plugins::harmonizer::scorers::Scorer;
     use crate::storage_entity::*;
     use crate::tables::TableHash;
 
@@ -727,8 +727,14 @@ mod tests {
     }
 
     struct NullScore;
+    #[async_trait]
     impl Scorer for NullScore {
-        fn score(&self, _: &PeerContext, _: &AvailabilityDraft) -> f32 {
+        async fn score(
+            &self,
+            _db: &KuramotoDb,
+            _ctx: &PeerContext,
+            _cand: &AvailabilityDraft,
+        ) -> f32 {
             0.0
         }
     }
@@ -756,10 +762,15 @@ mod tests {
         let clock = Arc::new(MockClock::new(0));
         let router = Router::new(RouterConfig::default(), clock.clone());
 
+        let local_peer = PeerContext {
+            peer_id: UuidBytes::new(),
+        };
+        let optimizer = Arc::new(BasicOptimizer::new(Box::new(NullScore), local_peer.clone()));
         let hz = Harmonizer::new(
-            Box::new(NullScore),
             router,
+            optimizer,
             HashSet::from([Foo::table_def().name()]),
+            local_peer,
         );
 
         let dir = tempdir().unwrap();
@@ -824,10 +835,15 @@ mod tests {
         rtr_b.connect_peer(pid_a, b_to_a);
 
         // Build Harmonizer on A (will register its protocol on A’s router)
+        let local_peer = PeerContext {
+            peer_id: UuidBytes::new(),
+        };
+        let optimizer = Arc::new(BasicOptimizer::new(Box::new(NullScore), local_peer.clone()));
         let hz_a = Harmonizer::new(
-            Box::new(NullScore),
             rtr_a,
+            optimizer,
             HashSet::from([Foo::table_def().name()]),
+            local_peer,
         );
         hz_a.add_peer(pid_b).await; // tell A to notify B
 
@@ -922,15 +938,25 @@ mod tests {
         rtr_b.connect_peer(pid_a, b_to_a);
 
         // Harmonizers on both sides (register their protocol with their routers)
+        let peer_a = PeerContext {
+            peer_id: UuidBytes::new(),
+        };
+        let opt_a = Arc::new(BasicOptimizer::new(Box::new(NullScore), peer_a.clone()));
         let hz_a = Harmonizer::new(
-            Box::new(NullScore),
             rtr_a.clone(),
+            opt_a,
             HashSet::from([Foo::table_def().name()]),
+            peer_a,
         );
+        let peer_b = PeerContext {
+            peer_id: UuidBytes::new(),
+        };
+        let opt_b = Arc::new(BasicOptimizer::new(Box::new(NullScore), peer_b.clone()));
         let hz_b = Harmonizer::new(
-            Box::new(NullScore),
             rtr_b.clone(),
+            opt_b,
             HashSet::from([Foo::table_def().name()]),
+            peer_b,
         );
 
         // Tell A to notify B for this v0 flow (hacky bootstrap)
@@ -983,7 +1009,11 @@ mod tests {
     async fn range_cover_antichain_and_single_container_pick() {
         let clock = Arc::new(MockClock::new(0));
         let router = Router::new(RouterConfig::default(), clock.clone());
-        let hz = Harmonizer::new(Box::new(NullScore), router, HashSet::new());
+        let local_peer = PeerContext {
+            peer_id: UuidBytes::new(),
+        };
+        let optimizer = Arc::new(BasicOptimizer::new(Box::new(NullScore), local_peer.clone()));
+        let hz = Harmonizer::new(router, optimizer, HashSet::new(), local_peer);
 
         let dir = tempdir().unwrap();
         let db = KuramotoDb::new(
@@ -1076,7 +1106,12 @@ mod tests {
     async fn range_cover_builds_containment_antichain() {
         let clock = Arc::new(MockClock::new(0));
         let router = Router::new(RouterConfig::default(), clock.clone());
-        let hz = Harmonizer::new(Box::new(NullScore), router, HashSet::new());
+        let local_peer = PeerContext {
+            peer_id: UuidBytes::new(),
+        };
+
+        let optimizer = Arc::new(BasicOptimizer::new(Box::new(NullScore), local_peer.clone()));
+        let hz = Harmonizer::new(router, optimizer, HashSet::new(), local_peer);
 
         let dir = tempdir().unwrap();
         let db = KuramotoDb::new(
@@ -1160,7 +1195,11 @@ mod tests {
     async fn count_replications_counts_unique_peers_that_contain_target() {
         let clock = Arc::new(MockClock::new(0));
         let router = Router::new(RouterConfig::default(), clock.clone());
-        let hz = Harmonizer::new(Box::new(NullScore), router, HashSet::new());
+        let local_peer = PeerContext {
+            peer_id: UuidBytes::new(),
+        };
+        let optimizer = Arc::new(BasicOptimizer::new(Box::new(NullScore), local_peer.clone()));
+        let hz = Harmonizer::new(router, optimizer, HashSet::new(), local_peer);
 
         let dir = tempdir().unwrap();
         let db = KuramotoDb::new(

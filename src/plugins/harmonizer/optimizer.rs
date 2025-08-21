@@ -15,6 +15,7 @@
 use async_trait::async_trait;
 
 use crate::plugins::harmonizer::availability::Availability;
+use crate::plugins::harmonizer::harmonizer::PeerContext;
 use crate::plugins::harmonizer::range_cube::RangeCube;
 use crate::plugins::harmonizer::scorers::Scorer;
 use crate::plugins::harmonizer::search::beam::{BeamConfig, BeamSearch};
@@ -23,11 +24,6 @@ use crate::uuid_bytes::UuidBytes;
 use crate::{KuramotoDb, storage_error::StorageError};
 
 /*──────────────────────── Context & core types ───────────────────────*/
-
-#[derive(Clone, Debug)]
-pub struct PeerContext {
-    pub peer_id: UuidBytes,
-}
 
 #[derive(Debug, Clone)]
 pub struct AvailabilityDraft {
@@ -176,8 +172,6 @@ impl Optimizer for BasicOptimizer {
 
         // Step magnitudes to explore for additive mutations.
         let step_base = self.momentum.ema.max(1.0).round() as u128;
-        // Broaden tiny steps so depth=2 can cover ≥4 leaves deterministically.
-        // Keeps determinism and still very small branching.
         let mut step_candidates: Vec<u128> = vec![
             1,
             2,
@@ -207,6 +201,7 @@ impl Optimizer for BasicOptimizer {
                 ctx: &self.ctx,
             };
             let eval = DraftEvaluator {
+                db,
                 scorer: &*self.scorer,
                 ctx: &self.ctx,
             };
@@ -218,7 +213,7 @@ impl Optimizer for BasicOptimizer {
                 max_evals: 0, // unlimited in this MVP
             });
 
-            if let Some(seq) = search.propose_step(seed, &g, &eval) {
+            if let Some(seq) = search.propose_step(seed, &g, &eval).await {
                 println!("opt.seed[{}]: beam proposed {} actions", i, seq.len());
                 for (k, a) in seq.iter().enumerate() {
                     match a {
@@ -248,7 +243,6 @@ impl Optimizer for BasicOptimizer {
         }
 
         // Post-pass: propose deletes for negative parents overlapping any seed.
-        // (Search cannot see deletions since they don't change draft state.)
         let mut deletes =
             propose_negative_parent_deletes(db, &self.ctx, &*self.scorer, &seeds).await?;
         if !deletes.is_empty() {
@@ -266,9 +260,6 @@ impl Optimizer for BasicOptimizer {
 
 /*──────────────────────── Candidate generator & evaluator ───────────*/
 
-/// Generates INSERT mutations (additive) for the current draft, plus (enumerated-only)
-/// DELETEs for overlapping parents. Deletes won't be picked by the beam (state doesn't
-/// change), but we keep this here to make candidate production complete/deterministic.
 struct DraftCandidateGen<'a> {
     caps: Caps,
     steps: &'a [u128],
@@ -294,7 +285,7 @@ impl<'a> CandidateGen<AvailabilityDraft> for DraftCandidateGen<'a> {
                         uniq.push(a);
                     }
                 }
-                Action::Delete(_) => {} // we no longer produce deletes here
+                Action::Delete(_) => {}
             }
             if uniq.len() >= self.caps.max_variants_per_draft {
                 break;
@@ -306,15 +297,18 @@ impl<'a> CandidateGen<AvailabilityDraft> for DraftCandidateGen<'a> {
 
 /// Evaluates a draft using the provided scorer.
 struct DraftEvaluator<'a> {
+    db: &'a KuramotoDb,
     scorer: &'a dyn Scorer,
     ctx: &'a PeerContext,
 }
-impl<'a> Evaluator<AvailabilityDraft> for DraftEvaluator<'a> {
-    fn score(&self, s: &AvailabilityDraft) -> f32 {
+
+#[async_trait]
+impl Evaluator<AvailabilityDraft> for DraftEvaluator<'_> {
+    async fn score(&self, s: &AvailabilityDraft) -> f32 {
         if range_is_empty(&s.range) {
-            return f32::NEG_INFINITY; // never choose empties
+            return f32::NEG_INFINITY;
         }
-        self.scorer.score(self.ctx, s)
+        self.scorer.score(self.db, self.ctx, s).await
     }
     fn feasible(&self, _s: &AvailabilityDraft) -> bool {
         true
@@ -347,7 +341,7 @@ async fn propose_negative_parent_deletes(
         let s_old = if range_is_empty(&pd.range) {
             0.0
         } else {
-            scorer.score(ctx, &pd)
+            scorer.score(db, ctx, &pd).await
         };
         if s_old < 0.0 {
             // avoid duplicates
@@ -475,12 +469,15 @@ fn contains_insert(haystack: &[Action], needle: &AvailabilityDraft) -> bool {
         .iter()
         .any(|a| matches!(a, Action::Insert(d) if draft_eq(d, needle)))
 }
+
 fn contains_draft_cand(haystack: &[Cand], needle: &AvailabilityDraft) -> bool {
     haystack.iter().any(|c| draft_eq(&c.draft, needle))
 }
+
 fn draft_eq(a: &AvailabilityDraft, b: &AvailabilityDraft) -> bool {
     a.level == b.level && a.complete == b.complete && ranges_equal(&a.range, &b.range)
 }
+
 fn ranges_equal(x: &RangeCube, y: &RangeCube) -> bool {
     if x.mins.len() != y.mins.len() || x.maxs.len() != y.maxs.len() {
         return false;
@@ -510,14 +507,12 @@ fn range_is_empty(r: &RangeCube) -> bool {
     }
     false
 }
+#[allow(dead_code)]
 fn overlaps_any(r: &RangeCube, drafts: &[AvailabilityDraft]) -> bool {
     drafts.iter().any(|d| r.overlaps(&d.range))
 }
 
 /// Add a signed integer `delta` to a **big-endian, variable-length** unsigned byte vector.
-/// - Positive delta does carry-propagation, possibly increasing length.
-/// - Negative delta borrows; if magnitude exceeds the value, returns **empty vec** (canonical zero).
-/// - Leading zeros are trimmed so lex compare aligns with numeric compare.
 fn be_add_signed(input: &[u8], delta: i128) -> Option<Vec<u8>> {
     if delta == 0 {
         return Some(trim_leading_zeros(input.to_vec()));
@@ -531,7 +526,7 @@ fn be_add_signed(input: &[u8], delta: i128) -> Option<Vec<u8>> {
         let mag = (-delta) as u128;
         match be_sub_value(input, mag) {
             Some(v) => Some(trim_leading_zeros(v)),
-            None => Some(vec![]), // underflow → canonical zero (empty vec)
+            None => Some(vec![]),
         }
     }
 }
@@ -643,18 +638,20 @@ mod tests {
         }
     }
 
-    /*──────── score helpers ────────*/
+    /*──────── score helpers (async) ────────*/
     struct ZeroScorer;
+    #[async_trait::async_trait]
     impl Scorer for ZeroScorer {
-        fn score(&self, _ctx: &PeerContext, _a: &AvailabilityDraft) -> f32 {
+        async fn score(&self, _db: &KuramotoDb, _ctx: &PeerContext, _a: &AvailabilityDraft) -> f32 {
             0.0
         }
     }
 
     /// Prefers larger span and higher level → pushes to parents and growth.
     struct SpanPromoteScorer;
+    #[async_trait::async_trait]
     impl Scorer for SpanPromoteScorer {
-        fn score(&self, _ctx: &PeerContext, a: &AvailabilityDraft) -> f32 {
+        async fn score(&self, _db: &KuramotoDb, _ctx: &PeerContext, a: &AvailabilityDraft) -> f32 {
             let d = a.range.mins.len().min(a.range.maxs.len());
             let mut span = 0i32;
             for i in 0..d {
@@ -667,8 +664,9 @@ mod tests {
 
     /// Loves identity and dislikes change → triggers identity early-exit.
     struct IdentityLovesScorer;
+    #[async_trait::async_trait]
     impl Scorer for IdentityLovesScorer {
-        fn score(&self, _ctx: &PeerContext, a: &AvailabilityDraft) -> f32 {
+        async fn score(&self, _db: &KuramotoDb, _ctx: &PeerContext, a: &AvailabilityDraft) -> f32 {
             if a.level == 0 { 1.0 } else { 0.0 }
         }
     }
@@ -748,8 +746,14 @@ mod tests {
     async fn proposes_delete_of_negative_parent_in_post_pass() {
         // scorer that makes ANY parent (level ≥1) negative
         struct KillParents;
+        #[async_trait::async_trait]
         impl Scorer for KillParents {
-            fn score(&self, _ctx: &PeerContext, a: &AvailabilityDraft) -> f32 {
+            async fn score(
+                &self,
+                _db: &KuramotoDb,
+                _ctx: &PeerContext,
+                a: &AvailabilityDraft,
+            ) -> f32 {
                 if a.level >= 1 { -1.0 } else { 0.0 }
             }
         }

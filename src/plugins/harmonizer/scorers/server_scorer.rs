@@ -1,13 +1,14 @@
 use std::collections::HashSet;
 
+use async_trait::async_trait;
+
 use crate::plugins::harmonizer::availability::Availability;
+use crate::plugins::harmonizer::harmonizer::PeerContext;
 use crate::plugins::harmonizer::optimizer::AvailabilityDraft;
-use crate::plugins::harmonizer::optimizer::PeerContext;
 use crate::plugins::harmonizer::scorers::Scorer;
-use crate::uuid_bytes::UuidBytes;
 use crate::{KuramotoDb, storage_error::StorageError};
 
-// ====== Params ======
+/// Tunables for the server-side scoring heuristic.
 #[derive(Clone, Debug)]
 pub struct ServerScorerParams {
     /// Baseline cost per node (positive number). Score subtracts this.
@@ -16,11 +17,10 @@ pub struct ServerScorerParams {
     pub child_target: usize,
     /// Weight for the child-target shaping term.
     pub child_weight: f32,
-    /// Weight per overlapping same-level neighbor (simple anti-overlap).
-    pub overlap_weight: f32,
-    // To make sure we don't delete data
-    pub replication_target: usize, // e.g. 3
-    pub replication_weight: f32,   // how strong the nudge should be
+    /// Replication target (distinct peers fully containing the candidate).
+    pub replication_target: usize,
+    /// Nudge strength for replication shortfall when we **don’t** short-circuit.
+    pub replication_weight: f32,
 }
 
 impl Default for ServerScorerParams {
@@ -29,108 +29,96 @@ impl Default for ServerScorerParams {
             rent: 1.0,
             child_target: 6,
             child_weight: 0.5,
-            overlap_weight: 0.25,
             replication_target: 3,
             replication_weight: 1.0,
         }
     }
 }
 
-// ====== Scorer implementation (snapshot-based, local only) ======
+/// Stateless, async scorer that queries the DB on demand.
+/// No snapshots, no overlap pressure.
 pub struct ServerScorer {
     params: ServerScorerParams,
-    self_peer: UuidBytes,
-    /// Local (and any gossiped) availabilities snapshotted at construction time.
-    view: Vec<Availability>,
 }
 
 impl ServerScorer {
-    /// Build a scorer from a DB snapshot (no async work inside score()).
-    pub async fn from_db_snapshot(
+    pub fn new(params: ServerScorerParams) -> Self {
+        Self { params }
+    }
+
+    /// Count distinct peers that **fully contain** the candidate range.
+    async fn replication_count(
+        &self,
         db: &KuramotoDb,
-        self_peer: UuidBytes,
-        params: ServerScorerParams,
-    ) -> Result<Self, StorageError> {
-        // MVP: scan everything; later we can pre-index by level.
-        let view: Vec<Availability> = db.range_by_pk::<Availability>(&[], &[0xFF], None).await?;
-        Ok(Self {
-            params,
-            self_peer,
-            view,
-        })
-    }
-
-    /// Estimate how many immediate children this parent would adopt if inserted.
-    /// Heuristic: count **local** complete nodes at level = cand.level - 1
-    /// whose range is fully contained by the candidate.
-    fn estimate_children_local(&self, cand: &AvailabilityDraft) -> usize {
-        if cand.level == 0 {
-            // leaf → one symbol (the new entity) by construction
-            return 1;
-        }
-        let want_child_level = cand.level.saturating_sub(1);
-        self.view
-            .iter()
-            .filter(|a| a.complete)
-            .filter(|a| a.peer_id == self.self_peer) // local-only for now
-            .filter(|a| a.level == want_child_level)
-            .filter(|a| cand.range.contains(&a.range))
-            .count()
-    }
-
-    /// Count same-level overlaps with local nodes (cheap anti-overlap pressure).
-    fn overlap_count_same_level(&self, cand: &AvailabilityDraft) -> usize {
-        self.view
-            .iter()
-            .filter(|a| a.level == cand.level)
-            .filter(|a| a.range.overlaps(&cand.range))
-            .count()
-    }
-
-    fn replication_count(&self, cand: &AvailabilityDraft) -> usize {
-        let mut peers = HashSet::new();
-        for a in &self.view {
-            if !a.complete {
-                continue;
-            }
-            if a.range.contains(&cand.range) {
+        cand: &AvailabilityDraft,
+    ) -> Result<usize, StorageError> {
+        let mut peers: HashSet<_> = HashSet::new();
+        // MVP: full scan. Callers can later wrap this scorer with caching/indexes.
+        let all: Vec<Availability> = db.range_by_pk::<Availability>(&[], &[0xFF], None).await?;
+        for a in all {
+            if a.complete && a.range.contains(&cand.range) {
                 peers.insert(a.peer_id);
             }
         }
-        peers.len()
+        Ok(peers.len())
     }
 
-    /// Convert child deviation into a bounded utility: max at target; negative if far.
-    fn child_shape_score(&self, child_count: usize) -> f32 {
+    /// Estimate local children a parent would adopt (level-1 nodes contained).
+    /// For leaves, this is 1 by construction (the written entity).
+    async fn child_count_local(
+        &self,
+        db: &KuramotoDb,
+        ctx: &PeerContext,
+        cand: &AvailabilityDraft,
+    ) -> Result<usize, StorageError> {
+        if cand.level == 0 {
+            return Ok(1);
+        }
+        let want_child_level = cand.level.saturating_sub(1);
+        let all: Vec<Availability> = db.range_by_pk::<Availability>(&[], &[0xFF], None).await?;
+        Ok(all
+            .into_iter()
+            .filter(|a| a.complete)
+            .filter(|a| a.peer_id == ctx.peer_id) // local-only
+            .filter(|a| a.level == want_child_level)
+            .filter(|a| cand.range.contains(&a.range))
+            .count())
+    }
+
+    /// Single “child count” shaping function:
+    /// peak at `child_target`, linear drop-off as you deviate.
+    fn child_count_score(&self, child_count: usize) -> f32 {
         let t = self.params.child_target as i32;
         let dev = (child_count as i32 - t).abs() as f32;
-        // Linear “peak” shaping around the target: +W*t at dev=0, then declining.
         self.params.child_weight * ((t as f32) - dev)
     }
 }
 
+#[async_trait]
 impl Scorer for ServerScorer {
-    fn score(&self, _ctx: &PeerContext, cand: &AvailabilityDraft) -> f32 {
-        // 1) rent
+    async fn score(&self, db: &KuramotoDb, ctx: &PeerContext, cand: &AvailabilityDraft) -> f32 {
+        // 1) Strong safety valve: if under-replicated, force a positive score and return.
+        //    This guarantees we keep/expand coverage until we hit the target.
+        let replicas = match self.replication_count(db, cand).await {
+            Ok(n) => n as i32,
+            Err(_) => 0, // on error, be conservative
+        };
+        let target = self.params.replication_target as i32;
+        if replicas < target {
+            // Always positive; bias proportional to shortfall.
+            // Caller can still rank among under-replicated candidates.
+            return 1.0 + self.params.replication_weight * ((target - replicas) as f32);
+        }
+
+        // 2) Otherwise: rent + child-count shaping (no overlap term).
         let mut s = -self.params.rent;
 
-        // 2) branching / child target
-        let est_children = self.estimate_children_local(cand);
-        s += self.child_shape_score(est_children);
+        let child_count = match self.child_count_local(db, ctx, cand).await {
+            Ok(c) => c,
+            Err(_) => 0, // on error, fall back to 0 local children
+        };
+        s += self.child_count_score(child_count);
 
-        // 3) anti-overlap (same level)
-        let overlaps = self.overlap_count_same_level(cand) as f32;
-        s -= self.params.overlap_weight * overlaps;
-
-        // 4) replication nudge (soft): + if replicas < K, 0 at K, - if > K
-        let replicas = self.replication_count(cand) as i32;
-        let k = self.params.replication_target as i32;
-        s += self.params.replication_weight * ((k - replicas) as f32);
-
-        // Coverage safety: leaves are required; never rate them negative.
-        if cand.level == 0 && s < 0.0 {
-            s = 0.0;
-        }
         s
     }
 }
@@ -140,20 +128,14 @@ mod emergence_via_plugin_tests {
     use crate::clock::MockClock;
     use crate::plugins::communication::router::{Router, RouterConfig};
     use crate::plugins::harmonizer::availability::Availability;
-    use crate::plugins::harmonizer::harmonizer::Harmonizer;
-    use crate::plugins::harmonizer::optimizer::{
-        Action, AvailabilityDraft, BasicOptimizer, Optimizer, PeerContext,
-    };
-    use crate::plugins::harmonizer::range_cube::RangeCube;
+    use crate::plugins::harmonizer::harmonizer::{Harmonizer, PeerContext};
+    use crate::plugins::harmonizer::optimizer::AvailabilityDraft;
     use crate::plugins::harmonizer::scorers::Scorer;
-    use crate::plugins::harmonizer::scorers::server_scorer::{ServerScorer, ServerScorerParams};
     use crate::storage_entity::{IndexSpec, StorageEntity};
-    use crate::tables::TableHash;
     use crate::uuid_bytes::UuidBytes;
     use crate::{KuramotoDb, StaticTableDef, storage_error::StorageError};
-    use redb::TableDefinition;
-    use redb::TableHandle;
-    use smallvec::smallvec;
+
+    use redb::{TableDefinition, TableHandle};
     use std::collections::HashSet;
     use std::sync::Arc;
     use tempfile::tempdir;
@@ -193,7 +175,8 @@ mod emergence_via_plugin_tests {
         }
     }
 
-    // Dummy scorer just to satisfy Harmonizer::new signature (Harmonizer builds its own ServerScorer internally)
+    // Dummy scorer just to satisfy Harmonizer::new signature (the plugin currently
+    // builds its own ServerScorer internally for planning).
     struct Dummy;
     impl Scorer for Dummy {
         fn score(&self, _ctx: &PeerContext, _a: &AvailabilityDraft) -> f32 {
@@ -201,173 +184,94 @@ mod emergence_via_plugin_tests {
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────
-    // EMERGENCE (real): scorer+optimizer propose parents that “adopt” many leaves
-    // ─────────────────────────────────────────────────────────────────────
-    //
-    // This bypasses the plugin’s ephemeral peer-id issue and tests the actual
-    // emergence logic: given a bed of local leaves, does the scorer+optimizer
-    // propose level>0 parents that cover multiple children?
+    /// End-to-end: with the Harmonizer plugin enabled and many leaves present,
+    /// we expect level>=1 parents to emerge that cover multiple leaves, i.e.
+    /// the structure is a hierarchy rather than a flat list.
+    ///
+    /// NOTE: This asserts desired system behavior (hierarchy). It will begin to
+    /// pass once the plugin uses a stable self-peer id (so the scorer “sees”
+    /// local children) and parent formation is enabled by default.
     #[tokio::test]
-    async fn scorer_emergence_builds_parents_over_leaf_bed() {
-        let dir = tempdir().unwrap();
-        let clock = Arc::new(MockClock::new(0));
-        let db = KuramotoDb::new(
-            dir.path().join("emergence_core.redb").to_str().unwrap(),
-            clock,
-            vec![],
-        )
-        .await;
-        db.create_table_and_indexes::<Availability>().unwrap();
-
-        // All leaves share the SAME local peer id → scorer can “see” children locally.
-        let self_peer = UuidBytes::new();
-        let dim = TableHash { hash: 1 };
-        let cube = |min: &[u8], max: &[u8]| RangeCube {
-            dims: smallvec![dim],
-            mins: smallvec![min.to_vec()],
-            maxs: smallvec![max.to_vec()],
-        };
-
-        // Seed ~30 leaves on one axis: [i, i+ε)
-        for i in 0u8..30 {
-            let id = UuidBytes::new();
-            let leaf = Availability {
-                key: id,
-                peer_id: self_peer,
-                range: cube(&[i], &[i, 1]),
-                level: 0,
-                children: crate::plugins::harmonizer::child_set::ChildSet {
-                    parent: id,
-                    children: vec![i as u64],
-                },
-                schema_hash: 0,
-                version: 0,
-                updated_at: 0,
-                complete: true,
-            };
-            db.put(leaf).await.unwrap();
-        }
-
-        // Scorer tuned to actually form parents (target ~6 kids, modest rent).
-        let params = ServerScorerParams {
-            rent: 0.2,
-            child_target: 6,
-            child_weight: 2.0,
-            overlap_weight: 0.1,
-            replication_target: 1,
-            replication_weight: 0.0,
-        };
-        let scorer = ServerScorer::from_db_snapshot(&db, self_peer, params.clone())
-            .await
-            .unwrap();
-        let opt = BasicOptimizer::new(Box::new(scorer), PeerContext { peer_id: self_peer });
-
-        // Seed a tiny draft around the middle; optimizer must promote+expand.
-        let seed = AvailabilityDraft {
-            level: 0,
-            range: cube(&[15u8], &[15u8, 1]),
-            complete: true,
-        };
-        let inserts = vec![seed];
-
-        let plan = opt
-            .propose(&db, &inserts)
-            .await
-            .unwrap()
-            .expect("should propose parents");
-
-        println!("plan.len()={}", plan.len());
-        for (i, a) in plan.iter().enumerate() {
-            match a {
-                Action::Insert(d) => {
-                    println!(
-                        "  plan[{}] INSERT level={} mins={:?} maxs={:?}",
-                        i, d.level, d.range.mins, d.range.maxs
-                    );
-                }
-                Action::Delete(id) => {
-                    println!("  plan[{}] DELETE id={:?}", i, id);
-                }
-            }
-        }
-        let leaves: Vec<Availability> = db
-            .range_by_pk::<Availability>(&[], &[0xFF], None)
-            .await
-            .unwrap()
-            .into_iter()
-            .filter(|a| a.level == 0)
-            .collect();
-
-        // Validate: at least one parent insert exists and it covers multiple leaves (~target).
-        let mut best_adopt = 0usize;
-        let mut saw_parent = false;
-        for act in plan {
-            if let Action::Insert(d) = act {
-                if d.level >= 1 {
-                    saw_parent = true;
-                    let adopted = leaves
-                        .iter()
-                        .filter(|lv| d.range.contains(&lv.range))
-                        .count();
-                    best_adopt = best_adopt.max(adopted);
-                }
-            }
-        }
-        assert!(saw_parent, "expected at least one parent insert");
-        assert!(
-            best_adopt >= 4,
-            "parent should cover multiple leaves (got {best_adopt})"
-        );
-        // Optional stronger claim if you want closeness to target:
-        // assert!((best_adopt as isize - params.child_target as isize).abs() <= 2);
-    }
-
-    // ─────────────────────────────────────────────────────────────────────
-    // SYSTEM (current): plugin forms leaves but NO parents yet (peer-id mismatch)
-    // ─────────────────────────────────────────────────────────────────────
-    //
-    // This documents current end-to-end behavior: Harmonizer randomizes peer_id
-    // per write, so the scorer sees 0 local children and doesn’t propose parents.
-    // Flip the final assertion once the plugin uses a stable self_peer.
-    #[tokio::test(start_paused = true)]
-    async fn plugin_currently_only_forms_leaves_no_parents() {
+    async fn end_to_end_emergence_builds_hierarchy() {
         // Router + Harmonizer plugin (watching Foo)
         let clock = Arc::new(MockClock::new(0));
         let router = Router::new(RouterConfig::default(), clock.clone());
+        let local_peer = PeerContext {
+            peer_id: UuidBytes::new(),
+        };
+
         let hz = Harmonizer::new(
             Box::new(Dummy),
             router,
             HashSet::from([Foo::table_def().name()]),
+            local_peer,
         );
 
         // DB with plugin installed
         let dir = tempdir().unwrap();
         let db = KuramotoDb::new(
-            dir.path().join("emergence_plugin.redb").to_str().unwrap(),
+            dir.path()
+                .join("emergence_end_to_end.redb")
+                .to_str()
+                .unwrap(),
             clock.clone(),
             vec![hz.clone()],
         )
         .await;
-        db.create_table_and_indexes::<Foo>().unwrap();
 
-        // Seed rows → plugin creates leaves during before_update
-        for i in 0..20u32 {
+        db.create_table_and_indexes::<Foo>().unwrap();
+        db.create_table_and_indexes::<Availability>().unwrap();
+
+        // Seed rows → plugin creates leaves during before_update and (once wired)
+        // proposes parents in the same batch.
+        for i in 0..30u32 {
             db.put(Foo { id: i }).await.unwrap();
         }
 
-        // Observe: leaves yes, parents no (for now)
+        // Observe the resulting availability graph.
         let avs: Vec<Availability> = db
             .range_by_pk::<Availability>(&[], &[0xFF], None)
             .await
             .unwrap();
-        let leaves = avs.iter().filter(|a| a.level == 0).count();
-        let parents = avs.iter().filter(|a| a.level >= 1).count();
 
-        assert!(leaves >= 20, "expected at least 20 leaves");
-        assert_eq!(
-            parents, 0,
-            "no parents should emerge yet (random peer_id per leaf)"
+        let leaves: Vec<&Availability> = avs.iter().filter(|a| a.level == 0).collect();
+        let parents: Vec<&Availability> = avs.iter().filter(|a| a.level >= 1).collect();
+
+        // Basic presence checks.
+        assert!(
+            leaves.len() >= 30,
+            "expected at least 30 leaves; got {}",
+            leaves.len()
         );
+        assert!(
+            !parents.is_empty(),
+            "expected parent nodes to emerge (level>=1), but none were found"
+        );
+
+        // At least one parent should adopt multiple leaves (grouping effect).
+        let mut best_adopt = 0usize;
+        for p in &parents {
+            let adopted = leaves
+                .iter()
+                .filter(|lv| p.range.contains(&lv.range))
+                .count();
+            best_adopt = best_adopt.max(adopted);
+        }
+        assert!(
+            best_adopt >= 4,
+            "expected a parent to cover multiple leaves; best adoption count was {best_adopt}"
+        );
+
+        // Optional shape sanity: if we have ≥2 parent levels, ensure nesting (tree-like).
+        let max_parent_level = parents.iter().map(|a| a.level).max().unwrap_or(0);
+        if max_parent_level >= 2 {
+            // Find a level-2+ parent that contains some level-1 parent (hierarchical nesting)
+            let has_nesting = parents.iter().any(|p_hi| {
+                parents
+                    .iter()
+                    .any(|p_lo| p_lo.level + 1 == p_hi.level && p_hi.range.contains(&p_lo.range))
+            });
+            assert!(has_nesting, "expected some nesting among parent levels");
+        }
     }
 }

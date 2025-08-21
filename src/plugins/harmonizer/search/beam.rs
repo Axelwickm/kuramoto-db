@@ -1,4 +1,4 @@
-//! Deterministic N-step beam look-ahead planner.
+//! Deterministic N-step beam look-ahead planner (async).
 //!
 //! - Depth >= 1, beam width >= 1, no randomness.
 //! - Explores top-K children at each level (ordered by child state's score).
@@ -9,8 +9,13 @@
 //! Prints (minimal, deterministic):
 //! - search.step: depth, beam, eps
 //! - search.best_single and search.best_seq with gains
+//!
+//! Notes:
+//! - This async version keeps the original semantics but avoids recursion so we
+//!   can `.await` scoring at every expansion without additional deps.
 
 use super::{CandidateGen, Evaluator, SearchAlgorithm, State};
+use async_trait::async_trait;
 
 #[derive(Clone, Debug)]
 pub struct BeamConfig {
@@ -53,121 +58,155 @@ impl BeamSearch {
         self.cfg.max_evals == 0 || self.evals < self.cfg.max_evals
     }
 
-    fn score<S: State, E: Evaluator<S>>(&mut self, eval: &E, s: &S) -> Option<f32> {
+    async fn score<S, E>(&mut self, eval: &E, s: &S) -> Option<f32>
+    where
+        S: State + Send + Sync,
+        E: Evaluator<S> + Send + Sync,
+    {
         if !self.budget_ok() {
             return None;
         }
-        self.evals += 1;
         if !eval.feasible(s) {
             return None;
         }
-        Some(eval.score(s))
-    }
-
-    /// Return (gain, seq) for best sequence up to `depth` from `state`,
-    /// relative to `base_score`. Deterministic.
-    fn best_seq<S, G, E>(
-        &mut self,
-        state: &S,
-        cand: &G,
-        eval: &E,
-        depth: usize,
-        base_score: f32,
-    ) -> (f32, Vec<S::Action>)
-    where
-        S: State,
-        G: CandidateGen<S>,
-        E: Evaluator<S>,
-    {
-        if depth == 0 {
-            return (0.0, Vec::new());
-        }
-
-        // Generate children and pre-score them to order the beam.
-        let mut scored: Vec<(f32, S::Action, S)> = Vec::new();
-        for a in cand.candidates(state).into_iter() {
-            let next = state.apply(&a);
-            if let Some(s1) = self.score(eval, &next) {
-                scored.push((s1, a, next));
-            }
-        }
-
-        // No feasible children.
-        if scored.is_empty() {
-            return (0.0, Vec::new());
-        }
-
-        // Deterministic order: sort by child score desc, then debug-printable action.
-        scored.sort_by(|(s_a, a_act, _), (s_b, b_act, _)| {
-            s_b.partial_cmp(s_a)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| format!("{b_act:?}").cmp(&format!("{a_act:?}")))
-        });
-
-        // Keep top-K.
-        if scored.len() > self.cfg.beam_width {
-            scored.truncate(self.cfg.beam_width);
-        }
-
-        // Explore each child recursively and keep the best (by total gain).
-        let mut best_gain = f32::NEG_INFINITY;
-        let mut best_seq: Vec<S::Action> = Vec::new();
-
-        for (s1, a1, next1) in scored.into_iter() {
-            let gain1 = s1 - base_score;
-
-            // If we still have depth, recurse from next1 with base s1.
-            let (sub_gain, mut sub_seq) =
-                self.best_seq(&next1, cand, eval, depth.saturating_sub(1), s1);
-            let total_gain = gain1 + sub_gain;
-
-            if total_gain > best_gain {
-                best_gain = total_gain;
-                let mut seq = Vec::with_capacity(1 + sub_seq.len());
-                seq.push(a1);
-                seq.append(&mut sub_seq);
-                best_seq = seq;
-            }
-        }
-
-        (best_gain, best_seq)
+        self.evals += 1;
+        Some(eval.score(s).await)
     }
 }
 
-impl<S: State> SearchAlgorithm<S> for BeamSearch {
-    fn propose_step<G: CandidateGen<S>, E: Evaluator<S>>(
+#[async_trait]
+impl<S> SearchAlgorithm<S> for BeamSearch
+where
+    S: State + Send + Sync,
+{
+    async fn propose_step<G, E>(
         &mut self,
         current: &S,
         cand: &G,
         eval: &E,
-    ) -> Option<Vec<S::Action>> {
+    ) -> Option<Vec<S::Action>>
+    where
+        G: CandidateGen<S> + Send + Sync,
+        E: Evaluator<S> + Send + Sync,
+    {
         self.reset_budget();
 
         // Score the current state once.
-        let s0 = self.score(eval, current)?;
+        let s0 = self.score(eval, current).await?;
         println!(
             "search.step: depth={} beam={} eps={} s0={:.3}",
             self.cfg.depth, self.cfg.beam_width, self.cfg.eps, s0
         );
 
-        // Depth-1 “best single” for visibility
-        let (single_gain, single_seq) = {
-            let mut tmp = Self::new(BeamConfig {
-                depth: 1,
-                beam_width: self.cfg.beam_width,
-                eps: self.cfg.eps,
-                max_evals: self.cfg.max_evals,
-            });
-            tmp.best_seq(current, cand, eval, 1, s0)
-        };
-        if let Some(a) = single_seq.get(0) {
-            println!("search.best_single: gain={:.3} act={:?}", single_gain, a);
-        } else {
-            println!("search.best_single: none");
+        // Helper record kept on the frontier.
+        #[derive(Clone)]
+        struct Node<S: State> {
+            state: S,
+            score: f32,          // absolute score of `state`
+            seq: Vec<S::Action>, // actions taken from the root to reach `state`
         }
 
-        // Full depth best sequence.
-        let (best_gain, best_seq) = self.best_seq(current, cand, eval, self.cfg.depth, s0);
+        // ----- Depth 1: evaluate children of `current` (also used for best_single print) -----
+        let mut first_level: Vec<(f32, S::Action, S)> = Vec::new();
+        for a in cand.candidates(current).into_iter() {
+            let next = current.apply(&a);
+            if let Some(s1) = self.score(eval, &next).await {
+                first_level.push((s1, a, next));
+            }
+        }
+
+        if first_level.is_empty() {
+            println!("search.best_single: none");
+            println!(
+                "search.best_seq: depth={} gain={:.3} len=0",
+                self.cfg.depth, 0.0
+            );
+            return None;
+        }
+
+        // Deterministic order: by score desc, tie-break by Debug(action)
+        first_level.sort_by(|(s_a, a_act, _), (s_b, b_act, _)| {
+            s_b.partial_cmp(s_a)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| format!("{b_act:?}").cmp(&format!("{a_act:?}")))
+        });
+
+        // Best single for visibility
+        let best_single_gain = first_level[0].0 - s0;
+        println!(
+            "search.best_single: gain={:.3} act={:?}",
+            best_single_gain, first_level[0].1
+        );
+
+        // Beam frontier after depth=1
+        if first_level.len() > self.cfg.beam_width {
+            first_level.truncate(self.cfg.beam_width);
+        }
+        let mut frontier: Vec<Node<S>> = first_level
+            .into_iter()
+            .map(|(sc, act, st)| Node {
+                state: st,
+                score: sc,
+                seq: vec![act],
+            })
+            .collect();
+
+        // Track the best sequence (any depth up to cfg.depth) by total gain over s0.
+        let mut best_gain = best_single_gain;
+        let mut best_seq = frontier.get(0).map(|n| n.seq.clone()).unwrap_or_default();
+
+        // If the configured depth is 1, we're done.
+        if self.cfg.depth == 1 {
+            if best_gain > self.cfg.eps && !best_seq.is_empty() {
+                return Some(best_seq);
+            } else {
+                return None;
+            }
+        }
+
+        // ----- Depth >= 2: iteratively expand the frontier -----
+        for _d in 2..=self.cfg.depth {
+            let mut expanded: Vec<Node<S>> = Vec::new();
+
+            for node in &frontier {
+                for a in cand.candidates(&node.state).into_iter() {
+                    let next = node.state.apply(&a);
+                    if let Some(s2) = self.score(eval, &next).await {
+                        let mut seq2 = node.seq.clone();
+                        seq2.push(a);
+                        // Absolute score ordering (same as original code)
+                        expanded.push(Node {
+                            state: next,
+                            score: s2,
+                            seq: seq2,
+                        });
+                        // Track best-so-far across *all* levels
+                        let gain = s2 - s0;
+                        if gain > best_gain {
+                            best_gain = gain;
+                            best_seq = expanded.last().unwrap().seq.clone();
+                        }
+                    }
+                }
+            }
+
+            if expanded.is_empty() {
+                break; // no more feasible children
+            }
+
+            // Deterministic order: by score desc, tie-break by the sequence's Debug (stable string)
+            expanded.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| format!("{:?}", b.seq).cmp(&format!("{:?}", a.seq)))
+            });
+            if expanded.len() > self.cfg.beam_width {
+                expanded.truncate(self.cfg.beam_width);
+            }
+            frontier = expanded;
+        }
+
         println!(
             "search.best_seq: depth={} gain={:.3} len={}",
             self.cfg.depth,
@@ -186,6 +225,7 @@ impl<S: State> SearchAlgorithm<S> for BeamSearch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
 
     /// Simple deterministic toy domain:
     /// - State(val, staged). score = val.
@@ -235,8 +275,13 @@ mod tests {
     }
 
     struct E;
-    impl Evaluator<S> for E {
-        fn score(&self, s: &S) -> f32 {
+
+    #[async_trait]
+    impl Evaluator<S> for E
+    where
+        S: State + Send + Sync,
+    {
+        async fn score(&self, s: &S) -> f32 {
             s.val as f32
         }
         fn feasible(&self, _s: &S) -> bool {
@@ -244,8 +289,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn depth1_picks_best_single() {
+    #[tokio::test]
+    async fn depth1_picks_best_single() {
         let mut algo = BeamSearch::new(BeamConfig {
             depth: 1,
             beam_width: 8,
@@ -256,13 +301,13 @@ mod tests {
             val: 0,
             staged: false,
         };
-        let plan = algo.propose_step(&s0, &G, &E).expect("some plan");
+        let plan = algo.propose_step(&s0, &G, &E).await.expect("some plan");
         // With only Inc(1) or Setup available, depth-1 should pick Inc(1).
         assert_eq!(plan, vec![A::Inc(1)]);
     }
 
-    #[test]
-    fn depth2_escapes_local_minimum() {
+    #[tokio::test]
+    async fn depth2_escapes_local_minimum() {
         // With depth=2 and beam_width=2, planner must choose Setup -> Inc(5) for total gain 4.
         let mut algo = BeamSearch::new(BeamConfig {
             depth: 2,
@@ -274,12 +319,12 @@ mod tests {
             val: 0,
             staged: false,
         };
-        let plan = algo.propose_step(&s0, &G, &E).expect("some plan");
+        let plan = algo.propose_step(&s0, &G, &E).await.expect("some plan");
         assert_eq!(plan, vec![A::Setup, A::Inc(5)]);
     }
 
-    #[test]
-    fn epsilon_blocks_small_improvements() {
+    #[tokio::test]
+    async fn epsilon_blocks_small_improvements() {
         // Even with the good two-step plan (gain 4), eps=5 should reject.
         let mut algo = BeamSearch::new(BeamConfig {
             depth: 2,
@@ -291,8 +336,7 @@ mod tests {
             val: 0,
             staged: false,
         };
-        let plan = algo.propose_step(&s0, &G, &E);
+        let plan = algo.propose_step(&s0, &G, &E).await;
         assert!(plan.is_none(), "gain=4 should be rejected by eps=5");
     }
 }
-

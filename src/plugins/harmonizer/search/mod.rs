@@ -3,6 +3,7 @@
 //!
 //! Plug different planners (beam, greedy, etc.) behind `SearchAlgorithm`.
 
+use async_trait::async_trait;
 use std::fmt::Debug;
 
 pub mod beam;
@@ -10,7 +11,7 @@ pub mod beam;
 /// A clonable, hypothetical state of the world.
 /// Apply an action to obtain the next hypothetical state.
 pub trait State: Clone {
-    type Action: Clone + Debug;
+    type Action: Clone + Debug + Send + Sync;
 
     /// Pure transition (no side-effects).
     fn apply(&self, action: &Self::Action) -> Self;
@@ -24,9 +25,16 @@ pub trait CandidateGen<S: State> {
 
 /// Scores a *whole* hypothetical state (global objective).
 /// Also provides a feasibility guard for hard constraints.
-pub trait Evaluator<S: State> {
+///
+/// `score` is async to allow DB-backed evaluators/scorers.
+/// `feasible` stays sync (pure guard) for cheap early rejections.
+#[async_trait]
+pub trait Evaluator<S>: Send + Sync
+where
+    S: State + Send + Sync,
+{
     /// Global objective. Larger is better.
-    fn score(&self, state: &S) -> f32;
+    async fn score(&self, state: &S) -> f32;
 
     /// Hard guard: return false to reject the state outright.
     /// Default is no guard.
@@ -37,11 +45,18 @@ pub trait Evaluator<S: State> {
 
 /// One-step planner: from a given state, propose a (possibly multi-action)
 /// batch to apply atomically now. Returns None if no improving batch.
-pub trait SearchAlgorithm<S: State> {
-    fn propose_step<G: CandidateGen<S>, E: Evaluator<S>>(
+#[async_trait]
+pub trait SearchAlgorithm<S>: Send
+where
+    S: State + Send + Sync,
+{
+    async fn propose_step<G, E>(
         &mut self,
         current: &S,
         cand: &G,
         eval: &E,
-    ) -> Option<Vec<S::Action>>;
+    ) -> Option<Vec<S::Action>>
+    where
+        G: CandidateGen<S> + Send + Sync,
+        E: Evaluator<S> + Send + Sync;
 }

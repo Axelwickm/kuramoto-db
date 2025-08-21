@@ -1,7 +1,12 @@
-use crate::plugins::harmonizer::optimizer::{AvailabilityDraft, PeerContext};
+use crate::plugins::harmonizer::{harmonizer::PeerContext, optimizer::AvailabilityDraft};
 
-pub mod server_scorer;
+use async_trait::async_trait;
 
+use crate::KuramotoDb;
+
+/// Async scorer so implementors can hit the DB (or a cached context) per evaluation.
+/// Keep this minimal: one pure score method; callers decide how/when to cache.
+#[async_trait]
 pub trait Scorer: Send + Sync {
-    fn score(&self, ctx: &PeerContext, avail: &AvailabilityDraft) -> f32;
+    async fn score(&self, db: &KuramotoDb, ctx: &PeerContext, cand: &AvailabilityDraft) -> f32;
 }
