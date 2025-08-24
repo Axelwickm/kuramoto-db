@@ -1,4 +1,5 @@
 mod availability;
+mod availability_queries;
 mod child_set;
 pub mod harmonizer;
 mod optimizer;

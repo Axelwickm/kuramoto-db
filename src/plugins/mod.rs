@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use redb::WriteTransaction;
+use redb::ReadTransaction;
 
 pub mod communication;
 pub mod harmonizer;
@@ -28,7 +28,7 @@ pub trait Plugin: Send + Sync + 'static {
     async fn before_update(
         &self,
         db: &KuramotoDb,
-        txn: &WriteTransaction,
+        txn: &ReadTransaction,
         batch: &mut WriteBatch,
     ) -> Result<(), StorageError>;
 }
@@ -62,7 +62,7 @@ mod tests {
         async fn before_update(
             &self,
             _db: &KuramotoDb,
-            _txn: &WriteTransaction,
+            _txn: &ReadTransaction,
             _batch: &mut WriteBatch,
         ) -> Result<(), StorageError> {
             self.count.fetch_add(1, Ordering::Relaxed);
@@ -82,7 +82,7 @@ mod tests {
         async fn before_update(
             &self,
             _db: &KuramotoDb,
-            _txn: &WriteTransaction,
+            _txn: &ReadTransaction,
             _batch: &mut WriteBatch,
         ) -> Result<(), StorageError> {
             self.count

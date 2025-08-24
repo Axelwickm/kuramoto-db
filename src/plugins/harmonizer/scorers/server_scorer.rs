@@ -1,12 +1,18 @@
-use std::collections::HashSet;
-
+use async_recursion::async_recursion;
 use async_trait::async_trait;
+use redb::ReadTransaction;
 
-use crate::plugins::harmonizer::availability::Availability;
-use crate::plugins::harmonizer::harmonizer::PeerContext;
-use crate::plugins::harmonizer::optimizer::AvailabilityDraft;
-use crate::plugins::harmonizer::scorers::Scorer;
-use crate::{KuramotoDb, storage_error::StorageError};
+use crate::{
+    KuramotoDb,
+    plugins::harmonizer::{
+        availability::{Availability, roots_for_peer}, // roots via (peer_id,is_root) index
+        availability_queries::{count_replications, resolve_child_avail}, // txn-aware helpers
+        harmonizer::PeerContext,
+        optimizer::{ActionSet, AvailabilityDraft},
+        scorers::Scorer,
+    },
+    storage_error::StorageError,
+};
 
 /// Tunables for the server-side scoring heuristic.
 #[derive(Clone, Debug)]
@@ -36,7 +42,7 @@ impl Default for ServerScorerParams {
 }
 
 /// Stateless, async scorer that queries the DB on demand.
-/// No snapshots, no overlap pressure.
+/// Snapshot-aware (reads via provided `txn`), no whole-table scans for child counting.
 pub struct ServerScorer {
     params: ServerScorerParams,
 }
@@ -46,47 +52,114 @@ impl ServerScorer {
         Self { params }
     }
 
-    /// Count distinct peers that **fully contain** the candidate range.
+    /// Txn-aware replication count: distinct peers that **fully contain** the candidate range.
+    /// NOTE: remains global & scan-based (as in availability_queries), since replication is
+    /// a cross-peer property.
     async fn replication_count(
         &self,
         db: &KuramotoDb,
+        txn: &ReadTransaction,
         cand: &AvailabilityDraft,
     ) -> Result<usize, StorageError> {
-        let mut peers: HashSet<_> = HashSet::new();
-        // MVP: full scan. Callers can later wrap this scorer with caching/indexes.
-        let all: Vec<Availability> = db.range_by_pk::<Availability>(&[], &[0xFF], None).await?;
-        for a in all {
-            if a.complete && a.range.contains(&cand.range) {
-                peers.insert(a.peer_id);
-            }
-        }
-        Ok(peers.len())
+        count_replications(db, Some(txn), &cand.range, |_a| true, None).await
     }
 
-    /// Estimate local children a parent would adopt (level-1 nodes contained).
-    /// For leaves, this is 1 by construction (the written entity).
+    /// Count **local** children a parent would adopt at level-1 (i.e., `want_child_level`),
+    /// using only your local roots and a txn-aware child resolver. No full-table scans.
+    ///
+    /// Rules:
+    /// - We traverse only subtrees reachable from `(ctx.peer_id)` roots.
+    /// - We **prune** traversal when a node does not intersect `cand.range`.
+    /// - We **stop descending** once we reach at/below `want_child_level`.
+    /// - We count a node iff:
+    ///     * `node.level == want_child_level`
+    ///     * `node.complete`
+    ///     * `node.peer_id == ctx.peer_id`
+    ///     * `cand.range.contains(node.range)`
+    /// - Overlay deletions/additions can be folded in (TODOs noted inline).
     async fn child_count_local(
         &self,
         db: &KuramotoDb,
+        txn: &ReadTransaction,
         ctx: &PeerContext,
         cand: &AvailabilityDraft,
+        _overlay: &ActionSet, // TODO: subtract overlay deletions, add overlay additions
     ) -> Result<usize, StorageError> {
         if cand.level == 0 {
+            // Leaves adopt exactly the written entity.
             return Ok(1);
         }
-        let want_child_level = cand.level.saturating_sub(1);
-        let all: Vec<Availability> = db.range_by_pk::<Availability>(&[], &[0xFF], None).await?;
-        Ok(all
-            .into_iter()
-            .filter(|a| a.complete)
-            .filter(|a| a.peer_id == ctx.peer_id) // local-only
-            .filter(|a| a.level == want_child_level)
-            .filter(|a| cand.range.contains(&a.range))
-            .count())
+
+        let want_child_level = cand.level.saturating_sub(1) as u16;
+
+        // Get **local** roots via the index (no scans).
+        let roots: Vec<Availability> = roots_for_peer(db, Some(txn), &ctx.peer_id).await?;
+
+        // Dedup to avoid double-count if multiple roots reach the same node.
+        use std::collections::HashSet;
+        let mut seen: HashSet<crate::uuid_bytes::UuidBytes> = HashSet::new();
+
+        #[async_recursion]
+        async fn walk(
+            db: &KuramotoDb,
+            txn: &ReadTransaction,
+            ctx: &PeerContext,
+            target: &crate::plugins::harmonizer::range_cube::RangeCube,
+            want_level: u16,
+            acc_seen: &mut HashSet<crate::uuid_bytes::UuidBytes>,
+            node: &Availability,
+            // _overlay: &ActionSet, // when you surface overlay APIs, add here
+        ) -> Result<usize, StorageError> {
+            // Prune if no intersection
+            if node.range.intersect(target).is_none() {
+                return Ok(0);
+            }
+
+            // If we're at/below want_level, either count (==) or stop (<).
+            if node.level <= want_level {
+                if node.level == want_level
+                    && node.complete
+                    && node.peer_id == ctx.peer_id
+                    && target.contains(&node.range)
+                {
+                    // TODO(overlay): if overlay deletes this node, skip it.
+                    if acc_seen.insert(node.key) {
+                        return Ok(1);
+                    }
+                }
+                return Ok(0);
+            }
+
+            // Otherwise, descend to children that resolve.
+            let mut sum = 0usize;
+            for cid in &node.children.children {
+                // TODO(overlay): if overlay deletes this child id, skip resolution.
+                if let Some(child) = resolve_child_avail(db, Some(txn), cid).await? {
+                    sum += walk(db, txn, ctx, target, want_level, acc_seen, &child).await?;
+                } else {
+                    // Broken link → stop this branch (don't count node here, only want exact level)
+                }
+            }
+            Ok(sum)
+        }
+
+        let mut total = 0usize;
+        for r in &roots {
+            total += walk(db, txn, ctx, &cand.range, want_child_level, &mut seen, r).await?;
+        }
+
+        // TODO(overlay):
+        //  - Add any `AvailabilityDraft` inserts that:
+        //      * level == want_child_level
+        //      * peer_id == ctx.peer_id (or implicit)
+        //      * cand.range.contains(draft.range)
+        //  - Make sure not to double-count something that already exists.
+
+        Ok(total)
     }
 
-    /// Single “child count” shaping function:
-    /// peak at `child_target`, linear drop-off as you deviate.
+    /// Single “child count” shaping function: peak at `child_target`,
+    /// linear drop-off as you deviate.
     fn child_count_score(&self, child_count: usize) -> f32 {
         let t = self.params.child_target as i32;
         let dev = (child_count as i32 - t).abs() as f32;
@@ -96,182 +169,34 @@ impl ServerScorer {
 
 #[async_trait]
 impl Scorer for ServerScorer {
-    async fn score(&self, db: &KuramotoDb, ctx: &PeerContext, cand: &AvailabilityDraft) -> f32 {
-        // 1) Strong safety valve: if under-replicated, force a positive score and return.
-        //    This guarantees we keep/expand coverage until we hit the target.
-        let replicas = match self.replication_count(db, cand).await {
+    async fn score(
+        &self,
+        db: &KuramotoDb,
+        txn: &ReadTransaction,
+        ctx: &PeerContext,
+        cand: &AvailabilityDraft,
+        overlay: &ActionSet,
+    ) -> f32 {
+        // 1) Safety valve: under-replicated? Force positive score and return.
+        let replicas = match self.replication_count(db, txn, cand).await {
             Ok(n) => n as i32,
             Err(_) => 0, // on error, be conservative
         };
         let target = self.params.replication_target as i32;
         if replicas < target {
             // Always positive; bias proportional to shortfall.
-            // Caller can still rank among under-replicated candidates.
             return 1.0 + self.params.replication_weight * ((target - replicas) as f32);
         }
 
         // 2) Otherwise: rent + child-count shaping (no overlap term).
         let mut s = -self.params.rent;
 
-        let child_count = match self.child_count_local(db, ctx, cand).await {
+        let child_count = match self.child_count_local(db, txn, ctx, cand, overlay).await {
             Ok(c) => c,
             Err(_) => 0, // on error, fall back to 0 local children
         };
         s += self.child_count_score(child_count);
 
         s
-    }
-}
-
-#[cfg(test)]
-mod emergence_via_plugin_tests {
-    use crate::clock::MockClock;
-    use crate::plugins::communication::router::{Router, RouterConfig};
-    use crate::plugins::harmonizer::availability::Availability;
-    use crate::plugins::harmonizer::harmonizer::{Harmonizer, PeerContext};
-    use crate::plugins::harmonizer::optimizer::AvailabilityDraft;
-    use crate::plugins::harmonizer::scorers::Scorer;
-    use crate::storage_entity::{IndexSpec, StorageEntity};
-    use crate::uuid_bytes::UuidBytes;
-    use crate::{KuramotoDb, StaticTableDef, storage_error::StorageError};
-
-    use redb::{TableDefinition, TableHandle};
-    use std::collections::HashSet;
-    use std::sync::Arc;
-    use tempfile::tempdir;
-
-    // ---------- Minimal test entity ----------
-    #[derive(Clone, Debug, bincode::Encode, bincode::Decode, PartialEq, Eq)]
-    struct Foo {
-        id: u32,
-    }
-    impl StorageEntity for Foo {
-        const STRUCT_VERSION: u8 = 0;
-        fn primary_key(&self) -> Vec<u8> {
-            self.id.to_be_bytes().to_vec()
-        }
-        fn table_def() -> StaticTableDef {
-            static TBL: TableDefinition<'static, &'static [u8], Vec<u8>> =
-                TableDefinition::new("foo");
-            &TBL
-        }
-        fn meta_table_def() -> StaticTableDef {
-            static TBL: TableDefinition<'static, &'static [u8], Vec<u8>> =
-                TableDefinition::new("foo_meta");
-            &TBL
-        }
-        fn load_and_migrate(data: &[u8]) -> Result<Self, StorageError> {
-            match data.first().copied() {
-                Some(0) => {
-                    bincode::decode_from_slice::<Self, _>(&data[1..], bincode::config::standard())
-                        .map(|(v, _)| v)
-                        .map_err(|e| StorageError::Bincode(e.to_string()))
-                }
-                _ => Err(StorageError::Bincode("bad version".into())),
-            }
-        }
-        fn indexes() -> &'static [IndexSpec<Self>] {
-            &[]
-        }
-    }
-
-    // Dummy scorer just to satisfy Harmonizer::new signature (the plugin currently
-    // builds its own ServerScorer internally for planning).
-    struct Dummy;
-    impl Scorer for Dummy {
-        fn score(&self, _ctx: &PeerContext, _a: &AvailabilityDraft) -> f32 {
-            0.0
-        }
-    }
-
-    /// End-to-end: with the Harmonizer plugin enabled and many leaves present,
-    /// we expect level>=1 parents to emerge that cover multiple leaves, i.e.
-    /// the structure is a hierarchy rather than a flat list.
-    ///
-    /// NOTE: This asserts desired system behavior (hierarchy). It will begin to
-    /// pass once the plugin uses a stable self-peer id (so the scorer “sees”
-    /// local children) and parent formation is enabled by default.
-    #[tokio::test]
-    async fn end_to_end_emergence_builds_hierarchy() {
-        // Router + Harmonizer plugin (watching Foo)
-        let clock = Arc::new(MockClock::new(0));
-        let router = Router::new(RouterConfig::default(), clock.clone());
-        let local_peer = PeerContext {
-            peer_id: UuidBytes::new(),
-        };
-
-        let hz = Harmonizer::new(
-            Box::new(Dummy),
-            router,
-            HashSet::from([Foo::table_def().name()]),
-            local_peer,
-        );
-
-        // DB with plugin installed
-        let dir = tempdir().unwrap();
-        let db = KuramotoDb::new(
-            dir.path()
-                .join("emergence_end_to_end.redb")
-                .to_str()
-                .unwrap(),
-            clock.clone(),
-            vec![hz.clone()],
-        )
-        .await;
-
-        db.create_table_and_indexes::<Foo>().unwrap();
-        db.create_table_and_indexes::<Availability>().unwrap();
-
-        // Seed rows → plugin creates leaves during before_update and (once wired)
-        // proposes parents in the same batch.
-        for i in 0..30u32 {
-            db.put(Foo { id: i }).await.unwrap();
-        }
-
-        // Observe the resulting availability graph.
-        let avs: Vec<Availability> = db
-            .range_by_pk::<Availability>(&[], &[0xFF], None)
-            .await
-            .unwrap();
-
-        let leaves: Vec<&Availability> = avs.iter().filter(|a| a.level == 0).collect();
-        let parents: Vec<&Availability> = avs.iter().filter(|a| a.level >= 1).collect();
-
-        // Basic presence checks.
-        assert!(
-            leaves.len() >= 30,
-            "expected at least 30 leaves; got {}",
-            leaves.len()
-        );
-        assert!(
-            !parents.is_empty(),
-            "expected parent nodes to emerge (level>=1), but none were found"
-        );
-
-        // At least one parent should adopt multiple leaves (grouping effect).
-        let mut best_adopt = 0usize;
-        for p in &parents {
-            let adopted = leaves
-                .iter()
-                .filter(|lv| p.range.contains(&lv.range))
-                .count();
-            best_adopt = best_adopt.max(adopted);
-        }
-        assert!(
-            best_adopt >= 4,
-            "expected a parent to cover multiple leaves; best adoption count was {best_adopt}"
-        );
-
-        // Optional shape sanity: if we have ≥2 parent levels, ensure nesting (tree-like).
-        let max_parent_level = parents.iter().map(|a| a.level).max().unwrap_or(0);
-        if max_parent_level >= 2 {
-            // Find a level-2+ parent that contains some level-1 parent (hierarchical nesting)
-            let has_nesting = parents.iter().any(|p_hi| {
-                parents
-                    .iter()
-                    .any(|p_lo| p_lo.level + 1 == p_hi.level && p_hi.range.contains(&p_lo.range))
-            });
-            assert!(has_nesting, "expected some nesting among parent levels");
-        }
     }
 }

@@ -13,6 +13,7 @@
 //! - Deterministic: no randomness in enumeration or selection.
 
 use async_trait::async_trait;
+use redb::ReadTransaction;
 
 use crate::plugins::harmonizer::availability::Availability;
 use crate::plugins::harmonizer::harmonizer::PeerContext;
@@ -96,6 +97,7 @@ pub trait Optimizer: Send + Sync {
     async fn propose(
         &self,
         db: &KuramotoDb,
+        tx: &ReadTransaction,
         drafts: &[AvailabilityDraft],
     ) -> Result<Option<ActionSet>, StorageError>;
 }
@@ -148,6 +150,7 @@ impl Optimizer for BasicOptimizer {
     async fn propose(
         &self,
         db: &KuramotoDb,
+        txn: &ReadTransaction,
         seeds: &[AvailabilityDraft],
     ) -> Result<Option<ActionSet>, StorageError> {
         let seeds: Vec<AvailabilityDraft> = seeds
@@ -202,6 +205,7 @@ impl Optimizer for BasicOptimizer {
             };
             let eval = DraftEvaluator {
                 db,
+                txn,
                 scorer: &*self.scorer,
                 ctx: &self.ctx,
             };
@@ -244,7 +248,7 @@ impl Optimizer for BasicOptimizer {
 
         // Post-pass: propose deletes for negative parents overlapping any seed.
         let mut deletes =
-            propose_negative_parent_deletes(db, &self.ctx, &*self.scorer, &seeds).await?;
+            propose_negative_parent_deletes(db, txn, &self.ctx, &*self.scorer, &seeds).await?;
         if !deletes.is_empty() {
             println!("opt.delete_pass: proposing {} deletes", deletes.len());
             plan.append(&mut deletes);
@@ -298,6 +302,7 @@ impl<'a> CandidateGen<AvailabilityDraft> for DraftCandidateGen<'a> {
 /// Evaluates a draft using the provided scorer.
 struct DraftEvaluator<'a> {
     db: &'a KuramotoDb,
+    txn: &'a ReadTransaction,
     scorer: &'a dyn Scorer,
     ctx: &'a PeerContext,
 }
@@ -308,7 +313,7 @@ impl Evaluator<AvailabilityDraft> for DraftEvaluator<'_> {
         if range_is_empty(&s.range) {
             return f32::NEG_INFINITY;
         }
-        self.scorer.score(self.db, self.ctx, s).await
+        self.scorer.score(self.db, self.txn, self.ctx, s).await
     }
     fn feasible(&self, _s: &AvailabilityDraft) -> bool {
         true
@@ -319,6 +324,7 @@ impl Evaluator<AvailabilityDraft> for DraftEvaluator<'_> {
 
 async fn propose_negative_parent_deletes(
     db: &KuramotoDb,
+    txn: &ReadTransaction,
     ctx: &PeerContext,
     scorer: &dyn Scorer,
     seeds: &[AvailabilityDraft],
@@ -341,7 +347,7 @@ async fn propose_negative_parent_deletes(
         let s_old = if range_is_empty(&pd.range) {
             0.0
         } else {
-            scorer.score(db, ctx, &pd).await
+            scorer.score(db, txn, ctx, &pd).await
         };
         if s_old < 0.0 {
             // avoid duplicates
@@ -601,7 +607,9 @@ mod tests {
     use std::sync::Arc;
     use tempfile::tempdir;
 
-    use crate::{clock::MockClock, uuid_bytes::UuidBytes};
+    use crate::{
+        clock::MockClock, plugins::harmonizer::child_set::ChildSet, uuid_bytes::UuidBytes,
+    };
 
     // small builder
     fn draft_bytes(level: u16, mins: &[&[u8]], maxs: &[&[u8]]) -> AvailabilityDraft {
@@ -642,7 +650,13 @@ mod tests {
     struct ZeroScorer;
     #[async_trait::async_trait]
     impl Scorer for ZeroScorer {
-        async fn score(&self, _db: &KuramotoDb, _ctx: &PeerContext, _a: &AvailabilityDraft) -> f32 {
+        async fn score(
+            &self,
+            _db: &KuramotoDb,
+            _txn: &ReadTransaction,
+            _ctx: &PeerContext,
+            _a: &AvailabilityDraft,
+        ) -> f32 {
             0.0
         }
     }
@@ -651,7 +665,13 @@ mod tests {
     struct SpanPromoteScorer;
     #[async_trait::async_trait]
     impl Scorer for SpanPromoteScorer {
-        async fn score(&self, _db: &KuramotoDb, _ctx: &PeerContext, a: &AvailabilityDraft) -> f32 {
+        async fn score(
+            &self,
+            _db: &KuramotoDb,
+            _txn: &ReadTransaction,
+            _ctx: &PeerContext,
+            a: &AvailabilityDraft,
+        ) -> f32 {
             let d = a.range.mins.len().min(a.range.maxs.len());
             let mut span = 0i32;
             for i in 0..d {
@@ -666,7 +686,13 @@ mod tests {
     struct IdentityLovesScorer;
     #[async_trait::async_trait]
     impl Scorer for IdentityLovesScorer {
-        async fn score(&self, _db: &KuramotoDb, _ctx: &PeerContext, a: &AvailabilityDraft) -> f32 {
+        async fn score(
+            &self,
+            _db: &KuramotoDb,
+            _txn: &ReadTransaction,
+            _ctx: &PeerContext,
+            a: &AvailabilityDraft,
+        ) -> f32 {
             if a.level == 0 { 1.0 } else { 0.0 }
         }
     }
@@ -697,7 +723,10 @@ mod tests {
         .with_caps(caps());
 
         let base = draft_bytes(0, &[b"a"], &[b"a\x01"]);
-        let got = opt.propose(&db, &[base]).await.unwrap();
+
+        let txn = db.begin_read_txn().unwrap();
+        let got = opt.propose(&db, &txn, &[base]).await.unwrap();
+
         assert!(got.is_none(), "zero scorer should produce no plan");
     }
 
@@ -713,7 +742,8 @@ mod tests {
         .with_caps(caps());
 
         let base = draft_bytes(0, &[b"\x0f"], &[b"\x0f\x01"]);
-        let got = opt.propose(&db, &[base]).await.unwrap();
+        let txn = db.begin_read_txn().unwrap();
+        let got = opt.propose(&db, &txn, &[base]).await.unwrap();
         assert!(got.is_none(), "should early-exit when identity is argmax");
     }
 
@@ -734,7 +764,12 @@ mod tests {
 
         // small leaf
         let base = draft_bytes(0, &[&[15u8, 0x00]], &[&[15u8, 0x01]]);
-        let plan = opt.propose(&db, &[base]).await.unwrap().expect("plan");
+        let txn = db.begin_read_txn().unwrap();
+        let plan = opt
+            .propose(&db, &txn, &[base])
+            .await
+            .unwrap()
+            .expect("plan");
         assert!(
             plan.iter()
                 .any(|a| matches!(a, Action::Insert(d) if d.level >= 1)),
@@ -751,6 +786,7 @@ mod tests {
             async fn score(
                 &self,
                 _db: &KuramotoDb,
+                _txn: &ReadTransaction,
                 _ctx: &PeerContext,
                 a: &AvailabilityDraft,
             ) -> f32 {
@@ -776,7 +812,7 @@ mod tests {
             peer_id: ctx.peer_id,
             range: rc,
             level: 1,
-            children: crate::plugins::harmonizer::child_set::ChildSet {
+            children: ChildSet {
                 parent: parent_id,
                 children: vec![],
             },
@@ -789,7 +825,12 @@ mod tests {
 
         // one tiny seed overlapping that parent
         let seed = draft_bytes(0, &[&[15u8]], &[&[15u8, 1]]);
-        let plan = opt.propose(&db, &[seed]).await.unwrap().expect("plan");
+        let txn = db.begin_read_txn().unwrap();
+        let plan = opt
+            .propose(&db, &txn, &[seed])
+            .await
+            .unwrap()
+            .expect("plan");
         assert!(
             plan.iter().any(|a| matches!(a, Action::Delete(_))),
             "expected at least one Delete action from post-pass"

@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use redb::WriteTransaction;
+use redb::ReadTransaction;
 use std::{
     collections::HashMap,
     fmt,
@@ -736,7 +736,7 @@ impl Plugin for Router {
     async fn before_update(
         &self,
         _db: &KuramotoDb,
-        _txn: &WriteTransaction,
+        _txn: &ReadTransaction,
         _batch: &mut WriteBatch,
     ) -> Result<(), StorageError> {
         Ok(())

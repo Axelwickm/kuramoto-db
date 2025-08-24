@@ -16,13 +16,21 @@ use bincode::error::{DecodeError, EncodeError};
 
 /*──────────────────────────── constants ─────────────────────────*/
 
-pub type Sym = u64;
-pub type Enc = Encoder<8, Sym>;
-pub type Cell = CodedSymbol<8, Sym>;
+pub type Enc = Encoder<16, UuidBytes>;
+pub type Cell = CodedSymbol<16, UuidBytes>;
 
 pub const DIGEST_CHUNK_BYTES: usize = 1024;
 pub const CELLS_PER_CHUNK: usize = 16;
 pub const STORED_CHUNKS: usize = 1; // ← *only* the first chunk lives in the DB
+
+impl Symbol<16> for UuidBytes {
+    fn encode(&self) -> [u8; 16] {
+        *self.as_bytes()
+    }
+    fn decode(bytes: [u8; 16]) -> Self {
+        Self::from_bytes(bytes)
+    }
+}
 
 /*─────────────────────────── tables ─────────────────────────────*/
 
@@ -41,7 +49,7 @@ pub static AVAIL_DIG_CHUNK_META_TBL: StaticTableDef =
 pub struct Child {
     pub parent: UuidBytes,
     pub ordinal: u32,
-    pub child_id: Sym,
+    pub child_id: UuidBytes,
 }
 
 // manual encode/decode (newtype avoids orphan‑rule problems)
@@ -57,7 +65,7 @@ impl Decode<()> for Child {
         Ok(Self {
             parent: UuidBytes::decode(d)?,
             ordinal: <u32 as Decode<()>>::decode(d)?,
-            child_id: <u64 as Decode<()>>::decode(d)?,
+            child_id: <UuidBytes as Decode<()>>::decode(d)?,
         })
     }
 }
@@ -164,7 +172,7 @@ async fn scan_prefix<E: StorageEntity>(
 #[derive(Clone, Debug, Encode, Decode)]
 pub struct ChildSet {
     pub parent: UuidBytes,
-    pub children: Vec<Sym>,
+    pub children: Vec<UuidBytes>,
 }
 
 impl ChildSet {
@@ -183,20 +191,28 @@ impl ChildSet {
     }
 
     /* add/remove child -----------------------------------------*/
-    pub async fn add_child(&mut self, db: &KuramotoDb, sym: Sym) -> Result<(), StorageError> {
+    pub async fn add_child(
+        &mut self,
+        db: &KuramotoDb,
+        child_id: UuidBytes,
+    ) -> Result<(), StorageError> {
         let ord = self.children.len() as u32;
         db.put(Child {
             parent: self.parent,
             ordinal: ord,
-            child_id: sym,
+            child_id: child_id,
         })
         .await?;
-        self.children.push(sym);
+        self.children.push(child_id);
         self.rebuild_chunks(db).await
     }
 
-    pub async fn remove_child(&mut self, db: &KuramotoDb, sym: Sym) -> Result<(), StorageError> {
-        if let Some(pos) = self.children.iter().position(|&s| s == sym) {
+    pub async fn remove_child(
+        &mut self,
+        db: &KuramotoDb,
+        child_id: UuidBytes,
+    ) -> Result<(), StorageError> {
+        if let Some(pos) = self.children.iter().position(|&s| s == child_id) {
             self.children.remove(pos);
             // delete the row with that ordinal
             let mut pk = self.parent.as_bytes().to_vec();
@@ -296,7 +312,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use rand::Rng;
-    use redb::WriteTransaction;
+    use redb::ReadTransaction;
     use std::sync::Arc;
     use tempfile::tempdir;
     use tokio::runtime::Runtime;
@@ -313,7 +329,7 @@ mod tests {
         async fn before_update(
             &self,
             _db: &KuramotoDb,
-            _txn: &WriteTransaction,
+            _txn: &ReadTransaction,
             _batch: &mut WriteBatch,
         ) -> Result<(), StorageError> {
             Ok(())
