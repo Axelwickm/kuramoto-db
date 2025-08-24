@@ -12,7 +12,7 @@ use std::{
 
 use bincode::{Decode, Encode};
 use tokio::sync::{Semaphore, mpsc, oneshot};
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{debug, info, instrument, warn};
 
 use crate::{
     KuramotoDb, WriteBatch,

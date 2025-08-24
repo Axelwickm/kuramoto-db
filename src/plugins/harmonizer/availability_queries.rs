@@ -257,6 +257,7 @@ mod tests {
         let c1 = Availability {
             key: UuidBytes::new(),
             peer_id: UuidBytes::new(),
+            parent: None,
             range: cube(dim, b"g", b"n"), // intersects target
             level: 1,
             children: ChildSet {
@@ -271,6 +272,7 @@ mod tests {
         let c2 = Availability {
             key: UuidBytes::new(),
             peer_id: UuidBytes::new(),
+            parent: None,
             range: cube(dim, b"x", b"z"), // does NOT intersect target
             level: 1,
             children: ChildSet {
@@ -285,6 +287,7 @@ mod tests {
         let root = Availability {
             key: UuidBytes::new(),
             peer_id: UuidBytes::new(),
+            parent: None,
             range: cube(dim, b"a", b"z"), // intersects target
             level: 2,
             children: ChildSet {
@@ -322,6 +325,7 @@ mod tests {
         let present = Availability {
             key: UuidBytes::new(),
             peer_id: UuidBytes::new(),
+            parent: None,
             range: cube(dim, b"l", b"o"),
             level: 1,
             children: ChildSet {
@@ -337,6 +341,7 @@ mod tests {
         let parent = Availability {
             key: UuidBytes::new(),
             peer_id: UuidBytes::new(),
+            parent: None,
             range: cube(dim, b"a", b"z"),
             level: 2,
             children: ChildSet {
@@ -373,6 +378,7 @@ mod tests {
         let inc = Availability {
             key: UuidBytes::new(),
             peer_id: UuidBytes::new(),
+            parent: None,
             range: cube(dim, b"a", b"z"),
             level: 1,
             children: ChildSet {
@@ -404,6 +410,7 @@ mod tests {
         let c2 = Availability {
             key: UuidBytes::new(),
             peer_id: UuidBytes::new(),
+            parent: None,
             range: cube(dim, b"h", b"i"),
             level: 0,
             children: ChildSet {
@@ -418,6 +425,7 @@ mod tests {
         let c1 = Availability {
             key: UuidBytes::new(),
             peer_id: UuidBytes::new(),
+            parent: None,
             range: cube(dim, b"f", b"k"),
             level: 1,
             children: ChildSet {
@@ -432,6 +440,7 @@ mod tests {
         let root = Availability {
             key: UuidBytes::new(),
             peer_id: UuidBytes::new(),
+            parent: None,
             range: cube(dim, b"a", b"z"),
             level: 2,
             children: ChildSet {
@@ -477,6 +486,7 @@ mod tests {
         let mut a = Availability {
             key: id,
             peer_id: UuidBytes::new(),
+            parent: None,
             range: cube(dim, b"a", b"b"),
             level: 1,
             children: ChildSet {
@@ -520,6 +530,7 @@ mod tests {
         let child = Availability {
             key: UuidBytes::new(),
             peer_id: UuidBytes::new(),
+            parent: None,
             range: cube(dim, b"m", b"n"),
             level: 0,
             children: ChildSet {

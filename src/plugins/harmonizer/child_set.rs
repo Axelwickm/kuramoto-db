@@ -55,7 +55,7 @@ pub struct Child {
 // manual encode/decode (newtype avoids orphan‑rule problems)
 impl Encode for Child {
     fn encode<E: BinEncoder>(&self, e: &mut E) -> Result<(), EncodeError> {
-        self.parent.encode(e)?;
+        bincode::Encode::encode(&self.parent, e)?;
         self.ordinal.encode(e)?;
         Encode::encode(&self.child_id, e)
     }
@@ -63,7 +63,7 @@ impl Encode for Child {
 impl Decode<()> for Child {
     fn decode<D: BinDecoder<Context = ()>>(d: &mut D) -> Result<Self, DecodeError> {
         Ok(Self {
-            parent: UuidBytes::decode(d)?,
+            parent: bincode::Decode::decode(d)?,
             ordinal: <u32 as Decode<()>>::decode(d)?,
             child_id: <UuidBytes as Decode<()>>::decode(d)?,
         })
@@ -111,7 +111,7 @@ pub struct DigestChunk {
 
 impl Encode for DigestChunk {
     fn encode<E: BinEncoder>(&self, e: &mut E) -> Result<(), EncodeError> {
-        self.parent.encode(e)?;
+        bincode::Encode::encode(&self.parent, e)?;
         self.chunk_no.encode(e)?;
         self.bytes.encode(e)
     }
@@ -119,7 +119,7 @@ impl Encode for DigestChunk {
 impl Decode<()> for DigestChunk {
     fn decode<D: BinDecoder<Context = ()>>(d: &mut D) -> Result<Self, DecodeError> {
         Ok(Self {
-            parent: UuidBytes::decode(d)?,
+            parent: bincode::Decode::decode(d)?,
             chunk_no: <u32 as Decode<()>>::decode(d)?,
             bytes: Vec::<u8>::decode(d)?,
         })
@@ -363,13 +363,13 @@ mod tests {
         let child = Child {
             parent,
             ordinal: 7,
-            child_id: 42,
+            child_id: UuidBytes::new(),
         };
         let bytes = child.to_bytes();
         let decoded = Child::load_and_migrate(&bytes).unwrap();
         assert_eq!(decoded.parent, parent);
         assert_eq!(decoded.ordinal, 7);
-        assert_eq!(decoded.child_id, 42);
+        assert_eq!(decoded.child_id, child.child_id);
     }
 
     /*──────── add/remove + reopen round-trip ─────────────*/
@@ -383,16 +383,20 @@ mod tests {
         rt.block_on(async {
             let parent = UuidBytes::new();
             let mut cs = ChildSet::open(&db, parent).await.unwrap();
-            cs.add_child(&db, 10).await.unwrap();
-            cs.add_child(&db, 11).await.unwrap();
+
+            let id1 = UuidBytes::new();
+            let id2 = UuidBytes::new();
+
+            cs.add_child(&db, id1).await.unwrap();
+            cs.add_child(&db, id2).await.unwrap();
             assert_eq!(cs.count(), 2);
 
-            cs.remove_child(&db, 10).await.unwrap();
+            cs.remove_child(&db, id1).await.unwrap();
             assert_eq!(cs.count(), 1);
 
             let cs2 = ChildSet::open(&db, parent).await.unwrap();
             assert_eq!(cs2.count(), 1);
-            assert_eq!(cs2.children[0], 11);
+            assert_eq!(cs2.children[0], id2);
         });
     }
 
@@ -406,13 +410,21 @@ mod tests {
 
         rt.block_on(async {
             let mut rng = rand::rng();
-            let kids: Vec<u64> = (0..50).map(|_| rng.random()).collect();
+            // Generate real UuidBytes symbols, not u64
+            let kids: Vec<UuidBytes> = (0..50)
+                .map(|_| {
+                    // keep rng around to mirror original structure, though not used here
+                    let _ = rng.random::<u64>();
+                    UuidBytes::new()
+                })
+                .collect();
 
             let mut cs = ChildSet::open(&db, UuidBytes::new()).await.unwrap();
             for k in &kids {
                 cs.add_child(&db, *k).await.unwrap();
             }
 
+            // Encoder over &[UuidBytes]
             let mut enc = Enc::new(&kids);
             for i in 0..(CELLS_PER_CHUNK * STORED_CHUNKS + 10) {
                 let expected = enc.next_coded();

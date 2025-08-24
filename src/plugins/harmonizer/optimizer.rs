@@ -313,7 +313,9 @@ impl Evaluator<AvailabilityDraft> for DraftEvaluator<'_> {
         if range_is_empty(&s.range) {
             return f32::NEG_INFINITY;
         }
-        self.scorer.score(self.db, self.txn, self.ctx, s).await
+        self.scorer
+            .score(self.db, self.txn, self.ctx, s, &vec![])
+            .await
     }
     fn feasible(&self, _s: &AvailabilityDraft) -> bool {
         true
@@ -347,7 +349,7 @@ async fn propose_negative_parent_deletes(
         let s_old = if range_is_empty(&pd.range) {
             0.0
         } else {
-            scorer.score(db, txn, ctx, &pd).await
+            scorer.score(db, txn, ctx, &pd, &vec![]).await
         };
         if s_old < 0.0 {
             // avoid duplicates
@@ -656,6 +658,7 @@ mod tests {
             _txn: &ReadTransaction,
             _ctx: &PeerContext,
             _a: &AvailabilityDraft,
+            _overlay: &ActionSet,
         ) -> f32 {
             0.0
         }
@@ -671,6 +674,7 @@ mod tests {
             _txn: &ReadTransaction,
             _ctx: &PeerContext,
             a: &AvailabilityDraft,
+            _overlay: &ActionSet,
         ) -> f32 {
             let d = a.range.mins.len().min(a.range.maxs.len());
             let mut span = 0i32;
@@ -692,6 +696,7 @@ mod tests {
             _txn: &ReadTransaction,
             _ctx: &PeerContext,
             a: &AvailabilityDraft,
+            _overlay: &ActionSet,
         ) -> f32 {
             if a.level == 0 { 1.0 } else { 0.0 }
         }
@@ -789,6 +794,7 @@ mod tests {
                 _txn: &ReadTransaction,
                 _ctx: &PeerContext,
                 a: &AvailabilityDraft,
+                _overlay: &ActionSet,
             ) -> f32 {
                 if a.level >= 1 { -1.0 } else { 0.0 }
             }
@@ -810,6 +816,7 @@ mod tests {
         let parent = Availability {
             key: parent_id,
             peer_id: ctx.peer_id,
+            parent: None,
             range: rc,
             level: 1,
             children: ChildSet {

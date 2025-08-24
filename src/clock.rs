@@ -1,4 +1,4 @@
-use std::{fmt::Debug, sync::Arc};
+use std::{fmt::Debug};
 use tokio::time::{Duration, Instant, advance};
 
 pub trait Clock: Debug + Send + Sync + 'static {

@@ -7,14 +7,12 @@ use std::sync::{OnceLock, Weak};
 use std::{collections::HashSet, sync::Arc};
 use tokio::sync::mpsc;
 
-use crate::database::{IndexPutRequest, WriteRequest};
-use crate::plugins::communication::transports::PeerId;
 use crate::plugins::harmonizer::child_set::{Child, DigestChunk};
 use crate::plugins::harmonizer::optimizer::{Action as OptAction, AvailabilityDraft};
 use crate::plugins::harmonizer::optimizer::{BasicOptimizer, Optimizer};
 use crate::plugins::harmonizer::range_cube::RangeCube;
 use crate::plugins::harmonizer::{
-    child_set::{ChildSet, Sym},
+    child_set::ChildSet,
     protocol::{
         HarmonizerMsg, HarmonizerResp, PROTO_HARMONIZER, ProtoCommand, ReconcileAsk,
         UpdateResponse, UpdateWithAttestation, register_harmonizer_protocol,
@@ -28,6 +26,10 @@ use crate::tables::TableHash;
 use crate::{
     KuramotoDb, StaticTableDef, WriteBatch, plugins::Plugin, storage_entity::StorageEntity,
     storage_error::StorageError, uuid_bytes::UuidBytes,
+};
+use crate::{
+    database::{IndexPutRequest, WriteRequest},
+    plugins::communication::transports::PeerId,
 };
 
 #[derive(Clone, Debug)]
@@ -159,9 +161,8 @@ impl Harmonizer {
         let router = self.router.clone();
         tokio::spawn(async move {
             while let Some(item) = outbox_rx.recv().await {
-                if let OutboxItem::Notify { peer, msg } = item {
-                    let _ = router.notify_on(PROTO_HARMONIZER, peer, &msg).await;
-                }
+                let OutboxItem::Notify { peer, msg } = item;
+                let _ = router.notify_on(PROTO_HARMONIZER, peer, &msg).await;
             }
         });
     }
@@ -238,41 +239,6 @@ impl Harmonizer {
             stored.to_vec()
         }
     }
-
-    #[inline]
-    fn splitmix64(mut x: u64) -> u64 {
-        // TODO: We already have hashes in table.rs, so maybe remove
-        x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        x ^ (x >> 31)
-    }
-
-    fn child_sym(&self, data_table: StaticTableDef, key: &[u8]) -> Sym {
-        let mut acc: u64 = 0xcbf2_9ce4_8422_2325;
-        for b in data_table
-            .name()
-            .as_bytes()
-            .iter()
-            .copied()
-            .chain([0u8])
-            .chain(key.iter().copied())
-        {
-            acc ^= b as u64;
-            acc = acc.wrapping_mul(0x1000_001B3);
-        }
-        Self::splitmix64(acc)
-    }
-
-    fn small_digest_single(&self, sym: Sym) -> u64 {
-        let bytes = sym.to_le_bytes();
-        let mut v = 0u64;
-        for (i, b) in bytes.iter().enumerate() {
-            v ^= (*b as u64) << ((i as u64 % 8) * 8);
-            v = Self::splitmix64(v);
-        }
-        v
-    }
 }
 
 #[async_trait]
@@ -309,7 +275,6 @@ impl Plugin for Harmonizer {
         };
 
         let now = db.get_clock().now();
-        let sym = self.child_sym(data_table, &key_owned);
 
         let peer_id = self.peer_ctx.peer_id;
 
@@ -320,11 +285,12 @@ impl Plugin for Harmonizer {
         let avail = Availability {
             key: avail_id,
             peer_id,
+            parent: None,
             range: leaf_range,
             level: 0,
             children: ChildSet {
                 parent: avail_id,
-                children: vec![sym],
+                children: vec![avail_id],
             },
             schema_hash: 0,
             version: 0,
@@ -369,6 +335,11 @@ impl Plugin for Harmonizer {
         // --- 2) broadcast inline attestation (v0) to known peers ---
         let peers = { self.peers.read().await.clone() }; // drop lock before awaits
         if !peers.is_empty() {
+            let b = avail_id.as_bytes();
+            debug_assert_eq!(b.len(), 16, "UuidBytes must be 16 bytes");
+            let hi = u64::from_le_bytes(b[0..8].try_into().unwrap());
+            let lo = u64::from_le_bytes(b[8..16].try_into().unwrap());
+            let digest = hi ^ lo;
             let att = UpdateWithAttestation {
                 table: data_table.name().to_string(),
                 pk: key_owned.clone(),
@@ -376,7 +347,7 @@ impl Plugin for Harmonizer {
                 local_availability_id: avail_id,
                 level: 0,
                 child_count: 1,
-                small_digest: self.small_digest_single(sym),
+                small_digest: digest,
                 entity_bytes,
             };
             let msg = HarmonizerMsg::UpdateWithAttestation(att);
@@ -416,6 +387,7 @@ impl Plugin for Harmonizer {
                         let parent = Availability {
                             key: id,
                             peer_id,
+                            parent: None,
                             range: d.range.clone(),
                             level: d.level,
                             children: ChildSet {
@@ -516,6 +488,7 @@ mod tests {
         Connector, PeerId, PeerResolver,
         inmem::{InMemConnector, InMemResolver},
     };
+    use crate::plugins::harmonizer::optimizer::ActionSet;
     use crate::plugins::harmonizer::optimizer::AvailabilityDraft;
     use crate::plugins::harmonizer::scorers::Scorer;
     use crate::storage_entity::*;
@@ -524,7 +497,7 @@ mod tests {
     use rand::Rng;
     use redb::TableDefinition;
     use std::collections::HashSet;
-    use std::io::Read;
+
     use std::sync::Arc;
     use tempfile::tempdir;
     use tokio::sync::mpsc;
@@ -577,6 +550,7 @@ mod tests {
             _txn: &ReadTransaction,
             _ctx: &PeerContext,
             _cand: &AvailabilityDraft,
+            _overlay: &ActionSet,
         ) -> f32 {
             0.0
         }

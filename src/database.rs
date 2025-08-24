@@ -1431,7 +1431,7 @@ mod tests {
             Ok(())
         }
 
-        fn attach_db(&self, db: Arc<KuramotoDb>) {}
+        fn attach_db(&self, _db: Arc<KuramotoDb>) {}
     }
 
     struct DoublePlugin;
@@ -1457,7 +1457,7 @@ mod tests {
             Ok(())
         }
 
-        fn attach_db(&self, db: Arc<KuramotoDb>) {}
+        fn attach_db(&self, _db: Arc<KuramotoDb>) {}
     }
 
     #[tokio::test]
