@@ -1,12 +1,13 @@
-use async_recursion::async_recursion;
+use crate::uuid_bytes::UuidBytes;
 use async_trait::async_trait;
 use redb::ReadTransaction;
+use std::collections::HashSet;
 
 use crate::{
     KuramotoDb,
     plugins::harmonizer::{
         availability::{Availability, roots_for_peer}, // roots via (peer_id,is_root) index
-        availability_queries::{count_replications, resolve_child_avail}, // txn-aware helpers
+        availability_queries::{count_replications, range_cover, resolve_child_avail}, // txn-aware helpers
         harmonizer::PeerContext,
         optimizer::{ActionSet, AvailabilityDraft},
         scorers::Scorer,
@@ -64,98 +65,54 @@ impl ServerScorer {
         count_replications(db, Some(txn), &cand.range, |_a| true, None).await
     }
 
-    /// Count **local** children a parent would adopt at level-1 (i.e., `want_child_level`),
-    /// using only your local roots and a txn-aware child resolver. No full-table scans.
+    /// Level-free, range-driven local child count.
     ///
-    /// Rules:
-    /// - We traverse only subtrees reachable from `(ctx.peer_id)` roots.
-    /// - We **prune** traversal when a node does not intersect `cand.range`.
-    /// - We **stop descending** once we reach at/below `want_child_level`.
-    /// - We count a node iff:
-    ///     * `node.level == want_child_level`
-    ///     * `node.complete`
-    ///     * `node.peer_id == ctx.peer_id`
-    ///     * `cand.range.contains(node.range)`
-    /// - Overlay deletions/additions can be folded in (TODOs noted inline).
+    /// Counts how many **local, complete** availabilities under this peer’s roots are
+    /// **contained by** `cand.range`. We avoid global scans by:
+    /// - fetching only this peer’s roots (`roots_for_peer`), and
+    /// - descending from those roots using `range_cover`, which only walks branches that
+    ///   intersect the target range and returns a frontier without over-traversal.
+    ///
+    /// Notes:
+    /// - No dependency on `level`; the definition is purely geometric (containment).
+    /// - Dedups by availability key since multiple roots may reach the same node.
+    /// - Overlay handling is still TODO (subtract deletes, add inserts).
     async fn child_count_local(
         &self,
         db: &KuramotoDb,
         txn: &ReadTransaction,
         ctx: &PeerContext,
         cand: &AvailabilityDraft,
-        _overlay: &ActionSet, // TODO: subtract overlay deletions, add overlay additions
+        _overlay: &ActionSet,
     ) -> Result<usize, StorageError> {
-        if cand.level == 0 {
-            // Leaves adopt exactly the written entity.
-            return Ok(1);
-        }
-
-        let want_child_level = cand.level.saturating_sub(1) as u16;
-
-        // Get **local** roots via the index (no scans).
+        // 1) Fetch this peer's roots in the same snapshot.
         let roots: Vec<Availability> = roots_for_peer(db, Some(txn), &ctx.peer_id).await?;
+        if roots.is_empty() {
+            return Ok(0);
+        }
+        let root_ids: Vec<UuidBytes> = roots.iter().map(|r| r.key).collect();
 
-        // Dedup to avoid double-count if multiple roots reach the same node.
-        use std::collections::HashSet;
-        let mut seen: HashSet<crate::uuid_bytes::UuidBytes> = HashSet::new();
-
-        #[async_recursion]
-        async fn walk(
-            db: &KuramotoDb,
-            txn: &ReadTransaction,
-            ctx: &PeerContext,
-            target: &crate::plugins::harmonizer::range_cube::RangeCube,
-            want_level: u16,
-            acc_seen: &mut HashSet<crate::uuid_bytes::UuidBytes>,
-            node: &Availability,
-            // _overlay: &ActionSet, // when you surface overlay APIs, add here
-        ) -> Result<usize, StorageError> {
-            // Prune if no intersection
-            if node.range.intersect(target).is_none() {
-                return Ok(0);
-            }
-
-            // If we're at/below want_level, either count (==) or stop (<).
-            if node.level <= want_level {
-                if node.level == want_level
-                    && node.complete
-                    && node.peer_id == ctx.peer_id
-                    && target.contains(&node.range)
-                {
-                    // TODO(overlay): if overlay deletes this node, skip it.
-                    if acc_seen.insert(node.key) {
-                        return Ok(1);
-                    }
-                }
-                return Ok(0);
-            }
-
-            // Otherwise, descend to children that resolve.
-            let mut sum = 0usize;
-            for cid in &node.children.children {
-                // TODO(overlay): if overlay deletes this child id, skip resolution.
-                if let Some(child) = resolve_child_avail(db, Some(txn), cid).await? {
-                    sum += walk(db, txn, ctx, target, want_level, acc_seen, &child).await?;
-                } else {
-                    // Broken link → stop this branch (don't count node here, only want exact level)
-                }
-            }
-            Ok(sum)
+        // 2) Compute the frontier that touches cand.range by descending only intersecting branches.
+        let (frontier, no_overlap) =
+            range_cover(db, Some(txn), &cand.range, &root_ids, None).await?;
+        if no_overlap {
+            return Ok(0);
         }
 
-        let mut total = 0usize;
-        for r in &roots {
-            total += walk(db, txn, ctx, &cand.range, want_child_level, &mut seen, r).await?;
+        // 3) Count local, complete nodes whose ranges are contained by the candidate’s range.
+        let mut seen = HashSet::<UuidBytes>::new();
+        let mut count = 0usize;
+
+        for a in frontier {
+            if a.peer_id == ctx.peer_id && a.complete && cand.range.contains(&a.range) {
+                if seen.insert(a.key) {
+                    // TODO(overlay): skip if deleted in overlay; consider drafts that fill gaps.
+                    count += 1;
+                }
+            }
         }
 
-        // TODO(overlay):
-        //  - Add any `AvailabilityDraft` inserts that:
-        //      * level == want_child_level
-        //      * peer_id == ctx.peer_id (or implicit)
-        //      * cand.range.contains(draft.range)
-        //  - Make sure not to double-count something that already exists.
-
-        Ok(total)
+        Ok(count)
     }
 
     /// Single “child count” shaping function: peak at `child_target`,
@@ -198,5 +155,441 @@ impl Scorer for ServerScorer {
         s += self.child_count_score(child_count);
 
         s
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        KuramotoDb,
+        clock::MockClock,
+        plugins::harmonizer::{
+            availability::{Availability, roots_for_peer},
+            child_set::ChildSet,
+            harmonizer::PeerContext,
+            optimizer::{Action, ActionSet, AvailabilityDraft, BasicOptimizer, Caps, Optimizer},
+            range_cube::RangeCube,
+            scorers::Scorer,
+        },
+        tables::TableHash,
+        uuid_bytes::UuidBytes,
+    };
+    use smallvec::smallvec;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    /* ---------- Helpers ---------- */
+
+    fn cube(dim: TableHash, min: &[u8], max_excl: &[u8]) -> RangeCube {
+        RangeCube {
+            dims: smallvec![dim],
+            mins: smallvec![min.to_vec()],
+            maxs: smallvec![max_excl.to_vec()],
+        }
+    }
+
+    async fn fresh_db() -> Arc<KuramotoDb> {
+        let dir = tempdir().unwrap();
+        let clock = Arc::new(MockClock::new(0));
+        let db = KuramotoDb::new(
+            dir.path().join("scorer.redb").to_str().unwrap(),
+            clock,
+            vec![],
+        )
+        .await;
+        db.create_table_and_indexes::<Availability>().unwrap();
+        db
+    }
+
+    /// Make N contiguous leaf availabilities [i, i+1) on a 1D axis.
+    /// Returns (root_id, leaf_ids).
+    async fn build_linear_leaves_with_root(
+        db: &KuramotoDb,
+        peer: UuidBytes,
+        dim: TableHash,
+        n: u8,
+        base: u8,
+    ) -> (UuidBytes, Vec<UuidBytes>) {
+        let mut leaf_ids = Vec::with_capacity(n as usize);
+        for i in 0..n {
+            let id = UuidBytes::new();
+            let lo = vec![base + i];
+            let mut hi = lo.clone();
+            hi.push(1); // half-open bump
+            let leaf = Availability {
+                key: id,
+                peer_id: peer,
+                parent: Some(UuidBytes::new()), // arbitrary; not used by roots index
+                range: cube(dim, &lo, &hi),
+                level: 0,
+                children: ChildSet {
+                    parent: id,
+                    children: vec![], // leaf ⇒ 0 children for range_cover frontier
+                },
+                schema_hash: 0,
+                version: 0,
+                updated_at: 0,
+                complete: true,
+            };
+            db.put(leaf).await.unwrap();
+            leaf_ids.push(id);
+        }
+
+        // One root that spans all leaves and points to all of them
+        let rid = UuidBytes::new();
+        let root = Availability {
+            key: rid,
+            peer_id: peer,
+            parent: None,                           // root
+            range: cube(dim, &[base], &[base + n]), // covers all
+            level: 3,
+            children: ChildSet {
+                parent: rid,
+                children: leaf_ids.clone(),
+            },
+            schema_hash: 0,
+            version: 0,
+            updated_at: 0,
+            complete: true,
+        };
+        db.put(root).await.unwrap();
+
+        (rid, leaf_ids)
+    }
+
+    fn params(child_target: usize) -> ServerScorerParams {
+        ServerScorerParams {
+            rent: 0.25,
+            child_target,
+            child_weight: 1.0,
+            replication_target: 0, // disable safety valve
+            replication_weight: 0.0,
+        }
+    }
+
+    fn draft(level: u16, r: &RangeCube) -> AvailabilityDraft {
+        AvailabilityDraft {
+            level,
+            range: r.clone(),
+            complete: true,
+        }
+    }
+
+    /* ---------- Unit tests for child_count_local ---------- */
+
+    #[tokio::test]
+    async fn child_count_local_counts_only_local_complete_contained() {
+        let db = fresh_db().await;
+        let dim = TableHash { hash: 11 };
+        let ctx = PeerContext {
+            peer_id: UuidBytes::new(),
+        };
+        // Build 6 local leaves [10..16)
+        let (_root, _leaves) = build_linear_leaves_with_root(&db, ctx.peer_id, dim, 6, 10).await;
+
+        // Add a foreign peer leaf that overlaps but must be ignored
+        let foreign = Availability {
+            key: UuidBytes::new(),
+            peer_id: UuidBytes::new(), // different peer
+            parent: None,
+            range: cube(dim, &[12], &[13]),
+            level: 0,
+            children: ChildSet {
+                parent: UuidBytes::new(),
+                children: vec![],
+            },
+            schema_hash: 0,
+            version: 0,
+            updated_at: 0,
+            complete: true,
+        };
+        db.put(foreign).await.unwrap();
+
+        // Candidate covering [11..14) should see exactly 3 local leaves: 11,12,13
+        let cand = draft(1, &cube(dim, &[11], &[14]));
+        let scorer = ServerScorer::new(params(3));
+
+        let txn = db.begin_read_txn().unwrap();
+        let got = scorer
+            .child_count_local(&db, &txn, &ctx, &cand, &vec![])
+            .await
+            .unwrap();
+        assert_eq!(
+            got, 3,
+            "should count local, complete, contained leaves only"
+        );
+    }
+
+    #[tokio::test]
+    async fn child_count_local_returns_zero_when_no_overlap_from_roots() {
+        let db = fresh_db().await;
+        let dim = TableHash { hash: 12 };
+        let ctx = PeerContext {
+            peer_id: UuidBytes::new(),
+        };
+        let (_root, _leaves) = build_linear_leaves_with_root(&db, ctx.peer_id, dim, 4, 50).await;
+
+        let cand = draft(2, &cube(dim, &[10], &[20])); // disjoint
+        let scorer = ServerScorer::new(params(2));
+        let txn = db.begin_read_txn().unwrap();
+        let got = scorer
+            .child_count_local(&db, &txn, &ctx, &cand, &vec![])
+            .await
+            .unwrap();
+        assert_eq!(got, 0);
+    }
+
+    #[tokio::test]
+    async fn child_count_local_dedupes_frontier_from_multiple_roots() {
+        let db = fresh_db().await;
+        let dim = TableHash { hash: 13 };
+        let ctx = PeerContext {
+            peer_id: UuidBytes::new(),
+        };
+        // Build 3 leaves and a first root
+        let (_r1, _leaves) = build_linear_leaves_with_root(&db, ctx.peer_id, dim, 3, 30).await;
+
+        // Add a second root that also points to the same leaves (dup coverage)
+        let all: Vec<Availability> = db
+            .range_by_pk::<Availability>(&[], &[0xFF], None)
+            .await
+            .unwrap();
+        let leaves: Vec<UuidBytes> = all
+            .into_iter()
+            .filter(|a| a.level == 0 && a.peer_id == ctx.peer_id)
+            .map(|a| a.key)
+            .collect();
+
+        let r2 = Availability {
+            key: UuidBytes::new(),
+            peer_id: ctx.peer_id,
+            parent: None,
+            range: cube(dim, &[30], &[33]),
+            level: 4,
+            children: ChildSet {
+                parent: UuidBytes::new(),
+                children: leaves.clone(),
+            },
+            schema_hash: 0,
+            version: 0,
+            updated_at: 0,
+            complete: true,
+        };
+        db.put(r2).await.unwrap();
+
+        // Sanity: two roots exist
+        let txn = db.begin_read_txn().unwrap();
+        let roots = roots_for_peer(&db, Some(&txn), &ctx.peer_id).await.unwrap();
+        assert!(roots.len() >= 2);
+
+        // Count should still be 3 (no double count)
+        let cand = draft(1, &cube(dim, &[30], &[33]));
+        let scorer = ServerScorer::new(params(3));
+        let got = scorer
+            .child_count_local(&db, &txn, &ctx, &cand, &vec![])
+            .await
+            .unwrap();
+        assert_eq!(got, 3, "duplicate roots must not double count");
+    }
+
+    /* ---------- Score shaping sanity ---------- */
+
+    #[tokio::test]
+    async fn score_prefers_child_target_and_penalizes_deviation() {
+        let db = fresh_db().await;
+        let dim = TableHash { hash: 14 };
+        let ctx = PeerContext {
+            peer_id: UuidBytes::new(),
+        };
+        let (_root, _leaves) = build_linear_leaves_with_root(&db, ctx.peer_id, dim, 6, 100).await;
+
+        let scorer = ServerScorer::new(ServerScorerParams {
+            rent: 0.5,
+            child_target: 3,
+            child_weight: 1.0,
+            replication_target: 0,
+            replication_weight: 0.0,
+        });
+
+        let txn = db.begin_read_txn().unwrap();
+        // Candidate windows with 2, 3, 4 leaves respectively
+        let c2 = draft(1, &cube(dim, &[101], &[103])); // covers 101,102 -> 2
+        let c3 = draft(1, &cube(dim, &[101], &[104])); // 101,102,103 -> 3
+        let c4 = draft(1, &cube(dim, &[101], &[105])); // 4 leaves
+
+        let s2 = scorer.score(&db, &txn, &ctx, &c2, &vec![]).await;
+        let s3 = scorer.score(&db, &txn, &ctx, &c3, &vec![]).await;
+        let s4 = scorer.score(&db, &txn, &ctx, &c4, &vec![]).await;
+
+        assert!(
+            s3 > s2 && s3 > s4,
+            "score should peak at child_target; got s2={s2}, s3={s3}, s4={s4}"
+        );
+    }
+
+    /* ---------- Emergence: optimizer + scorer build k-ary coverage ---------- */
+
+    #[tokio::test]
+    async fn optimizer_proposes_parents_that_group_exactly_k_leaves() {
+        let db = fresh_db().await;
+        let dim = TableHash { hash: 15 };
+        let ctx = PeerContext {
+            peer_id: UuidBytes::new(),
+        };
+
+        // Build 9 leaves in [0..9), local root points to all
+        let (_root, _leaves) = build_linear_leaves_with_root(&db, ctx.peer_id, dim, 9, 0).await;
+
+        // Scorer tuned for k = 3 children per parent; replication disabled
+        let scorer = ServerScorer::new(ServerScorerParams {
+            rent: 0.25,
+            child_target: 3,
+            child_weight: 2.0,
+            replication_target: 0,
+            replication_weight: 0.0,
+        });
+
+        // Optimizer setup
+        let opt = BasicOptimizer::new(Box::new(scorer), ctx.clone()).with_caps(Caps {
+            eps: 0.0,
+            max_variants_per_draft: 128,
+            depth: 2,
+            beam_width: 16,
+        });
+
+        // Seed with a small leaf window; beam can promote and expand.
+        let seed = AvailabilityDraft {
+            level: 0,
+            range: cube(dim, &[2], &[3]),
+            complete: true,
+        };
+
+        let txn = db.begin_read_txn().unwrap();
+        let plan = opt.propose(&db, &txn, &[seed]).await.unwrap().unwrap();
+
+        // Keep only INSERTs at level >= 1; they are prospective parents
+        let parents: Vec<_> = plan
+            .iter()
+            .filter_map(|a| match a {
+                Action::Insert(d) if d.level >= 1 => Some(d.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            !parents.is_empty(),
+            "expected the optimizer to propose parent inserts"
+        );
+
+        // Verify at least one proposed parent covers exactly 3 real leaves.
+        // And there should be no deletes (we don't delete local data).
+        let all_actions_ok = !plan.iter().any(|a| matches!(a, Action::Delete(_)));
+        assert!(all_actions_ok, "plan should not delete local data");
+
+        // Count underlying *real* leaves per proposed parent
+        let mut found_k = false;
+        for p in parents {
+            // Count leaves contained in p.range via scorer's local child counter
+            let sc = ServerScorer::new(params(3));
+            let cnt = sc
+                .child_count_local(&db, &txn, &ctx, &p, &vec![])
+                .await
+                .unwrap();
+            if cnt == 3 {
+                found_k = true;
+                break;
+            }
+        }
+        assert!(found_k, "at least one parent must group exactly 3 leaves");
+    }
+
+    #[tokio::test]
+    async fn iterative_planning_covers_all_leaves_in_k_sized_parents() {
+        let db = fresh_db().await;
+        let dim = TableHash { hash: 16 };
+        let ctx = PeerContext {
+            peer_id: UuidBytes::new(),
+        };
+
+        // 12 leaves, expect ~4 parents of size 3 each in ideal grouping.
+        let (_root, _leaves) = build_linear_leaves_with_root(&db, ctx.peer_id, dim, 12, 40).await;
+
+        let scorer = ServerScorer::new(ServerScorerParams {
+            rent: 0.25,
+            child_target: 3,
+            child_weight: 2.0,
+            replication_target: 0,
+            replication_weight: 0.0,
+        });
+
+        let opt = BasicOptimizer::new(Box::new(scorer), ctx.clone()).with_caps(Caps {
+            eps: 0.0,
+            max_variants_per_draft: 256,
+            depth: 2,
+            beam_width: 16,
+        });
+
+        let txn = db.begin_read_txn().unwrap();
+
+        // Iterate seeds across the space to encourage coverage
+        let mut seeds: Vec<AvailabilityDraft> = vec![
+            draft(0, &cube(dim, &[40], &[41])),
+            draft(0, &cube(dim, &[43], &[44])),
+            draft(0, &cube(dim, &[46], &[47])),
+            draft(0, &cube(dim, &[49], &[50])),
+        ];
+
+        let mut parents: Vec<AvailabilityDraft> = Vec::new();
+        for _round in 0..3 {
+            if let Some(plan) = opt.propose(&db, &txn, &seeds).await.unwrap() {
+                // Accept only INSERT parents; record them as seeds for the next round (to allow promotions)
+                for a in plan {
+                    if let Action::Insert(d) = a {
+                        if d.level >= 1 && !parents.iter().any(|p| p.range == d.range) {
+                            parents.push(d.clone());
+                        }
+                    }
+                }
+            }
+            // Next round: reseed around gaps (shift right)
+            seeds = seeds
+                .iter()
+                .map(|s| {
+                    let mut lo = s.range.mins[0].clone();
+                    let mut hi = s.range.maxs[0].clone();
+                    if !lo.is_empty() {
+                        lo[0] = lo[0].saturating_add(3);
+                    }
+                    if !hi.is_empty() {
+                        hi[0] = hi[0].saturating_add(3);
+                    }
+                    draft(0, &cube(dim, &lo, &hi))
+                })
+                .collect();
+        }
+
+        // For every parent found, count underlying leaves; accept either 2–4 as “near k”
+        // (beam search may align boundaries conservatively), but require that **at least three**
+        // parents hit exactly k=3.
+        let sc_check = ServerScorer::new(params(3));
+        let mut exact_k = 0usize;
+        for p in &parents {
+            let cnt = sc_check
+                .child_count_local(&db, &txn, &ctx, p, &vec![])
+                .await
+                .unwrap();
+            assert!(
+                (2..=4).contains(&cnt),
+                "parent should not be wildly off target; got {cnt}"
+            );
+            if cnt == 3 {
+                exact_k += 1;
+            }
+        }
+        assert!(
+            exact_k >= 3,
+            "expected at least 3 parents to capture exactly k=3 leaves; got {exact_k}"
+        );
     }
 }

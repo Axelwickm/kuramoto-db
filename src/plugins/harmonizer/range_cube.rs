@@ -6,7 +6,7 @@ use smallvec::SmallVec;
 use crate::tables::TableHash;
 
 /// Axis-aligned cube over ≤4 dimensions (hash-ids)
-#[derive(Clone, Debug, Encode, Decode)]
+#[derive(Clone, Debug, Eq, PartialEq, Encode, Decode)]
 pub struct RangeCube {
     pub dims: SmallVec<[TableHash; 4]>, // which index tables participate
     pub mins: SmallVec<[Vec<u8>; 4]>,   // same order as dims
