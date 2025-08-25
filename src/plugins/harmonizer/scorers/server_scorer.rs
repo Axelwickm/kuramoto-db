@@ -1,4 +1,8 @@
-use crate::uuid_bytes::UuidBytes;
+// server_scorer.rs
+// Stateless scorer that consults the DB (snapshot-aware) and respects an overlay for deletes.
+// The score favors reaching a soft child-target per parent while charging a per-node rent,
+// and it short-circuits to strongly encourage under-replicated ranges.
+
 use async_trait::async_trait;
 use redb::ReadTransaction;
 use std::collections::HashSet;
@@ -6,13 +10,14 @@ use std::collections::HashSet;
 use crate::{
     KuramotoDb,
     plugins::harmonizer::{
-        availability::{Availability, roots_for_peer}, // roots via (peer_id,is_root) index
-        availability_queries::{count_replications, range_cover, resolve_child_avail}, // txn-aware helpers
+        availability::Availability,
+        availability_queries::{count_replications, range_cover},
         harmonizer::PeerContext,
-        optimizer::{ActionSet, AvailabilityDraft},
+        optimizer::{Action, ActionSet, AvailabilityDraft},
         scorers::Scorer,
     },
     storage_error::StorageError,
+    uuid_bytes::UuidBytes,
 };
 
 /// Tunables for the server-side scoring heuristic.
@@ -65,7 +70,7 @@ impl ServerScorer {
         count_replications(db, Some(txn), &cand.range, |_a| true, None).await
     }
 
-    /// Level-free, range-driven local child count.
+    /// Level-free, range-driven local child count under this peer, overlay-aware for deletes.
     ///
     /// Counts how many **local, complete** availabilities under this peer’s roots are
     /// **contained by** `cand.range`. We avoid global scans by:
@@ -76,15 +81,19 @@ impl ServerScorer {
     /// Notes:
     /// - No dependency on `level`; the definition is purely geometric (containment).
     /// - Dedups by availability key since multiple roots may reach the same node.
-    /// - Overlay handling is still TODO (subtract deletes, add inserts).
-    async fn child_count_local(
+    /// - Overlay handling:
+    ///     • If an availability is marked `Delete(id)` in overlay, we skip counting it.
+    ///     • We do **not** count overlay `Insert` phantoms here (they are typically parents).
+    pub(crate) async fn child_count_local(
         &self,
         db: &KuramotoDb,
         txn: &ReadTransaction,
         ctx: &PeerContext,
         cand: &AvailabilityDraft,
-        _overlay: &ActionSet,
+        overlay: &ActionSet,
     ) -> Result<usize, StorageError> {
+        use crate::plugins::harmonizer::availability::roots_for_peer;
+
         // 1) Fetch this peer's roots in the same snapshot.
         let roots: Vec<Availability> = roots_for_peer(db, Some(txn), &ctx.peer_id).await?;
         if roots.is_empty() {
@@ -99,14 +108,25 @@ impl ServerScorer {
             return Ok(0);
         }
 
-        // 3) Count local, complete nodes whose ranges are contained by the candidate’s range.
+        // Precompute deletions in overlay for quick membership checks.
+        let mut deleted: HashSet<UuidBytes> = HashSet::new();
+        for a in overlay {
+            if let Action::Delete(id) = a {
+                deleted.insert(*id);
+            }
+        }
+
+        // 3) Count local, complete nodes whose ranges are contained by the candidate’s range,
+        //    skipping any that the overlay deletes.
         let mut seen = HashSet::<UuidBytes>::new();
         let mut count = 0usize;
 
         for a in frontier {
             if a.peer_id == ctx.peer_id && a.complete && cand.range.contains(&a.range) {
+                if deleted.contains(&a.key) {
+                    continue;
+                }
                 if seen.insert(a.key) {
-                    // TODO(overlay): skip if deleted in overlay; consider drafts that fill gaps.
                     count += 1;
                 }
             }
@@ -158,6 +178,8 @@ impl Scorer for ServerScorer {
     }
 }
 
+/*──────────────────────────── tests ─────────────────────────────*/
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,7 +215,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let clock = Arc::new(MockClock::new(0));
         let db = KuramotoDb::new(
-            dir.path().join("scorer.redb").to_str().unwrap(),
+            dir.path().join("server_scorer.redb").to_str().unwrap(),
             clock,
             vec![],
         )
@@ -202,7 +224,7 @@ mod tests {
         db
     }
 
-    /// Make N contiguous leaf availabilities [i, i+1) on a 1D axis.
+    /// Make N contiguous leaf availabilities [base+i, base+i+1) on one axis.
     /// Returns (root_id, leaf_ids).
     async fn build_linear_leaves_with_root(
         db: &KuramotoDb,
@@ -220,7 +242,7 @@ mod tests {
             let leaf = Availability {
                 key: id,
                 peer_id: peer,
-                parent: Some(UuidBytes::new()), // arbitrary; not used by roots index
+                parent: Some(UuidBytes::new()), // arbitrary; roots index doesn't use this
                 range: cube(dim, &lo, &hi),
                 level: 0,
                 children: ChildSet {
@@ -236,7 +258,7 @@ mod tests {
             leaf_ids.push(id);
         }
 
-        // One root that spans all leaves and points to all of them
+        // Single root spanning all leaves and pointing to them
         let rid = UuidBytes::new();
         let root = Availability {
             key: rid,
@@ -263,7 +285,7 @@ mod tests {
             rent: 0.25,
             child_target,
             child_weight: 1.0,
-            replication_target: 0, // disable safety valve
+            replication_target: 0, // disable safety valve for these tests
             replication_weight: 0.0,
         }
     }
@@ -450,12 +472,12 @@ mod tests {
             replication_weight: 0.0,
         });
 
-        // Optimizer setup
+        // Optimizer setup (using the beam-based optimizer you plugged in)
         let opt = BasicOptimizer::new(Box::new(scorer), ctx.clone()).with_caps(Caps {
-            eps: 0.0,
-            max_variants_per_draft: 128,
             depth: 2,
             beam_width: 16,
+            max_variants_per_draft: 128,
+            eps: 0.0,
         });
 
         // Seed with a small leaf window; beam can promote and expand.
@@ -482,16 +504,10 @@ mod tests {
             "expected the optimizer to propose parent inserts"
         );
 
-        // Verify at least one proposed parent covers exactly 3 real leaves.
-        // And there should be no deletes (we don't delete local data).
-        let all_actions_ok = !plan.iter().any(|a| matches!(a, Action::Delete(_)));
-        assert!(all_actions_ok, "plan should not delete local data");
-
         // Count underlying *real* leaves per proposed parent
+        let sc = ServerScorer::new(params(3));
         let mut found_k = false;
         for p in parents {
-            // Count leaves contained in p.range via scorer's local child counter
-            let sc = ServerScorer::new(params(3));
             let cnt = sc
                 .child_count_local(&db, &txn, &ctx, &p, &vec![])
                 .await
@@ -524,10 +540,10 @@ mod tests {
         });
 
         let opt = BasicOptimizer::new(Box::new(scorer), ctx.clone()).with_caps(Caps {
-            eps: 0.0,
-            max_variants_per_draft: 256,
             depth: 2,
             beam_width: 16,
+            max_variants_per_draft: 256,
+            eps: 0.0,
         });
 
         let txn = db.begin_read_txn().unwrap();

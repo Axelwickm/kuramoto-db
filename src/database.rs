@@ -14,6 +14,7 @@ use std::{
 
 use crate::plugins::Plugin;
 use crate::storage_entity::IndexCardinality;
+use crate::tables::TableHash;
 
 use super::{
     clock::Clock, meta::BlobMeta, region_lock::RegionLock, storage_entity::StorageEntity,
@@ -94,6 +95,8 @@ pub struct KuramotoDb {
     plugins: Vec<Arc<dyn Plugin>>,
 
     entity_putters: RwLock<HashMap<String, Arc<TablePutFn>>>,
+    data_table_by_hash: RwLock<HashMap<u64, StaticTableDef>>,
+    index_table_by_hash: RwLock<HashMap<u64, (StaticTableDef, StaticTableDef)>>,
 }
 
 impl KuramotoDb {
@@ -111,6 +114,8 @@ impl KuramotoDb {
             write_tx,
             clock,
             plugins,
+            data_table_by_hash: RwLock::new(HashMap::new()),
+            index_table_by_hash: RwLock::new(HashMap::new()),
             entity_putters: RwLock::new(HashMap::new()),
         });
 
@@ -144,6 +149,21 @@ impl KuramotoDb {
             );
         }
         {
+            // Pk table Hashes
+            let dh = TableHash::from(E::table_def()).hash();
+            self.data_table_by_hash
+                .write()
+                .unwrap()
+                .insert(dh, E::table_def());
+            for idx in E::indexes() {
+                let ih = TableHash::from(idx.table_def).hash();
+                self.index_table_by_hash
+                    .write()
+                    .unwrap()
+                    .insert(ih, (idx.table_def, E::table_def()));
+            }
+        }
+        {
             // Create the table
             let txn = self
                 .db
@@ -169,6 +189,67 @@ impl KuramotoDb {
     // Getters/setters
     pub fn get_clock(&self) -> Arc<dyn Clock> {
         self.clock.clone()
+    }
+
+    pub fn resolve_data_table_by_hash(&self, h: u64) -> Option<StaticTableDef> {
+        self.data_table_by_hash.read().unwrap().get(&h).copied()
+    }
+    pub fn resolve_index_table_by_hash(&self, h: u64) -> Option<(StaticTableDef, StaticTableDef)> {
+        self.index_table_by_hash.read().unwrap().get(&h).copied()
+    }
+
+    pub async fn collect_pks_in_data_range_tx(
+        &self,
+        txn: Option<&ReadTransaction>,
+        table: StaticTableDef,
+        start: &[u8],
+        end: &[u8],
+        limit: Option<usize>,
+    ) -> Result<Vec<Vec<u8>>, StorageError> {
+        self.with_read(txn, |rt| {
+            let t = rt
+                .open_table(table.clone())
+                .map_err(|e| StorageError::Other(e.to_string()))?;
+            let mut out = Vec::new();
+            for row in t
+                .range(start..end)
+                .map_err(|e| StorageError::Other(e.to_string()))?
+            {
+                let (k, _v) = row.map_err(|e| StorageError::Other(e.to_string()))?;
+                out.push(k.value().to_vec()); // PK from key
+                if limit.map_or(false, |n| out.len() >= n) {
+                    break;
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    pub async fn collect_pks_in_index_range_tx(
+        &self,
+        txn: Option<&ReadTransaction>,
+        index_table: StaticTableDef,
+        start: &[u8],
+        end: &[u8],
+        limit: Option<usize>,
+    ) -> Result<Vec<Vec<u8>>, StorageError> {
+        self.with_read(txn, |rt| {
+            let t = rt
+                .open_table(index_table.clone())
+                .map_err(|e| StorageError::Other(e.to_string()))?;
+            let mut out = Vec::new();
+            for row in t
+                .range(start..end)
+                .map_err(|e| StorageError::Other(e.to_string()))?
+            {
+                let (_k, v) = row.map_err(|e| StorageError::Other(e.to_string()))?;
+                out.push(v.value().to_vec()); // PK from value
+                if limit.map_or(false, |n| out.len() >= n) {
+                    break;
+                }
+            }
+            Ok(out)
+        })
     }
 
     #[inline]
@@ -1687,7 +1768,171 @@ mod tests {
         }
     }
 
-    // ───────── NEW TESTS FOR SNAPSHOT SEMANTICS + LIMITS ─────────
+    #[tokio::test]
+    async fn registry_resolves_tablehashes() {
+        use crate::tables::TableHash;
+
+        let dir = tempfile::tempdir().unwrap();
+        let clock = Arc::new(MockClock::new(0));
+        let db =
+            KuramotoDb::new(dir.path().join("reg.redb").to_str().unwrap(), clock, vec![]).await;
+
+        // Register tables/indexes for TestEntity
+        db.create_table_and_indexes::<TestEntity>().unwrap();
+
+        // Data-table hash resolves back to the TestEntity main table
+        let data_h = TableHash::from(TestEntity::table_def()).hash();
+        let got_data = db
+            .resolve_data_table_by_hash(data_h)
+            .expect("data table hash should resolve");
+        assert_eq!(got_data.name(), TestEntity::table_def().name());
+
+        // Unique index hash resolves to (that index, parent data table)
+        let name_idx_h = TableHash::from(&TEST_NAME_INDEX).hash();
+        let (idx_tbl, parent_tbl) = db
+            .resolve_index_table_by_hash(name_idx_h)
+            .expect("unique index hash should resolve");
+        assert_eq!(idx_tbl.name(), TEST_NAME_INDEX.name());
+        assert_eq!(parent_tbl.name(), TestEntity::table_def().name());
+
+        // Non-unique index hash resolves as well
+        let value_idx_h = TableHash::from(&TEST_VALUE_INDEX).hash();
+        let (idx_tbl2, parent_tbl2) = db
+            .resolve_index_table_by_hash(value_idx_h)
+            .expect("non-unique index hash should resolve");
+        assert_eq!(idx_tbl2.name(), TEST_VALUE_INDEX.name());
+        assert_eq!(parent_tbl2.name(), TestEntity::table_def().name());
+    }
+
+    #[tokio::test]
+    async fn raw_pk_collectors_work_and_respect_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = Arc::new(MockClock::new(0));
+        let db = KuramotoDb::new(
+            dir.path().join("rawpk.redb").to_str().unwrap(),
+            clock,
+            vec![],
+        )
+        .await;
+        db.create_table_and_indexes::<TestEntity>().unwrap();
+
+        // Seed a few rows: ids 1..=3, names A,B,C
+        for (id, name) in [(1u64, "A"), (2, "B"), (3, "C")] {
+            db.put(TestEntity {
+                id,
+                name: name.into(),
+                value: 0,
+            })
+            .await
+            .unwrap();
+        }
+
+        // ---- collect_pks_in_data_range_tx over PK range [1,4) ----
+        let pks = db
+            .collect_pks_in_data_range_tx(
+                None,
+                TestEntity::table_def(),
+                &1u64.to_be_bytes(),
+                &4u64.to_be_bytes(),
+                None,
+            )
+            .await
+            .unwrap();
+        let ids: Vec<u64> = pks
+            .into_iter()
+            .map(|k| u64::from_be_bytes(k.as_slice().try_into().unwrap()))
+            .collect();
+        assert_eq!(ids, vec![1, 2, 3], "data PK range should return 1..=3");
+
+        // ---- collect_pks_in_index_range_tx on UNIQUE name index, with limit=2 ----
+        let pks2 = db
+            .collect_pks_in_index_range_tx(None, &TEST_NAME_INDEX, b"A", b"Z", Some(2))
+            .await
+            .unwrap();
+        let ids2: Vec<u64> = pks2
+            .into_iter()
+            .map(|k| u64::from_be_bytes(k.as_slice().try_into().unwrap()))
+            .collect();
+        assert_eq!(ids2.len(), 2, "limit should cap the number of PKs");
+        // Names are A,B → PKs 1,2 (since we inserted in matching order)
+        assert_eq!(ids2, vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn raw_pk_collectors_respect_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = Arc::new(MockClock::new(0));
+        let db = KuramotoDb::new(
+            dir.path().join("rawsnap.redb").to_str().unwrap(),
+            clock,
+            vec![],
+        )
+        .await;
+        db.create_table_and_indexes::<TestEntity>().unwrap();
+
+        // Seed two rows
+        db.put(TestEntity {
+            id: 1,
+            name: "A".into(),
+            value: 0,
+        })
+        .await
+        .unwrap();
+        db.put(TestEntity {
+            id: 2,
+            name: "B".into(),
+            value: 0,
+        })
+        .await
+        .unwrap();
+
+        // Take a snapshot
+        let snap = db.begin_read_txn().unwrap();
+
+        // Add a third row after the snapshot
+        db.put(TestEntity {
+            id: 3,
+            name: "C".into(),
+            value: 0,
+        })
+        .await
+        .unwrap();
+
+        // Data-table collector through the snapshot → sees only ids 1,2
+        let snap_pks = db
+            .collect_pks_in_data_range_tx(
+                Some(&snap),
+                TestEntity::table_def(),
+                &1u64.to_be_bytes(),
+                &4u64.to_be_bytes(),
+                None,
+            )
+            .await
+            .unwrap();
+        let snap_ids: Vec<u64> = snap_pks
+            .into_iter()
+            .map(|k| u64::from_be_bytes(k.as_slice().try_into().unwrap()))
+            .collect();
+        assert_eq!(
+            snap_ids,
+            vec![1, 2],
+            "snapshot should not see post-snapshot rows"
+        );
+
+        // Index collector through the snapshot → names A..Z → only A,B
+        let snap_idx_pks = db
+            .collect_pks_in_index_range_tx(Some(&snap), &TEST_NAME_INDEX, b"A", b"Z", None)
+            .await
+            .unwrap();
+        assert_eq!(snap_idx_pks.len(), 2);
+
+        // Fresh read (no txn) should see all three now
+        let now_idx_pks = db
+            .collect_pks_in_index_range_tx(None, &TEST_NAME_INDEX, b"A", b"Z", None)
+            .await
+            .unwrap();
+        assert_eq!(now_idx_pks.len(), 3);
+    }
 
     #[tokio::test]
     async fn get_data_tx_respects_snapshot() {

@@ -1,30 +1,41 @@
-//! Optimizer: beam-search look-ahead over additive mutations
-//! ---------------------------------------------------------
-//! - No Overlay type. The API is propose(&db, &[AvailabilityDraft]) -> ActionSet.
-//! - Uses the generic BeamSearch (depth/beam configurable) where **AvailabilityDraft is the State**.
-//! - Candidate generation is *additive on bytes-as-big-endian integers*:
-//!     min  ← min  - step        (expand left)
-//!     max  ← max  + step        (expand right)
-//!     both ← (min - step, max + step)
-//!   with `step` tried from {1, EMA, 10*EMA} (deduped; EMA is a moving average you can tune).
-//! - We always include **promotion** variants (level+1) for each candidate.
-//! - After beam planning INSERTs, we run a **delete pass**: scan DB for same-peer parents
-//!   (level ≥ 1) overlapping any seed draft; if their standalone score < 0, propose Delete.
-//! - Deterministic: no randomness in enumeration or selection.
+//! optimizer.rs
+//! Beam-search planner that mutates ranges and scores against an overlay view.
+//!
+//! Key points:
+//! - Public API is unchanged: `propose(&db, &txn, &[AvailabilityDraft]) -> Option<ActionSet>`
+//! - Planning **state** = `{ focus draft, overlay }`, where overlay is a de-duped list of
+//!   `Action::{Insert,Delete}`. We *do not* write to the DB during planning.
+//! - Candidate generation enumerates **range mutations** (±Δ on min/max per axis, and grow-both),
+//!   plus a promotion variant (level+1). Δ comes from a fixed step ladder.
+//! - Evaluator builds an **effective overlay** per state by conditionally including the focus
+//!   insert only if it would actually adopt at least one local child (range->children via roots).
+//! - Scoring is done by the provided `Scorer` against that effective overlay.
+//! - No domain-y post passes: pruning empty nodes happens at commit time.
+//!
+//! This file intentionally relies on `RangeCube` operations (`overlaps`, `contains`, `intersect`)
+//! instead of re-implementing geometry checks here.
 
 use async_trait::async_trait;
 use redb::ReadTransaction;
 
-use crate::plugins::harmonizer::availability::Availability;
-use crate::plugins::harmonizer::harmonizer::PeerContext;
-use crate::plugins::harmonizer::range_cube::RangeCube;
-use crate::plugins::harmonizer::scorers::Scorer;
-use crate::plugins::harmonizer::search::beam::{BeamConfig, BeamSearch};
-use crate::plugins::harmonizer::search::{CandidateGen, Evaluator, SearchAlgorithm, State};
-use crate::uuid_bytes::UuidBytes;
-use crate::{KuramotoDb, storage_error::StorageError};
+use crate::{
+    KuramotoDb,
+    plugins::harmonizer::{
+        availability::Availability,
+        availability_queries::local_child_count_under_peer,
+        harmonizer::PeerContext,
+        range_cube::RangeCube,
+        scorers::Scorer,
+        search::{
+            CandidateGen, Evaluator, SearchAlgorithm, State,
+            beam::{BeamConfig, BeamSearch},
+        },
+    },
+    storage_error::StorageError,
+    uuid_bytes::UuidBytes,
+};
 
-/*──────────────────────── Context & core types ───────────────────────*/
+/*──────────────────── drafts & actions (public) ───────────────────*/
 
 #[derive(Debug, Clone)]
 pub struct AvailabilityDraft {
@@ -32,10 +43,9 @@ pub struct AvailabilityDraft {
     pub range: RangeCube,
     pub complete: bool,
 }
-
 impl From<&Availability> for AvailabilityDraft {
     fn from(a: &Availability) -> Self {
-        AvailabilityDraft {
+        Self {
             level: a.level,
             range: a.range.clone(),
             complete: a.complete,
@@ -48,99 +58,93 @@ pub enum Action {
     Insert(AvailabilityDraft),
     Delete(UuidBytes),
 }
-
 pub type ActionSet = Vec<Action>;
 
-/*──────────────────────── Config & Momentum ──────────────────────────*/
+/*──────────────────────── config ──────────────────────────────*/
 
 #[derive(Debug, Clone, Copy)]
 pub struct Caps {
-    /// minimum improvement threshold
-    pub eps: f32,
-    /// cap total variants per draft per enumeration
-    pub max_variants_per_draft: usize,
     /// beam search depth (look-ahead)
     pub depth: usize,
     /// beam width
     pub beam_width: usize,
+    /// cap total variants per expansion
+    pub max_variants_per_draft: usize,
+    /// minimum improvement threshold (passed to beam)
+    pub eps: f32,
 }
 impl Default for Caps {
     fn default() -> Self {
         Self {
-            eps: 0.0,
-            max_variants_per_draft: 64,
             depth: 2,
-            beam_width: 8,
+            beam_width: 12,
+            max_variants_per_draft: 96,
+            eps: 0.0,
         }
     }
 }
 
-/// Simple momentum over **step size** (EMA in “lex distance” units).
-#[derive(Clone, Debug)]
-pub struct Momentum {
-    pub ema: f64,   // current moving average step
-    pub alpha: f64, // smoothing factor (0,1]
-}
-impl Default for Momentum {
-    fn default() -> Self {
-        Self {
-            ema: 1.0,
-            alpha: 0.5,
-        }
-    }
-}
-
-/*──────────────────────── Optimizer trait ────────────────────────────*/
+/*──────────────────────── Optimizer trait ─────────────────────*/
 
 #[async_trait]
 pub trait Optimizer: Send + Sync {
     async fn propose(
         &self,
         db: &KuramotoDb,
-        tx: &ReadTransaction,
-        drafts: &[AvailabilityDraft],
+        txn: &ReadTransaction,
+        seeds: &[AvailabilityDraft],
     ) -> Result<Option<ActionSet>, StorageError>;
 }
 
-/*──────────────────────── State impl for AvailabilityDraft ───────────*/
+/*──────────────────────── Planning state ──────────────────────*/
 
-impl State for AvailabilityDraft {
-    type Action = Action;
-
-    /// Applying an INSERT returns that draft (next state).
-    /// DELETE does not change the draft state (handled in a separate pass).
-    fn apply(&self, action: &Self::Action) -> Self {
-        match action {
-            Action::Insert(d) => d.clone(),
-            Action::Delete(_) => self.clone(),
+#[derive(Debug, Clone)]
+struct PlanState {
+    /// The node we are currently mutating (range & level only).
+    focus: AvailabilityDraft,
+    /// The **material plan** so far (deduped Inserts/Deletes).
+    overlay: ActionSet,
+}
+impl PlanState {
+    fn new(seed: AvailabilityDraft) -> Self {
+        Self {
+            focus: seed,
+            overlay: Vec::new(),
         }
     }
 }
+impl State for PlanState {
+    type Action = Action;
 
-/*──────────────────────── BasicOptimizer (beam by default) ───────────*/
+    fn apply(&self, a: &Self::Action) -> Self {
+        let mut next = self.clone();
+        match a {
+            Action::Insert(d) => {
+                next.focus = d.clone();
+            }
+            Action::Delete(id) => push_delete(&mut next.overlay, *id),
+        }
+        next
+    }
+}
+
+/*──────────────────────── Basic optimizer ─────────────────────*/
 
 pub struct BasicOptimizer {
     pub scorer: Box<dyn Scorer>,
     pub ctx: PeerContext,
     pub caps: Caps,
-    pub momentum: Momentum,
 }
-
 impl BasicOptimizer {
     pub fn new(scorer: Box<dyn Scorer>, ctx: PeerContext) -> Self {
         Self {
             scorer,
             ctx,
             caps: Caps::default(),
-            momentum: Momentum::default(),
         }
     }
     pub fn with_caps(mut self, caps: Caps) -> Self {
         self.caps = caps;
-        self
-    }
-    pub fn with_momentum(mut self, m: Momentum) -> Self {
-        self.momentum = m;
         self
     }
 }
@@ -153,144 +157,145 @@ impl Optimizer for BasicOptimizer {
         txn: &ReadTransaction,
         seeds: &[AvailabilityDraft],
     ) -> Result<Option<ActionSet>, StorageError> {
-        let seeds: Vec<AvailabilityDraft> = seeds
+        // Filter obviously invalid seeds (empty range)
+        let seeds: Vec<_> = seeds
             .iter()
             .cloned()
             .filter(|d| !range_is_empty(&d.range))
             .collect();
-
-        println!(
-            "opt.start: seeds={} depth={} beam={} eps={:.3} ema={:.3}",
-            seeds.len(),
-            self.caps.depth,
-            self.caps.beam_width,
-            self.caps.eps,
-            self.momentum.ema
-        );
-
         if seeds.is_empty() {
-            println!("opt.stop: no non-empty seeds");
             return Ok(None);
         }
 
-        // Step magnitudes to explore for additive mutations.
-        let step_base = self.momentum.ema.max(1.0).round() as u128;
-        let mut step_candidates: Vec<u128> = vec![
-            1,
-            2,
-            3,
-            step_base,
-            step_base.saturating_mul(2),
-            step_base.saturating_mul(10),
-        ];
-        step_candidates.sort_unstable();
-        step_candidates.dedup();
+        let cfg = BeamConfig {
+            depth: self.caps.depth,
+            beam_width: self.caps.beam_width,
+            eps: self.caps.eps,
+            max_evals: 0, // unlimited
+            ..Default::default()
+        };
 
-        // Per-seed beam plan; then we merge/dedupe.
-        let mut plan: ActionSet = Vec::new();
+        let mut merged: ActionSet = Vec::new();
 
-        for (i, seed) in seeds.iter().enumerate() {
-            println!(
-                "opt.seed[{}]: lvl={} mins0={:?} maxs0={:?}",
-                i,
-                seed.level,
-                seed.range.mins.get(0).cloned().unwrap_or_default(),
-                seed.range.maxs.get(0).cloned().unwrap_or_default()
-            );
+        let mut search = BeamSearch::new(cfg);
 
-            let g = DraftCandidateGen {
-                caps: self.caps,
-                steps: &step_candidates,
-                ctx: &self.ctx,
-            };
-            let eval = DraftEvaluator {
+        for seed in seeds {
+            let start = PlanState::new(seed.clone());
+            let g = PlannerGen { caps: self.caps };
+            let eval = PlannerEval {
                 db,
                 txn,
-                scorer: &*self.scorer,
                 ctx: &self.ctx,
+                scorer: &*self.scorer,
             };
 
-            let mut search = BeamSearch::new(BeamConfig {
-                depth: self.caps.depth,
-                beam_width: self.caps.beam_width,
-                eps: self.caps.eps,
-                max_evals: 0, // unlimited in this MVP
-            });
+            let Some(path) = search.propose_step(&start, &g, &eval).await else {
+                continue;
+            };
 
-            if let Some(seq) = search.propose_step(seed, &g, &eval).await {
-                println!("opt.seed[{}]: beam proposed {} actions", i, seq.len());
-                for (k, a) in seq.iter().enumerate() {
-                    match a {
-                        Action::Insert(d) => println!(
-                            "  plan[{}].{} INSERT lvl={} min0={:?} max0={:?}",
-                            i,
-                            k,
-                            d.level,
-                            d.range.mins.get(0).cloned().unwrap_or_default(),
-                            d.range.maxs.get(0).cloned().unwrap_or_default()
-                        ),
-                        Action::Delete(id) => println!("  plan[{}].{} DELETE id={:?}", i, k, id),
-                    }
+            // Build final state's overlay and merge deterministically.
+            let mut st = start.clone();
+            for a in &path {
+                st = st.apply(a);
+            }
+
+            // 1) For scoring we used effective_overlay (adoption-aware).
+            // 2) For the returned plan, always include the beam’s final focus draft.
+            //    Commit-time pruning will drop empty/non-adopting parents later.
+            push_insert(&mut merged, st.focus.clone());
+            for a in st.overlay {
+                if let Action::Delete(id) = a {
+                    push_delete(&mut merged, id);
                 }
-                // Only keep INSERTs that are not duplicate of previously kept ones.
-                for a in seq {
-                    if let Action::Insert(ref d) = a {
-                        if contains_insert(&plan, d) {
-                            continue;
-                        }
-                    }
-                    plan.push(a);
-                }
-            } else {
-                println!("opt.seed[{}]: beam returned None (no improving seq)", i);
             }
         }
 
-        // Post-pass: propose deletes for negative parents overlapping any seed.
-        let mut deletes =
-            propose_negative_parent_deletes(db, txn, &self.ctx, &*self.scorer, &seeds).await?;
-        if !deletes.is_empty() {
-            println!("opt.delete_pass: proposing {} deletes", deletes.len());
-            plan.append(&mut deletes);
-        }
-
-        if plan.is_empty() {
+        if merged.is_empty() {
             Ok(None)
         } else {
-            Ok(Some(plan))
+            Ok(Some(merged))
         }
     }
 }
 
-/*──────────────────────── Candidate generator & evaluator ───────────*/
+/*──────────────────────── Candidate generator ─────────────────*/
 
-struct DraftCandidateGen<'a> {
+struct PlannerGen {
     caps: Caps,
-    steps: &'a [u128],
-    ctx: &'a PeerContext,
 }
+impl CandidateGen<PlanState> for PlannerGen {
+    fn candidates(&self, s: &PlanState) -> Vec<Action> {
+        let steps = step_ladder();
+        println!("Step ladder steps {}", steps.len());
+        let d = s.focus.range.mins.len().min(s.focus.range.maxs.len());
+        let mut out: Vec<Action> = Vec::with_capacity(self.caps.max_variants_per_draft);
 
-impl<'a> CandidateGen<AvailabilityDraft> for DraftCandidateGen<'a> {
-    fn candidates(&self, s: &AvailabilityDraft) -> Vec<Action> {
-        // INSERT candidates from additive enumeration (with promotions).
-        let mut out: Vec<Action> = Vec::new();
-        for c in enumerate_additive_mutations(s, self.steps, self.caps) {
-            if !range_is_empty(&c.draft.range) {
-                out.push(Action::Insert(c.draft));
+        // Identity
+        out.push(Action::Insert(s.focus.clone()));
+        // Promotion (same geometry, higher level)
+        out.push(Action::Insert(AvailabilityDraft {
+            level: s.focus.level.saturating_add(1),
+            range: s.focus.range.clone(),
+            complete: true,
+        }));
+
+        for &st in &steps {
+            for ax in 0..d {
+                // min -= Δ
+                if let Some(min2) = be_add_signed(&s.focus.range.mins[ax], -(st as i128)) {
+                    let mut r = s.focus.range.clone();
+                    r.mins[ax] = min2;
+                    if !range_is_empty(&r) {
+                        out.push(Action::Insert(AvailabilityDraft {
+                            level: s.focus.level,
+                            range: r.clone(),
+                            complete: true,
+                        }));
+                    }
+                }
+                // max += Δ
+                if let Some(max2) = be_add_signed(&s.focus.range.maxs[ax], st as i128) {
+                    let mut r = s.focus.range.clone();
+                    r.maxs[ax] = max2;
+                    if !range_is_empty(&r) {
+                        out.push(Action::Insert(AvailabilityDraft {
+                            level: s.focus.level,
+                            range: r.clone(),
+                            complete: true,
+                        }));
+                    }
+                }
+                // grow both
+                if let (Some(min2), Some(max2)) = (
+                    be_add_signed(&s.focus.range.mins[ax], -(st as i128)),
+                    be_add_signed(&s.focus.range.maxs[ax], st as i128),
+                ) {
+                    let mut r = s.focus.range.clone();
+                    r.mins[ax] = min2;
+                    r.maxs[ax] = max2;
+                    if !range_is_empty(&r) {
+                        out.push(Action::Insert(AvailabilityDraft {
+                            level: s.focus.level,
+                            range: r.clone(),
+                            complete: true,
+                        }));
+                    }
+                }
+            }
+            if out.len() >= self.caps.max_variants_per_draft {
+                break;
             }
         }
 
-        // Dedupe & cap
+        // De-dup by (level, range, complete), capped
         let mut uniq: ActionSet = Vec::with_capacity(out.len());
         for a in out.into_iter() {
-            match &a {
-                Action::Insert(d) => {
-                    if !contains_insert(&uniq, d) {
-                        uniq.push(a);
-                    }
+            if let Action::Insert(ref d) = a {
+                if contains_insert(&uniq, d) {
+                    continue;
                 }
-                Action::Delete(_) => {}
             }
+            uniq.push(a);
             if uniq.len() >= self.caps.max_variants_per_draft {
                 break;
             }
@@ -299,228 +304,117 @@ impl<'a> CandidateGen<AvailabilityDraft> for DraftCandidateGen<'a> {
     }
 }
 
-/// Evaluates a draft using the provided scorer.
-struct DraftEvaluator<'a> {
+/*──────────────────────── Evaluator (overlay-aware) ─────────────────*/
+
+struct PlannerEval<'a> {
     db: &'a KuramotoDb,
     txn: &'a ReadTransaction,
-    scorer: &'a dyn Scorer,
     ctx: &'a PeerContext,
+    scorer: &'a dyn Scorer,
 }
 
 #[async_trait]
-impl Evaluator<AvailabilityDraft> for DraftEvaluator<'_> {
-    async fn score(&self, s: &AvailabilityDraft) -> f32 {
-        if range_is_empty(&s.range) {
-            return f32::NEG_INFINITY;
-        }
+impl Evaluator<PlanState> for PlannerEval<'_> {
+    async fn score(&self, s: &PlanState) -> f32 {
+        let overlay = match self.effective_overlay(s).await {
+            Ok(v) => v,
+            Err(_) => s.overlay.clone(),
+        };
         self.scorer
-            .score(self.db, self.txn, self.ctx, s, &vec![])
+            .score(self.db, self.txn, self.ctx, &s.focus, &overlay)
             .await
     }
-    fn feasible(&self, _s: &AvailabilityDraft) -> bool {
-        true
+
+    fn feasible(&self, s: &PlanState) -> bool {
+        !range_is_empty(&s.focus.range)
     }
 }
 
-/*──────────────────────── Delete post-pass ───────────────────────────*/
+impl<'a> PlannerEval<'a> {
+    /// Build what the scorer should see:
+    /// - include the focus insert only if it would adopt ≥1 local child under this peer’s roots.
+    async fn effective_overlay(&self, s: &PlanState) -> Result<ActionSet, StorageError> {
+        let mut eff = s.overlay.clone();
 
-async fn propose_negative_parent_deletes(
-    db: &KuramotoDb,
-    txn: &ReadTransaction,
-    ctx: &PeerContext,
-    scorer: &dyn Scorer,
-    seeds: &[AvailabilityDraft],
-) -> Result<ActionSet, StorageError> {
-    let mut plan: ActionSet = Vec::new();
-    let parents = db.range_by_pk::<Availability>(&[], &[0xFF], None).await?;
-    'outer: for p in parents {
-        if p.level == 0 || p.peer_id != ctx.peer_id {
-            continue;
+        let cnt = local_child_count_under_peer(
+            self.db,
+            Some(self.txn),
+            &self.ctx.peer_id,
+            &s.focus.range,
+        )
+        .await?;
+        if cnt > 0 {
+            push_insert(&mut eff, s.focus.clone());
         }
-        // Only consider if it overlaps ANY seed
-        if !seeds.iter().any(|s| p.range.overlaps(&s.range)) {
-            continue;
-        }
-        let pd = AvailabilityDraft {
-            level: p.level,
-            range: p.range.clone(),
-            complete: true,
-        };
-        let s_old = if range_is_empty(&pd.range) {
-            0.0
-        } else {
-            scorer.score(db, txn, ctx, &pd, &vec![]).await
-        };
-        if s_old < 0.0 {
-            // avoid duplicates
-            for a in &plan {
-                if let Action::Delete(id) = a {
-                    if *id == p.key {
-                        continue 'outer;
-                    }
-                }
-            }
-            plan.push(Action::Delete(p.key));
-        }
+        Ok(eff)
     }
-    Ok(plan)
 }
 
-/*──────────────────────── Additive mutation helpers ──────────────────*/
+/*──────────────────────── Overlay helpers ─────────────────────*/
 
-#[derive(Clone)]
-struct Cand {
-    draft: AvailabilityDraft,
-    used_step: u128, // magnitude of the additive delta we applied (kept for future momentum)
-}
-
-/// For each step in `steps`, produce additive variants:
-///   - expand left  (min -= step)
-///   - expand right (max += step)
-///   - expand both  (min -= step, max += step)
-/// For each produced range we also add a **promoted** copy (level+1).
-fn enumerate_additive_mutations(base: &AvailabilityDraft, steps: &[u128], caps: Caps) -> Vec<Cand> {
-    let dims = base.range.mins.len().min(base.range.maxs.len());
-    let mut out: Vec<Cand> = Vec::with_capacity(2 + 6 * dims);
-
-    // Identity (so the beam can see "no change" at depth-1 if it wants).
-    out.push(Cand {
-        draft: AvailabilityDraft {
-            level: base.level,
-            range: base.range.clone(),
-            complete: true,
-        },
-        used_step: 0,
-    });
-    // Promotion without geometry change
-    out.push(Cand {
-        draft: AvailabilityDraft {
-            level: base.level + 1,
-            range: base.range.clone(),
-            complete: true,
-        },
-        used_step: 0,
-    });
-
-    for &st in steps {
-        if st == 0 {
-            continue;
-        }
-        for dim in 0..dims {
-            // min -= st
-            if let Some(min2) = be_add_signed(&base.range.mins[dim], -(st as i128)) {
-                let mut r = base.range.clone();
-                r.mins[dim] = min2;
-                if !range_is_empty(&r) {
-                    push_both_levels(&mut out, &r, base.level, st);
-                }
-            }
-            // max += st
-            if let Some(max2) = be_add_signed(&base.range.maxs[dim], st as i128) {
-                let mut r = base.range.clone();
-                r.maxs[dim] = max2;
-                if !range_is_empty(&r) {
-                    push_both_levels(&mut out, &r, base.level, st);
-                }
-            }
-            // both sides
-            if let (Some(min2), Some(max2)) = (
-                be_add_signed(&base.range.mins[dim], -(st as i128)),
-                be_add_signed(&base.range.maxs[dim], st as i128),
-            ) {
-                let mut r = base.range.clone();
-                r.mins[dim] = min2;
-                r.maxs[dim] = max2;
-                if !range_is_empty(&r) {
-                    push_both_levels(&mut out, &r, base.level, st);
-                }
-            }
-        }
+fn push_insert(overlay: &mut ActionSet, d: AvailabilityDraft) {
+    if let Some(pos) = overlay
+        .iter()
+        .position(|a| matches!(a, Action::Insert(x) if draft_eq(x, &d)))
+    {
+        overlay[pos] = Action::Insert(d);
+    } else {
+        overlay.push(Action::Insert(d));
     }
-
-    // Dedupe and cap
-    let mut uniq: Vec<Cand> = Vec::with_capacity(out.len());
-    for c in out.into_iter() {
-        if !range_is_empty(&c.draft.range) && !contains_draft_cand(&uniq, &c.draft) {
-            uniq.push(c);
-        }
-        if uniq.len() >= caps.max_variants_per_draft {
-            break;
-        }
+}
+fn push_delete(overlay: &mut ActionSet, id: UuidBytes) {
+    if !overlay
+        .iter()
+        .any(|a| matches!(a, Action::Delete(x) if *x == id))
+    {
+        overlay.push(Action::Delete(id));
     }
-    uniq
 }
 
-fn push_both_levels(out: &mut Vec<Cand>, r: &RangeCube, level: u16, used: u128) {
-    out.push(Cand {
-        draft: AvailabilityDraft {
-            level,
-            range: r.clone(),
-            complete: true,
-        },
-        used_step: used,
-    });
-    out.push(Cand {
-        draft: AvailabilityDraft {
-            level: level + 1,
-            range: r.clone(),
-            complete: true,
-        },
-        used_step: used,
-    });
-}
-
-/*──────────────────────── Equality / identity ───────────────────────*/
+/*──────────────────── equality / de-dup helpers ───────────────────*/
 
 fn contains_insert(haystack: &[Action], needle: &AvailabilityDraft) -> bool {
     haystack
         .iter()
         .any(|a| matches!(a, Action::Insert(d) if draft_eq(d, needle)))
 }
-
-fn contains_draft_cand(haystack: &[Cand], needle: &AvailabilityDraft) -> bool {
-    haystack.iter().any(|c| draft_eq(&c.draft, needle))
-}
-
 fn draft_eq(a: &AvailabilityDraft, b: &AvailabilityDraft) -> bool {
     a.level == b.level && a.complete == b.complete && ranges_equal(&a.range, &b.range)
 }
-
 fn ranges_equal(x: &RangeCube, y: &RangeCube) -> bool {
-    if x.mins.len() != y.mins.len() || x.maxs.len() != y.maxs.len() {
+    if x.dims.len() != y.dims.len() || x.mins.len() != y.mins.len() || x.maxs.len() != y.maxs.len()
+    {
         return false;
     }
+    // rely on RangeCube invariants (aligned dims) — compare mins/maxs bytewise
     for i in 0..x.mins.len() {
-        if x.mins[i] != y.mins[i] {
-            return false;
-        }
-    }
-    for i in 0..x.maxs.len() {
-        if x.maxs[i] != y.maxs[i] {
+        if x.mins[i] != y.mins[i] || x.maxs[i] != y.maxs[i] {
             return false;
         }
     }
     true
 }
 
-/*──────────────────────── Range utils (byte-lex) ────────────────────*/
+/*──────────────────────── range / byte math ─────────────────────────*/
 
-/// A range is empty if, on any dimension, max ≤ min in lexicographic byte order.
+/// A range is **invalid/empty** if any axis has max ≤ min (lex byte order).
 fn range_is_empty(r: &RangeCube) -> bool {
-    let d = r.mins.len().min(r.maxs.len());
-    for i in 0..d {
-        if r.maxs[i] <= r.mins[i] {
-            return true;
-        }
-    }
-    false
-}
-#[allow(dead_code)]
-fn overlaps_any(r: &RangeCube, drafts: &[AvailabilityDraft]) -> bool {
-    drafts.iter().any(|d| r.overlaps(&d.range))
+    let n = r.mins.len().min(r.maxs.len());
+    (0..n).any(|i| r.maxs[i] <= r.mins[i])
 }
 
-/// Add a signed integer `delta` to a **big-endian, variable-length** unsigned byte vector.
+/// Ladder of step magnitudes in "byte-lex distance".
+fn step_ladder() -> Vec<u128> {
+    let mut v: Vec<u128> = vec![
+        1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, // powers of two
+        10, 100, 1_000, 10_000, 100_000, // powers of ten
+    ];
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// Add signed integer `delta` to a big-endian, variable-length unsigned byte vector.
 fn be_add_signed(input: &[u8], delta: i128) -> Option<Vec<u8>> {
     if delta == 0 {
         return Some(trim_leading_zeros(input.to_vec()));
@@ -529,12 +423,12 @@ fn be_add_signed(input: &[u8], delta: i128) -> Option<Vec<u8>> {
         let mut a = input.to_vec();
         let mut b = u128_to_trimmed_be(delta as u128);
         be_add_in_place(&mut a, &mut b);
-        return Some(trim_leading_zeros(a));
+        Some(trim_leading_zeros(a))
     } else {
         let mag = (-delta) as u128;
         match be_sub_value(input, mag) {
             Some(v) => Some(trim_leading_zeros(v)),
-            None => Some(vec![]),
+            None => Some(vec![]), // underflow → canonical zero
         }
     }
 }
@@ -550,7 +444,6 @@ fn be_add_in_place(a: &mut Vec<u8>, b: &mut Vec<u8>) {
         pad.extend_from_slice(b);
         *b = pad;
     }
-
     let mut carry = 0u16;
     for i in (0..max_len).rev() {
         let sum = a[i] as u16 + b[i] as u16 + carry;
@@ -594,13 +487,13 @@ fn u128_to_trimmed_be(mut v: u128) -> Vec<u8> {
     buf[i..].to_vec()
 }
 fn trim_leading_zeros(mut v: Vec<u8>) -> Vec<u8> {
-    while v.first().map(|b| *b == 0).unwrap_or(false) {
+    while v.first().is_some_and(|b| *b == 0) {
         v.remove(0);
     }
     v
 }
 
-/*──────────────────────────── tests ─────────────────────────────────*/
+/*──────────────────────────── tests ─────────────────────────────*/
 
 #[cfg(test)]
 mod tests {
@@ -610,16 +503,21 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::{
-        clock::MockClock, plugins::harmonizer::child_set::ChildSet, uuid_bytes::UuidBytes,
+        clock::MockClock,
+        plugins::harmonizer::{
+            availability::Availability, child_set::ChildSet, harmonizer::PeerContext,
+            range_cube::RangeCube, scorers::Scorer,
+        },
+        tables::TableHash,
+        uuid_bytes::UuidBytes,
     };
 
-    // small builder
-    fn draft_bytes(level: u16, mins: &[&[u8]], maxs: &[&[u8]]) -> AvailabilityDraft {
+    fn draft(level: u16, mins: &[&[u8]], maxs: &[&[u8]]) -> AvailabilityDraft {
         AvailabilityDraft {
             level,
             complete: true,
             range: RangeCube {
-                dims: smallvec![], // unused in these tests
+                dims: smallvec![], // tests don't depend on dims here
                 mins: mins.iter().map(|m| m.to_vec()).collect(),
                 maxs: maxs.iter().map(|m| m.to_vec()).collect(),
             },
@@ -630,7 +528,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let clock = Arc::new(MockClock::new(0));
         let db = KuramotoDb::new(
-            dir.path().join("opt_beam.redb").to_str().unwrap(),
+            dir.path().join("opt_overlay_beam.redb").to_str().unwrap(),
             clock,
             vec![],
         )
@@ -641,14 +539,15 @@ mod tests {
 
     fn caps() -> Caps {
         Caps {
-            eps: 0.0,
-            max_variants_per_draft: 64,
             depth: 2,
             beam_width: 8,
+            max_variants_per_draft: 64,
+            eps: 0.0,
         }
     }
 
-    /*──────── score helpers (async) ────────*/
+    /*──────── dummy scorers ────────*/
+
     struct ZeroScorer;
     #[async_trait::async_trait]
     impl Scorer for ZeroScorer {
@@ -676,48 +575,21 @@ mod tests {
             a: &AvailabilityDraft,
             _overlay: &ActionSet,
         ) -> f32 {
-            let d = a.range.mins.len().min(a.range.maxs.len());
-            let mut span = 0i32;
-            for i in 0..d {
-                // span proxy: length(max) - length(min)
-                span += (a.range.maxs[i].len() as i32) - (a.range.mins[i].len() as i32);
-            }
-            span as f32 + (a.level as f32) * 2.0
-        }
-    }
-
-    /// Loves identity and dislikes change → triggers identity early-exit.
-    struct IdentityLovesScorer;
-    #[async_trait::async_trait]
-    impl Scorer for IdentityLovesScorer {
-        async fn score(
-            &self,
-            _db: &KuramotoDb,
-            _txn: &ReadTransaction,
-            _ctx: &PeerContext,
-            a: &AvailabilityDraft,
-            _overlay: &ActionSet,
-        ) -> f32 {
-            if a.level == 0 { 1.0 } else { 0.0 }
+            a.range.approx_volume() as f32 + (a.level as f32) * 2.0
         }
     }
 
     #[test]
     fn be_add_signed_basic() {
-        // add within same len
         assert_eq!(be_add_signed(&[0x0f], 1).unwrap(), vec![0x10]);
-        // carry extends length
         assert_eq!(be_add_signed(&[0xff], 1).unwrap(), vec![0x01, 0x00]);
-        // subtract within value
         assert_eq!(be_add_signed(&[0x10], -1).unwrap(), vec![0x0f]);
-        // subtract past zero → empty vec (canonical zero)
         assert_eq!(be_add_signed(&[0x00], -1).unwrap(), Vec::<u8>::new());
-        // trim leading zeros
         assert_eq!(be_add_signed(&[0x00, 0x10], 0).unwrap(), vec![0x10]);
     }
 
     #[tokio::test]
-    async fn propose_noop_when_scorer_is_zero() {
+    async fn zero_scorer_returns_none() {
         let db = fresh_db().await;
         let opt = BasicOptimizer::new(
             Box::new(ZeroScorer),
@@ -727,33 +599,14 @@ mod tests {
         )
         .with_caps(caps());
 
-        let base = draft_bytes(0, &[b"a"], &[b"a\x01"]);
-
+        let base = draft(0, &[b"a"], &[b"a\x01"]);
         let txn = db.begin_read_txn().unwrap();
         let got = opt.propose(&db, &txn, &[base]).await.unwrap();
-
-        assert!(got.is_none(), "zero scorer should produce no plan");
+        assert!(got.is_none());
     }
 
     #[tokio::test]
-    async fn identity_early_exit_via_beam() {
-        let db = fresh_db().await;
-        let opt = BasicOptimizer::new(
-            Box::new(IdentityLovesScorer),
-            PeerContext {
-                peer_id: UuidBytes::new(),
-            },
-        )
-        .with_caps(caps());
-
-        let base = draft_bytes(0, &[b"\x0f"], &[b"\x0f\x01"]);
-        let txn = db.begin_read_txn().unwrap();
-        let got = opt.propose(&db, &txn, &[base]).await.unwrap();
-        assert!(got.is_none(), "should early-exit when identity is argmax");
-    }
-
-    #[tokio::test]
-    async fn proposes_a_parent_insert_under_span_promote() {
+    async fn span_promote_proposes_parent_insert() {
         let db = fresh_db().await;
         let opt = BasicOptimizer::new(
             Box::new(SpanPromoteScorer),
@@ -761,86 +614,18 @@ mod tests {
                 peer_id: UuidBytes::new(),
             },
         )
-        .with_caps(caps())
-        .with_momentum(Momentum {
-            ema: 1.0,
-            alpha: 0.5,
-        });
+        .with_caps(caps());
 
         // small leaf
-        let base = draft_bytes(0, &[&[15u8, 0x00]], &[&[15u8, 0x01]]);
+        let base = draft(0, &[&[15u8, 0x00]], &[&[15u8, 0x01]]);
         let txn = db.begin_read_txn().unwrap();
-        let plan = opt
-            .propose(&db, &txn, &[base])
-            .await
-            .unwrap()
-            .expect("plan");
+        let plan = opt.propose(&db, &txn, &[base]).await.unwrap().unwrap();
         assert!(
             plan.iter()
                 .any(|a| matches!(a, Action::Insert(d) if d.level >= 1)),
             "expected at least one promoted (parent) insert"
         );
-    }
-
-    #[tokio::test]
-    async fn proposes_delete_of_negative_parent_in_post_pass() {
-        // scorer that makes ANY parent (level ≥1) negative
-        struct KillParents;
-        #[async_trait::async_trait]
-        impl Scorer for KillParents {
-            async fn score(
-                &self,
-                _db: &KuramotoDb,
-                _txn: &ReadTransaction,
-                _ctx: &PeerContext,
-                a: &AvailabilityDraft,
-                _overlay: &ActionSet,
-            ) -> f32 {
-                if a.level >= 1 { -1.0 } else { 0.0 }
-            }
-        }
-
-        let db = fresh_db().await;
-        let ctx = PeerContext {
-            peer_id: UuidBytes::new(),
-        };
-        let opt = BasicOptimizer::new(Box::new(KillParents), ctx.clone()).with_caps(caps());
-
-        // insert one negative parent directly into DB
-        let parent_id = UuidBytes::new();
-        let rc = RangeCube {
-            dims: smallvec![],
-            mins: smallvec![vec![10u8]],
-            maxs: smallvec![vec![20u8]],
-        };
-        let parent = Availability {
-            key: parent_id,
-            peer_id: ctx.peer_id,
-            parent: None,
-            range: rc,
-            level: 1,
-            children: ChildSet {
-                parent: parent_id,
-                children: vec![],
-            },
-            schema_hash: 0,
-            version: 0,
-            updated_at: 0,
-            complete: true,
-        };
-        db.put(parent).await.unwrap();
-
-        // one tiny seed overlapping that parent
-        let seed = draft_bytes(0, &[&[15u8]], &[&[15u8, 1]]);
-        let txn = db.begin_read_txn().unwrap();
-        let plan = opt
-            .propose(&db, &txn, &[seed])
-            .await
-            .unwrap()
-            .expect("plan");
-        assert!(
-            plan.iter().any(|a| matches!(a, Action::Delete(_))),
-            "expected at least one Delete action from post-pass"
-        );
+        // No explicit deletes in this planner
+        assert!(!plan.iter().any(|a| matches!(a, Action::Delete(_))));
     }
 }
