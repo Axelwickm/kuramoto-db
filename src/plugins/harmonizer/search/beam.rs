@@ -112,21 +112,38 @@ impl BeamSearch {
         if self.cfg.rollout_depth == 0 {
             return self.score_raw(eval, start).await;
         }
+
+        let k = self.cfg.rollout_depth.max(1);
         let mut best = self.score_raw(eval, start).await?;
         let mut frontier = vec![start.clone()];
+
         for _ in 0..self.cfg.rollout_depth {
-            let mut next = Vec::new();
-            for s in frontier {
-                for a in cand.candidates(&s).into_iter() {
+            let mut next: Vec<S> = Vec::new();
+
+            for s in &frontier {
+                // score all children once, keep only top-k by immediate score
+                let mut scored: Vec<(f32, S)> = Vec::new();
+                for a in cand.candidates(s).into_iter() {
                     let st = s.apply(&a);
+                    if !eval.feasible(&st) {
+                        continue;
+                    } // don’t waste evals
                     if let Some(sc) = self.score_raw(eval, &st).await {
                         if sc > best {
                             best = sc;
                         }
-                        next.push(st);
+                        scored.push((sc, st));
+                    } else {
+                        return None; // budget
                     }
                 }
+                if scored.len() > k {
+                    scored.select_nth_unstable_by(k, |a, b| b.0.partial_cmp(&a.0).unwrap());
+                    scored.truncate(k);
+                }
+                next.extend(scored.into_iter().map(|(_, st)| st));
             }
+
             if next.is_empty() {
                 break;
             }
@@ -155,51 +172,134 @@ where
 
         let mut stats = Stats::default();
 
+        // ── knobs for selective rollout (no new config fields to keep this simple)
+        const SELECTIVE_R: usize = 6; // rollout only top-R tied kids at depth-1
+        const TIE_MARGIN: f32 = 1e-6; // scores within this margin are “tied”
+
+        // ── timing accumulators ────────────────────────────────────────────────
+        let t_total = std::time::Instant::now();
+        let mut gen_candidates_ms: u128 = 0;
+
+        let mut d1_rollout_ms: u128 = 0;
+        let mut d1_score_ms: u128 = 0;
+        let mut d1_sort_ms: u128 = 0;
+
+        let mut per_depth_expand_ms: Vec<u128> = Vec::new(); // time spent generating children
+        let mut per_depth_eval_ms: Vec<u128> = Vec::new(); // time spent in score_raw
+        let mut per_depth_rollout_ms: Vec<u128> = Vec::new(); // time spent in rollout (will be 0 at depth>=2)
+        let mut per_depth_sort_ms: Vec<u128> = Vec::new(); // time spent sorting frontier
+
         // Root must be feasible or we bail immediately.
         if !eval.feasible(current) {
+            println!(
+                "search.timing: total={}ms (infeasible root)",
+                t_total.elapsed().as_millis()
+            );
             return None;
         }
-        let s0 = self.score(eval, current).await?;
+
+        let t_s0 = std::time::Instant::now();
+        let s0 = match self.score(eval, current).await {
+            Some(v) => v,
+            None => {
+                println!(
+                    "search.timing: total={}ms (budget at s0)",
+                    t_total.elapsed().as_millis()
+                );
+                return None;
+            }
+        };
+        let s0_ms = t_s0.elapsed().as_millis();
 
         println!(
-            "search.step: depth={} beam={} eps={} s0={:.3}",
-            self.cfg.depth, self.cfg.beam_width, self.cfg.eps, s0
+            "search.step: depth={} beam={} eps={} s0={:.3} (s0={}ms)",
+            self.cfg.depth, self.cfg.beam_width, self.cfg.eps, s0, s0_ms
         );
 
         #[derive(Clone)]
         struct Node<S: State> {
             state: S,
             score: f32, // immediate score of this state
-            prio: f32,  // rollout-based priority for ranking
+            prio: f32,  // ranking priority (selective rollout may bump this)
             seq: Vec<S::Action>,
         }
 
-        // -------- Depth 1: rank by rollout priority (do not gate by feasibility here) --------
+        // -------- Depth 1: score all kids; rollout only if plateau --------
+        let t_gen = std::time::Instant::now();
+        let raw_kids = cand.candidates(current);
+        gen_candidates_ms = t_gen.elapsed().as_millis();
+
         let mut kids: Vec<(
             f32,  /*prio*/
             f32,  /*score*/
             bool, /*feas*/
             S::Action,
             S,
-        )> = Vec::new();
-        for a in cand.candidates(current).into_iter() {
+        )> = Vec::with_capacity(raw_kids.len());
+
+        // First pass: compute immediate score (fast) and feasibility
+        for a in raw_kids.into_iter() {
             let next = current.apply(&a);
-            // heuristic ranking (ignores feasibility at the root of rollout)
-            let prio = match self.rollout_priority_unsafe(cand, eval, &next).await {
-                Some(p) => p,
-                None => return None, // budget exhausted
-            };
+
             // immediate score for gains / logging
+            let t_sc = std::time::Instant::now();
             let sc = match self.score_raw(eval, &next).await {
                 Some(s) => s,
-                None => return None, // budget exhausted
+                None => {
+                    println!(
+                        "search.timing: total={}ms (budget at d1 score)",
+                        t_total.elapsed().as_millis()
+                    );
+                    return None; // budget exhausted
+                }
             };
+            d1_score_ms += t_sc.elapsed().as_millis();
+
             let feas = eval.feasible(&next);
+            let prio = sc; // default priority is immediate score
             kids.push((prio, sc, feas, a, next));
         }
         stats.d1_total = kids.len();
 
-        println!("kids: {}", kids.len());
+        // If we have any kids, selectively rollout only a small plateau near the best
+        if !kids.is_empty() && self.cfg.rollout_depth > 0 && SELECTIVE_R > 0 {
+            let best_sc = kids.iter().map(|k| k.1).fold(f32::NEG_INFINITY, f32::max);
+            let mut plateau_ix: Vec<usize> = (0..kids.len())
+                .filter(|&i| (best_sc - kids[i].1) <= TIE_MARGIN)
+                .collect();
+
+            if !plateau_ix.is_empty() {
+                // Deterministic selection among ties: by action Debug asc
+                plateau_ix.sort_by(|&ia, &ib| {
+                    format!("{:?}", kids[ia].3).cmp(&format!("{:?}", kids[ib].3))
+                });
+
+                let r = SELECTIVE_R.min(plateau_ix.len());
+                for &ix in plateau_ix.iter().take(r) {
+                    let t_roll = std::time::Instant::now();
+                    let prio = match self.rollout_priority_unsafe(cand, eval, &kids[ix].4).await {
+                        Some(p) => p,
+                        None => {
+                            println!(
+                                "search.timing: total={}ms (budget at d1 selective rollout)",
+                                t_total.elapsed().as_millis()
+                            );
+                            return None; // budget exhausted
+                        }
+                    };
+                    d1_rollout_ms += t_roll.elapsed().as_millis();
+                    kids[ix].0 = prio; // bump priority only for the selected tied items
+                }
+            }
+        }
+
+        println!(
+            "kids: {} (gen_candidates={}ms, d1_rollout={}ms, d1_score={}ms)",
+            kids.len(),
+            gen_candidates_ms,
+            d1_rollout_ms,
+            d1_score_ms
+        );
 
         if kids.is_empty() {
             println!("search.best_single: none");
@@ -207,21 +307,24 @@ where
                 "search.best_seq: depth={} gain={:.3} len=0",
                 self.cfg.depth, 0.0
             );
+            println!("search.timing: total={}ms", t_total.elapsed().as_millis());
             return None;
         }
 
         // rank: prio desc; deterministic tie-break by action Debug
+        let t_sort_d1 = std::time::Instant::now();
         kids.sort_by(|(pa, _sa, _fa, aa, _na), (pb, _sb, _fb, ab, _nb)| {
             pb.partial_cmp(pa)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| format!("{ab:?}").cmp(&format!("{aa:?}")))
         });
+        d1_sort_ms = t_sort_d1.elapsed().as_millis();
 
         // best single (for logging) = top-ranked immediate gain (even if infeasible)
         let best_single_gain = kids[0].1 - s0;
         println!(
-            "search.best_single: gain={:.3} act={:?}",
-            best_single_gain, kids[0].3
+            "search.best_single: gain={:.3} act={:?} (sort_d1={}ms)",
+            best_single_gain, kids[0].3, d1_sort_ms
         );
 
         // beam+slack at depth-1: keep K + ceil(slack)
@@ -237,7 +340,7 @@ where
         stats.d1_kept = kids.len();
         stats.depth_frontiers.push(kids.len());
 
-        // frontier may include infeasible nodes (on purpose) to let strict beams die as expected
+        // frontier may include infeasible nodes (on purpose) to let strict beams die as expected)
         let mut frontier: Vec<Node<S>> = kids
             .iter()
             .map(|(prio, sc, _feas, act, st)| Node {
@@ -260,6 +363,15 @@ where
 
         // Depth==1 early exit: only return if a feasible 1-step beats eps
         if self.cfg.depth == 1 {
+            println!(
+                "search.timing: total={}ms \
+                 | gen={}ms d1_rollout={}ms d1_score={}ms d1_sort={}ms",
+                t_total.elapsed().as_millis(),
+                gen_candidates_ms,
+                d1_rollout_ms,
+                d1_score_ms,
+                d1_sort_ms
+            );
             return if best_gain > self.cfg.eps && !best_seq.is_empty() {
                 Some(best_seq)
             } else {
@@ -279,10 +391,13 @@ where
             self.evals
         );
 
-        // -------- Depth >= 2 --------
+        // -------- Depth >= 2 (cheap): use immediate score for prio; no rollout here --------
         for d in 2..=self.cfg.depth {
+            let t_expand_depth = std::time::Instant::now();
             let mut expanded: Vec<Node<S>> = Vec::new();
             let mut expanded_count_this_depth = 0;
+            let mut eval_ms_this_depth: u128 = 0;
+            let rollout_ms_this_depth: u128 = 0; // no rollout at depth >= 2
 
             for node in &frontier {
                 // only expand feasible frontier nodes
@@ -295,18 +410,22 @@ where
                     if !eval.feasible(&next) {
                         continue;
                     }
+                    let t_eval = std::time::Instant::now();
                     let sc = match self.score_raw(eval, &next).await {
                         Some(s) => s,
-                        None => return None, // budget exhausted
-                    };
-                    let prio = if self.cfg.rollout_depth > 0 {
-                        match self.rollout_priority_unsafe(cand, eval, &next).await {
-                            Some(p) => p,
-                            None => return None, // budget exhausted
+                        None => {
+                            println!(
+                                "search.timing: total={}ms (budget at depth {} score)",
+                                t_total.elapsed().as_millis(),
+                                d
+                            );
+                            return None; // budget exhausted
                         }
-                    } else {
-                        sc
                     };
+                    eval_ms_this_depth += t_eval.elapsed().as_millis();
+
+                    let prio = sc; // ← NO rollout at deeper levels
+
                     let mut seq2 = node.seq.clone();
                     seq2.push(a);
                     // update best (only from feasible nodes)
@@ -333,13 +452,23 @@ where
                 let strict = self.cfg.beam_slack <= 0.0 && self.cfg.beam_width == 1;
                 if strict {
                     println!("search.dead_end: no feasible children at depth {d} (strict)");
+                    println!(
+                        "search.timing: total={}ms (dead_end at depth {})",
+                        t_total.elapsed().as_millis(),
+                        d
+                    );
                     return None;
                 }
                 println!("search.dead_end: no feasible children at depth {d} (slack present)");
+                // still capture timing for this depth’s expand phase
+                per_depth_expand_ms.push(t_expand_depth.elapsed().as_millis());
+                per_depth_eval_ms.push(eval_ms_this_depth);
+                per_depth_rollout_ms.push(rollout_ms_this_depth);
                 break;
             }
 
-            // rank next frontier by rollout priority
+            // rank next frontier by priority (immediate score)
+            let t_sort = std::time::Instant::now();
             expanded.sort_by(|a, b| {
                 b.prio
                     .partial_cmp(&a.prio)
@@ -349,9 +478,27 @@ where
             if expanded.len() > self.cfg.beam_width {
                 expanded.truncate(self.cfg.beam_width);
             }
+            let sort_ms_this_depth = t_sort.elapsed().as_millis();
 
             stats.depth_expanded.push(expanded_count_this_depth);
             stats.depth_frontiers.push(expanded.len());
+
+            per_depth_expand_ms.push(t_expand_depth.elapsed().as_millis());
+            per_depth_eval_ms.push(eval_ms_this_depth);
+            per_depth_rollout_ms.push(rollout_ms_this_depth);
+            per_depth_sort_ms.push(sort_ms_this_depth);
+
+            println!(
+                "search.depth{}: expanded={} frontier={} \
+                 eval={}ms rollout={}ms sort={}ms expand={}ms",
+                d,
+                expanded_count_this_depth,
+                expanded.len(),
+                eval_ms_this_depth,
+                rollout_ms_this_depth,
+                sort_ms_this_depth,
+                *per_depth_expand_ms.last().unwrap()
+            );
 
             frontier = expanded;
         }
@@ -365,6 +512,22 @@ where
                 0.0
             },
             best_seq.len()
+        );
+
+        // ── final timing summary ───────────────────────────────────────────────
+        println!(
+            "search.timing: total={}ms | gen={}ms \
+             d1={{rollout:{}ms, score:{}ms, sort:{}ms}} \
+             per_depth_ms={{expand:{:?}, eval:{:?}, rollout:{:?}, sort:{:?}}}",
+            t_total.elapsed().as_millis(),
+            gen_candidates_ms,
+            d1_rollout_ms,
+            d1_score_ms,
+            d1_sort_ms,
+            per_depth_expand_ms,
+            per_depth_eval_ms,
+            per_depth_rollout_ms,
+            per_depth_sort_ms
         );
 
         if best_gain > self.cfg.eps && !best_seq.is_empty() {

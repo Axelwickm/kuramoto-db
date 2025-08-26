@@ -1,19 +1,21 @@
 // server_scorer.rs
 // Stateless scorer that consults the DB (snapshot-aware) and respects an overlay for deletes.
-// The score favors reaching a soft child-target per parent while charging a per-node rent,
-// and it short-circuits to strongly encourage under-replicated ranges.
+// Now with simple memo caches for roots/frontiers/replication.
 
 use async_trait::async_trait;
 use redb::ReadTransaction;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 
 use crate::{
     KuramotoDb,
     plugins::harmonizer::{
         availability::Availability,
+        availability::roots_for_peer,
         availability_queries::{count_replications, range_cover},
         harmonizer::PeerContext,
         optimizer::{Action, ActionSet, AvailabilityDraft},
+        range_cube::RangeCube,
         scorers::Scorer,
     },
     storage_error::StorageError,
@@ -23,16 +25,12 @@ use crate::{
 /// Tunables for the server-side scoring heuristic.
 #[derive(Clone, Debug)]
 pub struct ServerScorerParams {
-    /// Baseline cost per node (positive number). Score subtracts this.
     pub rent: f32,
-    /// Desired number of children per parent (soft target).
     pub child_target: usize,
-    /// Weight for the child-target shaping term.
     pub child_weight: f32,
-    /// Replication target (distinct peers fully containing the candidate).
     pub replication_target: usize,
-    /// Nudge strength for replication shortfall when we **don’t** short-circuit.
     pub replication_weight: f32,
+    pub level_weight: f32,
 }
 
 impl Default for ServerScorerParams {
@@ -43,47 +41,157 @@ impl Default for ServerScorerParams {
             child_weight: 0.5,
             replication_target: 3,
             replication_weight: 1.0,
+            level_weight: 0.0001,
         }
     }
 }
 
-/// Stateless, async scorer that queries the DB on demand.
-/// Snapshot-aware (reads via provided `txn`), no whole-table scans for child counting.
+// ───── simple global caches keyed by txn ptr + peer/range ─────
+
+#[derive(Default)]
+struct ScorerCaches {
+    roots: Mutex<HashMap<(usize, Vec<u8>), Vec<UuidBytes>>>,
+    frontier: Mutex<HashMap<(usize, Vec<u8>, Vec<u8>), Vec<UuidBytes>>>,
+    repl: Mutex<HashMap<(usize, Vec<u8>), usize>>,
+}
+
+fn txntag(txn: &ReadTransaction) -> usize {
+    (txn as *const ReadTransaction) as usize
+}
+fn peer_key_bytes(p: &UuidBytes) -> Vec<u8> {
+    p.as_bytes().to_vec()
+}
+fn range_key(r: &RangeCube) -> Vec<u8> {
+    let mut k = Vec::with_capacity(64);
+    for d in &r.dims {
+        k.extend_from_slice(&d.hash.to_be_bytes());
+        k.push(0xFE);
+    }
+    k.push(0xF0);
+    for m in &r.mins {
+        k.extend_from_slice(m);
+        k.push(0xFD);
+    }
+    k.push(0xE0);
+    for m in &r.maxs {
+        k.extend_from_slice(m);
+        k.push(0xFB);
+    }
+    k
+}
+
+/// Server-side scorer with lightweight memoization.
 pub struct ServerScorer {
     params: ServerScorerParams,
+    caches: ScorerCaches,
 }
 
 impl ServerScorer {
     pub fn new(params: ServerScorerParams) -> Self {
-        Self { params }
+        Self {
+            params,
+            caches: ScorerCaches::default(),
+        }
     }
 
-    /// Txn-aware replication count: distinct peers that **fully contain** the candidate range.
-    /// NOTE: remains global & scan-based (as in availability_queries), since replication is
-    /// a cross-peer property.
     async fn replication_count(
         &self,
         db: &KuramotoDb,
         txn: &ReadTransaction,
         cand: &AvailabilityDraft,
     ) -> Result<usize, StorageError> {
-        count_replications(db, Some(txn), &cand.range, |_a| true, None).await
+        let tk = txntag(txn);
+        let rk = range_key(&cand.range);
+        {
+            let repl = self.caches.repl.lock().unwrap();
+            if let Some(v) = repl.get(&(tk, rk.clone())) {
+                // println!("Repl cache hit!");
+                return Ok(*v);
+            }
+        }
+        let v = count_replications(db, Some(txn), &cand.range, |_a| true, None).await?;
+        {
+            let mut repl = self.caches.repl.lock().unwrap();
+            if repl.len() > 4096 {
+                repl.clear();
+            }
+            repl.insert((tk, rk), v);
+        }
+        Ok(v)
     }
 
-    /// Level-free, range-driven local child count under this peer, overlay-aware for deletes.
-    ///
-    /// Counts how many **local, complete** availabilities under this peer’s roots are
-    /// **contained by** `cand.range`. We avoid global scans by:
-    /// - fetching only this peer’s roots (`roots_for_peer`), and
-    /// - descending from those roots using `range_cover`, which only walks branches that
-    ///   intersect the target range and returns a frontier without over-traversal.
-    ///
-    /// Notes:
-    /// - No dependency on `level`; the definition is purely geometric (containment).
-    /// - Dedups by availability key since multiple roots may reach the same node.
-    /// - Overlay handling:
-    ///     • If an availability is marked `Delete(id)` in overlay, we skip counting it.
-    ///     • We do **not** count overlay `Insert` phantoms here (they are typically parents).
+    async fn roots_for_peer(
+        &self,
+        db: &KuramotoDb,
+        txn: &ReadTransaction,
+        peer: &UuidBytes,
+    ) -> Result<Vec<UuidBytes>, StorageError> {
+        let tk = txntag(txn);
+        let pk = peer_key_bytes(peer);
+        {
+            let roots = self.caches.roots.lock().unwrap();
+            if let Some(v) = roots.get(&(tk, pk.clone())) {
+                // println!("Root cache hit");
+                return Ok(v.clone());
+            }
+        }
+        let roots = roots_for_peer(db, Some(txn), peer).await?;
+        let ids: Vec<UuidBytes> = roots.into_iter().map(|r| r.key).collect();
+        {
+            let mut roots = self.caches.roots.lock().unwrap();
+            if roots.len() > 1024 {
+                roots.clear();
+            }
+            roots.insert((tk, pk), ids.clone());
+        }
+        Ok(ids)
+    }
+
+    async fn frontier_ids(
+        &self,
+        db: &KuramotoDb,
+        txn: &ReadTransaction,
+        ctx: &PeerContext,
+        range: &RangeCube,
+    ) -> Result<Vec<UuidBytes>, StorageError> {
+        let tk = txntag(txn);
+        let pk = peer_key_bytes(&ctx.peer_id);
+        let rk = range_key(range);
+        {
+            let fr = self.caches.frontier.lock().unwrap();
+            if let Some(v) = fr.get(&(tk, pk.clone(), rk.clone())) {
+                // println!("Fronteir cache hit");
+                return Ok(v.clone());
+            }
+        }
+
+        let roots_ids = self.roots_for_peer(db, txn, &ctx.peer_id).await?;
+        let (frontier, no_overlap) = range_cover(db, Some(txn), range, &roots_ids, None).await?;
+        let mut seen = HashSet::<UuidBytes>::new();
+        if !no_overlap {
+            for a in frontier {
+                if a.peer_id == ctx.peer_id && a.complete && range.contains(&a.range) {
+                    let _ = seen.insert(a.key);
+                }
+            }
+        }
+        let ids: Vec<UuidBytes> = seen.into_iter().collect();
+        {
+            let mut fr = self.caches.frontier.lock().unwrap();
+            if fr.len() > 4 * 4096 {
+                fr.clear();
+            }
+            fr.insert((tk, pk, rk), ids.clone());
+        }
+        Ok(ids)
+    }
+
+    fn child_count_score(&self, child_count: usize) -> f32 {
+        let t = self.params.child_target as i32;
+        let dev = (child_count as i32 - t).abs() as f32;
+        self.params.child_weight * ((t as f32) - dev)
+    }
+
     pub(crate) async fn child_count_local(
         &self,
         db: &KuramotoDb,
@@ -92,55 +200,15 @@ impl ServerScorer {
         cand: &AvailabilityDraft,
         overlay: &ActionSet,
     ) -> Result<usize, StorageError> {
-        use crate::plugins::harmonizer::availability::roots_for_peer;
-
-        // 1) Fetch this peer's roots in the same snapshot.
-        let roots: Vec<Availability> = roots_for_peer(db, Some(txn), &ctx.peer_id).await?;
-        if roots.is_empty() {
-            return Ok(0);
-        }
-        let root_ids: Vec<UuidBytes> = roots.iter().map(|r| r.key).collect();
-
-        // 2) Compute the frontier that touches cand.range by descending only intersecting branches.
-        let (frontier, no_overlap) =
-            range_cover(db, Some(txn), &cand.range, &root_ids, None).await?;
-        if no_overlap {
-            return Ok(0);
-        }
-
-        // Precompute deletions in overlay for quick membership checks.
-        let mut deleted: HashSet<UuidBytes> = HashSet::new();
+        let mut deleted = HashSet::<UuidBytes>::new();
         for a in overlay {
             if let Action::Delete(id) = a {
                 deleted.insert(*id);
             }
         }
-
-        // 3) Count local, complete nodes whose ranges are contained by the candidate’s range,
-        //    skipping any that the overlay deletes.
-        let mut seen = HashSet::<UuidBytes>::new();
-        let mut count = 0usize;
-
-        for a in frontier {
-            if a.peer_id == ctx.peer_id && a.complete && cand.range.contains(&a.range) {
-                if deleted.contains(&a.key) {
-                    continue;
-                }
-                if seen.insert(a.key) {
-                    count += 1;
-                }
-            }
-        }
-
+        let ids = self.frontier_ids(db, txn, ctx, &cand.range).await?;
+        let count = ids.iter().filter(|id| !deleted.contains(id)).count();
         Ok(count)
-    }
-
-    /// Single “child count” shaping function: peak at `child_target`,
-    /// linear drop-off as you deviate.
-    fn child_count_score(&self, child_count: usize) -> f32 {
-        let t = self.params.child_target as i32;
-        let dev = (child_count as i32 - t).abs() as f32;
-        self.params.child_weight * ((t as f32) - dev)
     }
 }
 
@@ -154,26 +222,22 @@ impl Scorer for ServerScorer {
         cand: &AvailabilityDraft,
         overlay: &ActionSet,
     ) -> f32 {
-        // 1) Safety valve: under-replicated? Force positive score and return.
         let replicas = match self.replication_count(db, txn, cand).await {
             Ok(n) => n as i32,
-            Err(_) => 0, // on error, be conservative
+            Err(_) => 0,
         };
         let target = self.params.replication_target as i32;
         if replicas < target {
-            // Always positive; bias proportional to shortfall.
             return 1.0 + self.params.replication_weight * ((target - replicas) as f32);
         }
 
-        // 2) Otherwise: rent + child-count shaping (no overlap term).
         let mut s = -self.params.rent;
-
         let child_count = match self.child_count_local(db, txn, ctx, cand, overlay).await {
             Ok(c) => c,
-            Err(_) => 0, // on error, fall back to 0 local children
+            Err(_) => 0,
         };
         s += self.child_count_score(child_count);
-
+        s += (cand.level as f32) * self.params.level_weight;
         s
     }
 }
@@ -200,8 +264,6 @@ mod tests {
     use smallvec::smallvec;
     use std::sync::Arc;
     use tempfile::tempdir;
-
-    /* ---------- Helpers ---------- */
 
     fn cube(dim: TableHash, min: &[u8], max_excl: &[u8]) -> RangeCube {
         RangeCube {
@@ -287,6 +349,7 @@ mod tests {
             child_weight: 1.0,
             replication_target: 0, // disable safety valve for these tests
             replication_weight: 0.0,
+            ..Default::default()
         }
     }
 
@@ -432,6 +495,7 @@ mod tests {
             child_weight: 1.0,
             replication_target: 0,
             replication_weight: 0.0,
+            ..Default::default()
         });
 
         let txn = db.begin_read_txn().unwrap();
@@ -470,6 +534,7 @@ mod tests {
             child_weight: 2.0,
             replication_target: 0,
             replication_weight: 0.0,
+            ..Default::default()
         });
 
         // Optimizer setup (using the beam-based optimizer you plugged in)
@@ -537,6 +602,7 @@ mod tests {
             child_weight: 2.0,
             replication_target: 0,
             replication_weight: 0.0,
+            ..Default::default()
         });
 
         let opt = BasicOptimizer::new(Box::new(scorer), ctx.clone()).with_caps(Caps {

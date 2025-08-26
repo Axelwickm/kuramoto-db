@@ -17,12 +17,15 @@
 
 use async_trait::async_trait;
 use redb::ReadTransaction;
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 
 use crate::{
     KuramotoDb,
     plugins::harmonizer::{
         availability::Availability,
-        availability_queries::local_child_count_under_peer,
+        availability::roots_for_peer,
+        availability_queries::range_cover,
         harmonizer::PeerContext,
         range_cube::RangeCube,
         scorers::Scorer,
@@ -100,9 +103,7 @@ pub trait Optimizer: Send + Sync {
 
 #[derive(Debug, Clone)]
 struct PlanState {
-    /// The node we are currently mutating (range & level only).
     focus: AvailabilityDraft,
-    /// The **material plan** so far (deduped Inserts/Deletes).
     overlay: ActionSet,
 }
 impl PlanState {
@@ -182,12 +183,7 @@ impl Optimizer for BasicOptimizer {
         for seed in seeds {
             let start = PlanState::new(seed.clone());
             let g = PlannerGen { caps: self.caps };
-            let eval = PlannerEval {
-                db,
-                txn,
-                ctx: &self.ctx,
-                scorer: &*self.scorer,
-            };
+            let eval = PlannerEval::new(db, txn, &self.ctx, &*self.scorer);
 
             let Some(path) = search.propose_step(&start, &g, &eval).await else {
                 continue;
@@ -199,9 +195,6 @@ impl Optimizer for BasicOptimizer {
                 st = st.apply(a);
             }
 
-            // 1) For scoring we used effective_overlay (adoption-aware).
-            // 2) For the returned plan, always include the beam’s final focus draft.
-            //    Commit-time pruning will drop empty/non-adopting parents later.
             push_insert(&mut merged, st.focus.clone());
             for a in st.overlay {
                 if let Action::Delete(id) = a {
@@ -226,7 +219,6 @@ struct PlannerGen {
 impl CandidateGen<PlanState> for PlannerGen {
     fn candidates(&self, s: &PlanState) -> Vec<Action> {
         let steps = step_ladder();
-        println!("Step ladder steps {}", steps.len());
         let d = s.focus.range.mins.len().min(s.focus.range.maxs.len());
         let mut out: Vec<Action> = Vec::with_capacity(self.caps.max_variants_per_draft);
 
@@ -311,6 +303,101 @@ struct PlannerEval<'a> {
     txn: &'a ReadTransaction,
     ctx: &'a PeerContext,
     scorer: &'a dyn Scorer,
+
+    // Caches
+    roots_ids: Mutex<Option<Vec<UuidBytes>>>,
+    frontier_cache: Mutex<HashMap<Vec<u8>, Vec<UuidBytes>>>,
+}
+impl<'a> PlannerEval<'a> {
+    fn new(
+        db: &'a KuramotoDb,
+        txn: &'a ReadTransaction,
+        ctx: &'a PeerContext,
+        scorer: &'a dyn Scorer,
+    ) -> Self {
+        Self {
+            db,
+            txn,
+            ctx,
+            scorer,
+            roots_ids: Mutex::new(None),
+            frontier_cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn range_key(r: &RangeCube) -> Vec<u8> {
+        let mut k = Vec::with_capacity(64);
+        for d in &r.dims {
+            k.extend_from_slice(&d.hash.to_be_bytes());
+            k.push(0xFE);
+        }
+        k.push(0xF0);
+        for m in &r.mins {
+            k.extend_from_slice(m);
+            k.push(0xFD);
+        }
+        k.push(0xE0);
+        for m in &r.maxs {
+            k.extend_from_slice(m);
+            k.push(0xFB);
+        }
+        k
+    }
+
+    async fn ensure_roots(&self) -> Result<Vec<UuidBytes>, StorageError> {
+        {
+            let guard = self.roots_ids.lock().unwrap();
+            if let Some(v) = guard.as_ref() {
+                return Ok(v.clone());
+            }
+        }
+        let roots = roots_for_peer(self.db, Some(self.txn), &self.ctx.peer_id).await?;
+        let ids: Vec<UuidBytes> = roots.into_iter().map(|r| r.key).collect();
+        *self.roots_ids.lock().unwrap() = Some(ids.clone());
+        Ok(ids)
+    }
+
+    async fn local_child_ids(&self, target: &RangeCube) -> Result<Vec<UuidBytes>, StorageError> {
+        let key = Self::range_key(target);
+        {
+            let cache = self.frontier_cache.lock().unwrap();
+            if let Some(v) = cache.get(&key) {
+                return Ok(v.clone());
+            }
+        }
+        let roots_ids = self.ensure_roots().await?;
+        let (frontier, no_overlap) =
+            range_cover(self.db, Some(self.txn), target, &roots_ids, None).await?;
+        let mut seen = HashSet::<UuidBytes>::new();
+        if !no_overlap {
+            for a in frontier {
+                if a.peer_id == self.ctx.peer_id && a.complete && target.contains(&a.range) {
+                    seen.insert(a.key);
+                }
+            }
+        }
+        let ids: Vec<UuidBytes> = seen.into_iter().collect();
+        self.frontier_cache.lock().unwrap().insert(key, ids.clone());
+        Ok(ids)
+    }
+
+    async fn effective_overlay(&self, s: &PlanState) -> Result<ActionSet, StorageError> {
+        let mut eff = s.overlay.clone();
+
+        let mut deleted = HashSet::<UuidBytes>::new();
+        for a in &s.overlay {
+            if let Action::Delete(id) = a {
+                deleted.insert(*id);
+            }
+        }
+
+        let ids = self.local_child_ids(&s.focus.range).await?;
+        let adopts = ids.iter().any(|id| !deleted.contains(id));
+        if adopts {
+            push_insert(&mut eff, s.focus.clone());
+        }
+        Ok(eff)
+    }
 }
 
 #[async_trait]
@@ -327,26 +414,6 @@ impl Evaluator<PlanState> for PlannerEval<'_> {
 
     fn feasible(&self, s: &PlanState) -> bool {
         !range_is_empty(&s.focus.range)
-    }
-}
-
-impl<'a> PlannerEval<'a> {
-    /// Build what the scorer should see:
-    /// - include the focus insert only if it would adopt ≥1 local child under this peer’s roots.
-    async fn effective_overlay(&self, s: &PlanState) -> Result<ActionSet, StorageError> {
-        let mut eff = s.overlay.clone();
-
-        let cnt = local_child_count_under_peer(
-            self.db,
-            Some(self.txn),
-            &self.ctx.peer_id,
-            &s.focus.range,
-        )
-        .await?;
-        if cnt > 0 {
-            push_insert(&mut eff, s.focus.clone());
-        }
-        Ok(eff)
     }
 }
 
@@ -386,7 +453,6 @@ fn ranges_equal(x: &RangeCube, y: &RangeCube) -> bool {
     {
         return false;
     }
-    // rely on RangeCube invariants (aligned dims) — compare mins/maxs bytewise
     for i in 0..x.mins.len() {
         if x.mins[i] != y.mins[i] || x.maxs[i] != y.maxs[i] {
             return false;
@@ -397,13 +463,10 @@ fn ranges_equal(x: &RangeCube, y: &RangeCube) -> bool {
 
 /*──────────────────────── range / byte math ─────────────────────────*/
 
-/// A range is **invalid/empty** if any axis has max ≤ min (lex byte order).
 fn range_is_empty(r: &RangeCube) -> bool {
     let n = r.mins.len().min(r.maxs.len());
     (0..n).any(|i| r.maxs[i] <= r.mins[i])
 }
-
-/// Ladder of step magnitudes in "byte-lex distance".
 fn step_ladder() -> Vec<u128> {
     let mut v: Vec<u128> = vec![
         1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, // powers of two
@@ -413,8 +476,6 @@ fn step_ladder() -> Vec<u128> {
     v.dedup();
     v
 }
-
-/// Add signed integer `delta` to a big-endian, variable-length unsigned byte vector.
 fn be_add_signed(input: &[u8], delta: i128) -> Option<Vec<u8>> {
     if delta == 0 {
         return Some(trim_leading_zeros(input.to_vec()));
