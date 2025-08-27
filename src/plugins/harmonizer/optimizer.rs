@@ -71,8 +71,6 @@ pub struct Caps {
     pub depth: usize,
     /// beam width
     pub beam_width: usize,
-    /// cap total variants per expansion
-    pub max_variants_per_draft: usize,
     /// minimum improvement threshold (passed to beam)
     pub eps: f32,
 }
@@ -81,7 +79,6 @@ impl Default for Caps {
         Self {
             depth: 2,
             beam_width: 12,
-            max_variants_per_draft: 96,
             eps: 0.0,
         }
     }
@@ -218,9 +215,9 @@ struct PlannerGen {
 }
 impl CandidateGen<PlanState> for PlannerGen {
     fn candidates(&self, s: &PlanState) -> Vec<Action> {
-        let steps = step_ladder();
+        let steps = step_ladder(8); // TODO: make adjustable
         let d = s.focus.range.mins.len().min(s.focus.range.maxs.len());
-        let mut out: Vec<Action> = Vec::with_capacity(self.caps.max_variants_per_draft);
+        let mut out: Vec<Action> = Vec::with_capacity(8);
 
         // Identity
         out.push(Action::Insert(s.focus.clone()));
@@ -274,9 +271,6 @@ impl CandidateGen<PlanState> for PlannerGen {
                     }
                 }
             }
-            if out.len() >= self.caps.max_variants_per_draft {
-                break;
-            }
         }
 
         // De-dup by (level, range, complete), capped
@@ -288,9 +282,6 @@ impl CandidateGen<PlanState> for PlannerGen {
                 }
             }
             uniq.push(a);
-            if uniq.len() >= self.caps.max_variants_per_draft {
-                break;
-            }
         }
         uniq
     }
@@ -467,15 +458,17 @@ fn range_is_empty(r: &RangeCube) -> bool {
     let n = r.mins.len().min(r.maxs.len());
     (0..n).any(|i| r.maxs[i] <= r.mins[i])
 }
-fn step_ladder() -> Vec<u128> {
-    let mut v: Vec<u128> = vec![
-        1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, // powers of two
-        10, 100, 1_000, 10_000, 100_000, // powers of ten
-    ];
-    v.sort_unstable();
-    v.dedup();
+
+pub fn step_ladder(n: usize) -> Vec<usize> {
+    let mut v = Vec::with_capacity(n);
+    let mut x = 1usize;
+    while x <= n {
+        v.push(x);
+        x <<= 1; // multiply by 2
+    }
     v
 }
+
 fn be_add_signed(input: &[u8], delta: i128) -> Option<Vec<u8>> {
     if delta == 0 {
         return Some(trim_leading_zeros(input.to_vec()));
@@ -547,11 +540,10 @@ fn u128_to_trimmed_be(mut v: u128) -> Vec<u8> {
     }
     buf[i..].to_vec()
 }
-fn trim_leading_zeros(mut v: Vec<u8>) -> Vec<u8> {
-    while v.first().is_some_and(|b| *b == 0) {
-        v.remove(0);
-    }
-    v
+
+fn trim_leading_zeros(v: Vec<u8>) -> Vec<u8> {
+    let i = v.iter().position(|&b| b != 0).unwrap_or(v.len());
+    v[i..].to_vec()
 }
 
 /*──────────────────────────── tests ─────────────────────────────*/
@@ -602,7 +594,6 @@ mod tests {
         Caps {
             depth: 2,
             beam_width: 8,
-            max_variants_per_draft: 64,
             eps: 0.0,
         }
     }

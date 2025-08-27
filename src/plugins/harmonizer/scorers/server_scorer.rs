@@ -537,13 +537,7 @@ mod tests {
             ..Default::default()
         });
 
-        // Optimizer setup (using the beam-based optimizer you plugged in)
-        let opt = BasicOptimizer::new(Box::new(scorer), ctx.clone()).with_caps(Caps {
-            depth: 2,
-            beam_width: 16,
-            max_variants_per_draft: 128,
-            eps: 0.0,
-        });
+        let opt = BasicOptimizer::new(Box::new(scorer), ctx.clone()).with_caps(Default::default());
 
         // Seed with a small leaf window; beam can promote and expand.
         let seed = AvailabilityDraft {
@@ -605,12 +599,7 @@ mod tests {
             ..Default::default()
         });
 
-        let opt = BasicOptimizer::new(Box::new(scorer), ctx.clone()).with_caps(Caps {
-            depth: 2,
-            beam_width: 16,
-            max_variants_per_draft: 256,
-            eps: 0.0,
-        });
+        let opt = BasicOptimizer::new(Box::new(scorer), ctx.clone()).with_caps(Default::default());
 
         let txn = db.begin_read_txn().unwrap();
 
