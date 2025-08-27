@@ -285,13 +285,8 @@ impl Plugin for Harmonizer {
         let avail = Availability {
             key: avail_id,
             peer_id,
-            parent: None,
             range: leaf_range,
             level: 0,
-            children: ChildSet {
-                parent: avail_id,
-                children: vec![avail_id],
-            },
             schema_hash: 0,
             version: 0,
             updated_at: now,
@@ -387,13 +382,8 @@ impl Plugin for Harmonizer {
                         let parent = Availability {
                             key: id,
                             peer_id,
-                            parent: None,
                             range: d.range.clone(),
                             level: d.level,
-                            children: ChildSet {
-                                parent: id,
-                                children: vec![],
-                            },
                             schema_hash: 0,
                             version: 0,
                             updated_at: now2,
@@ -611,11 +601,7 @@ mod tests {
             1,
             "should materialize a single leaf availability"
         );
-        assert_eq!(
-            all[0].children.count(),
-            1,
-            "leaf should carry one child symbol"
-        );
+        // Child relations now live in a separate table; leaf completeness and level remain.
         assert!(all[0].complete);
         assert_eq!(all[0].level, 0);
     }
@@ -817,6 +803,6 @@ mod tests {
             !av_b.is_empty(),
             "receiver should materialize a leaf availability for the ingested entity"
         );
-        assert!(av_b.iter().any(|a| a.level == 0 && a.children.count() >= 1));
+        assert!(av_b.iter().any(|a| a.level == 0));
     }
 }

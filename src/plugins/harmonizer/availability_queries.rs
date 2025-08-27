@@ -6,6 +6,7 @@ use crate::{
     KuramotoDb, StaticTableDef,
     plugins::harmonizer::{
         availability::{Availability, roots_for_peer},
+        child_set::{Child, ChildSet, DigestChunk},
         range_cube::RangeCube,
     },
     storage_error::StorageError,
@@ -72,16 +73,21 @@ pub async fn range_cover(
         }
         *touched = true;
 
-        // Leaf or incomplete → frontier
-        let is_leaf = av.children.count() == 0;
+        // Leaf or incomplete → frontier (children resolved via child table)
+        let cs = if let Some(t) = txn {
+            ChildSet::open_tx(db, t, av.key).await?
+        } else {
+            ChildSet::open(db, av.key).await?
+        };
+        let is_leaf = cs.count() == 0;
         if !av.complete || is_leaf {
             out.push(av);
             return Ok(());
         }
 
         // Resolve all children first; if any is missing → frontier
-        let mut child_ids = Vec::with_capacity(av.children.count());
-        for cid in &av.children.children {
+        let mut child_ids = Vec::with_capacity(cs.count());
+        for cid in &cs.children {
             match resolve_child_avail(db, txn, cid).await? {
                 Some(_) => child_ids.push(*cid),
                 None => {
@@ -262,10 +268,11 @@ pub async fn child_count_by_availability(
     txn: Option<&ReadTransaction>,
     availability_id: &UuidBytes,
 ) -> Result<usize, StorageError> {
-    let a: Availability = db
-        .get_data_tx::<Availability>(txn, availability_id.as_bytes())
-        .await?;
-    Ok(a.children.count())
+    let cs = match txn {
+        Some(t) => ChildSet::open_tx(db, t, *availability_id).await?,
+        None => ChildSet::open(db, *availability_id).await?,
+    };
+    Ok(cs.count())
 }
 
 /// Transaction-aware read of raw child IDs embedded in an availability.
@@ -274,10 +281,11 @@ pub async fn children_by_availability(
     txn: Option<&ReadTransaction>,
     availability_id: &UuidBytes,
 ) -> Result<Vec<UuidBytes>, StorageError> {
-    let a: Availability = db
-        .get_data_tx::<Availability>(txn, availability_id.as_bytes())
-        .await?;
-    Ok(a.children.children.clone())
+    let cs = match txn {
+        Some(t) => ChildSet::open_tx(db, t, *availability_id).await?,
+        None => ChildSet::open(db, *availability_id).await?,
+    };
+    Ok(cs.children.clone())
 }
 
 /// Level-agnostic **local** child counter under a peer’s roots:
@@ -353,6 +361,8 @@ mod tests {
         )
         .await;
         db.create_table_and_indexes::<Availability>().unwrap();
+        db.create_table_and_indexes::<Child>().unwrap();
+        db.create_table_and_indexes::<DigestChunk>().unwrap();
         db
     }
 
@@ -366,13 +376,8 @@ mod tests {
         let leaf_hit = Availability {
             key: UuidBytes::new(),
             peer_id: UuidBytes::new(),
-            parent: None,
             range: cube(dim, b"g", b"n"),
             level: 1,
-            children: ChildSet {
-                parent: UuidBytes::new(),
-                children: vec![],
-            },
             schema_hash: 0,
             version: 0,
             updated_at: 0,
@@ -381,13 +386,8 @@ mod tests {
         let leaf_miss = Availability {
             key: UuidBytes::new(),
             peer_id: UuidBytes::new(),
-            parent: None,
             range: cube(dim, b"x", b"z"),
             level: 1,
-            children: ChildSet {
-                parent: UuidBytes::new(),
-                children: vec![],
-            },
             schema_hash: 0,
             version: 0,
             updated_at: 0,
@@ -396,13 +396,8 @@ mod tests {
         let root = Availability {
             key: UuidBytes::new(),
             peer_id: UuidBytes::new(),
-            parent: None,
             range: cube(dim, b"a", b"z"),
             level: 2,
-            children: ChildSet {
-                parent: UuidBytes::new(),
-                children: vec![leaf_hit.key, leaf_miss.key],
-            },
             schema_hash: 0,
             version: 0,
             updated_at: 0,
@@ -411,6 +406,11 @@ mod tests {
         db.put(root.clone()).await.unwrap();
         db.put(leaf_hit.clone()).await.unwrap();
         db.put(leaf_miss.clone()).await.unwrap();
+
+        // Link root → leaf_hit, leaf_miss
+        let mut cs = ChildSet::open(&db, root.key).await.unwrap();
+        cs.add_child(&db, leaf_hit.key).await.unwrap();
+        cs.add_child(&db, leaf_miss.key).await.unwrap();
 
         let target = cube(dim, b"h", b"m");
         let (nodes, no_overlap) = range_cover(&db, None, &target, &[root.key], None)
@@ -431,13 +431,8 @@ mod tests {
         let present = Availability {
             key: UuidBytes::new(),
             peer_id: UuidBytes::new(),
-            parent: None,
             range: cube(dim, b"l", b"o"),
             level: 1,
-            children: ChildSet {
-                parent: UuidBytes::new(),
-                children: vec![],
-            },
             schema_hash: 0,
             version: 0,
             updated_at: 0,
@@ -446,13 +441,8 @@ mod tests {
         let parent = Availability {
             key: UuidBytes::new(),
             peer_id: UuidBytes::new(),
-            parent: None,
             range: cube(dim, b"a", b"z"),
             level: 2,
-            children: ChildSet {
-                parent: UuidBytes::new(),
-                children: vec![missing, present.key],
-            },
             schema_hash: 0,
             version: 0,
             updated_at: 0,
@@ -460,6 +450,11 @@ mod tests {
         };
         db.put(parent.clone()).await.unwrap();
         db.put(present.clone()).await.unwrap();
+
+        // Link parent → {missing, present}
+        let mut cs = ChildSet::open(&db, parent.key).await.unwrap();
+        cs.add_child(&db, missing).await.unwrap();
+        cs.add_child(&db, present.key).await.unwrap();
 
         let target = cube(dim, b"m", b"n");
         let (nodes, no_overlap) = range_cover(&db, None, &target, &[parent.key], None)
@@ -479,13 +474,8 @@ mod tests {
         let c2 = Availability {
             key: UuidBytes::new(),
             peer_id: UuidBytes::new(),
-            parent: None,
             range: cube(dim, b"h", b"i"),
             level: 0,
-            children: ChildSet {
-                parent: UuidBytes::new(),
-                children: vec![],
-            },
             schema_hash: 0,
             version: 0,
             updated_at: 0,
@@ -494,13 +484,8 @@ mod tests {
         let c1 = Availability {
             key: UuidBytes::new(),
             peer_id: UuidBytes::new(),
-            parent: None,
             range: cube(dim, b"f", b"k"),
             level: 1,
-            children: ChildSet {
-                parent: UuidBytes::new(),
-                children: vec![c2.key],
-            },
             schema_hash: 0,
             version: 0,
             updated_at: 0,
@@ -509,13 +494,8 @@ mod tests {
         let root = Availability {
             key: UuidBytes::new(),
             peer_id: UuidBytes::new(),
-            parent: None,
             range: cube(dim, b"a", b"z"),
             level: 2,
-            children: ChildSet {
-                parent: UuidBytes::new(),
-                children: vec![c1.key],
-            },
             schema_hash: 0,
             version: 0,
             updated_at: 0,
@@ -524,6 +504,12 @@ mod tests {
         db.put(root.clone()).await.unwrap();
         db.put(c1.clone()).await.unwrap();
         db.put(c2.clone()).await.unwrap();
+
+        // Link root → c1 → c2
+        let mut cs = ChildSet::open(&db, root.key).await.unwrap();
+        cs.add_child(&db, c1.key).await.unwrap();
+        let mut cs1 = ChildSet::open(&db, c1.key).await.unwrap();
+        cs1.add_child(&db, c2.key).await.unwrap();
 
         let target = cube(dim, b"h", b"i");
 
@@ -548,16 +534,11 @@ mod tests {
         let dim = TableHash { hash: 4 };
 
         let id = UuidBytes::new();
-        let mut a = Availability {
+        let a = Availability {
             key: id,
             peer_id: UuidBytes::new(),
-            parent: None,
             range: cube(dim, b"a", b"b"),
             level: 1,
-            children: ChildSet {
-                parent: id,
-                children: vec![UuidBytes::new(), UuidBytes::new()],
-            },
             schema_hash: 0,
             version: 0,
             updated_at: 0,
@@ -567,18 +548,19 @@ mod tests {
 
         let txn = db.begin_read_txn().unwrap();
 
-        a.children.children.push(UuidBytes::new());
-        db.put(a.clone()).await.unwrap();
+        // Add a child after snapshot creation
+        let mut cs = ChildSet::open(&db, id).await.unwrap();
+        cs.add_child(&db, UuidBytes::new()).await.unwrap();
 
         let cnt_snap = child_count_by_availability(&db, Some(&txn), &id)
             .await
             .unwrap();
-        assert_eq!(cnt_snap, 2);
+        assert_eq!(cnt_snap, 0);
         let cnt_live = child_count_by_availability(&db, None, &id).await.unwrap();
-        assert_eq!(cnt_live, 3);
+        assert_eq!(cnt_live, 1);
 
         let kids_live = children_by_availability(&db, None, &id).await.unwrap();
-        assert_eq!(kids_live.len(), 3);
+        assert_eq!(kids_live.len(), 1);
     }
 
     // ---------- Storage-atom counting (no deserialization) ----------

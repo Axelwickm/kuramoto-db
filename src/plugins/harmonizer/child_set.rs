@@ -4,7 +4,7 @@ use redb::TableDefinition;
 use crate::{
     KuramotoDb, StaticTableDef,
     plugins::harmonizer::riblt::{CodedSymbol, Encoder, Symbol},
-    storage_entity::{IndexSpec, StorageEntity},
+    storage_entity::{IndexCardinality, IndexSpec, StorageEntity},
     storage_error::StorageError,
     uuid_bytes::UuidBytes,
 };
@@ -37,6 +37,10 @@ impl Symbol<16> for UuidBytes {
 pub static AVAIL_CHILDREN_TBL: StaticTableDef = &TableDefinition::new("availability_children");
 pub static AVAIL_CHILDREN_META_TBL: StaticTableDef =
     &TableDefinition::new("availability_children_meta");
+
+// Index: child_id -> rows (parents of this child)
+pub static AVAIL_CHILDREN_BY_CHILD_TBL: StaticTableDef =
+    &TableDefinition::new("availability_children_by_child");
 
 pub static AVAIL_DIG_CHUNK_TBL: StaticTableDef =
     &TableDefinition::new("availability_digest_chunks");
@@ -96,7 +100,13 @@ impl StorageEntity for Child {
     }
 
     fn indexes() -> &'static [IndexSpec<Self>] {
-        &[]
+        static INDEXES: &[IndexSpec<Child>] = &[IndexSpec::<Child> {
+            name: "by_child",
+            key_fn: |c: &Child| c.child_id.as_bytes().to_vec(),
+            table_def: AVAIL_CHILDREN_BY_CHILD_TBL,
+            cardinality: IndexCardinality::NonUnique,
+        }];
+        INDEXES
     }
 }
 
@@ -167,6 +177,16 @@ async fn scan_prefix<E: StorageEntity>(
     db.range_by_pk::<E>(prefix, &hi, None).await
 }
 
+async fn scan_prefix_tx<E: StorageEntity>(
+    db: &KuramotoDb,
+    txn: &redb::ReadTransaction,
+    prefix: &[u8],
+) -> Result<Vec<E>, StorageError> {
+    let mut hi = prefix.to_vec();
+    hi.push(0xFF);
+    db.range_by_pk_tx::<E>(Some(txn), prefix, &hi, None).await
+}
+
 /*────────────────────────── ChildSet ───────────────────────────*/
 
 #[derive(Clone, Debug, Encode, Decode)]
@@ -185,6 +205,18 @@ impl ChildSet {
         })
     }
 
+    pub async fn open_tx(
+        db: &KuramotoDb,
+        txn: &redb::ReadTransaction,
+        parent: UuidBytes,
+    ) -> Result<Self, StorageError> {
+        let rows = scan_prefix_tx::<Child>(db, txn, parent.as_bytes()).await?;
+        Ok(Self {
+            parent,
+            children: rows.into_iter().map(|r| r.child_id).collect(),
+        })
+    }
+
     #[inline]
     pub fn count(&self) -> usize {
         self.children.len()
@@ -196,6 +228,9 @@ impl ChildSet {
         db: &KuramotoDb,
         child_id: UuidBytes,
     ) -> Result<(), StorageError> {
+        if child_id == self.parent {
+            return Err(StorageError::Other("self-edge not allowed".into()));
+        }
         let ord = self.children.len() as u32;
         db.put(Child {
             parent: self.parent,
@@ -301,6 +336,34 @@ impl ChildSet {
             bytes,
         })
         .await
+    }
+}
+
+/*──────── Convenience lookups (txn-aware) ─────────────────────*/
+impl ChildSet {
+    pub async fn parents_of(
+        db: &KuramotoDb,
+        txn: Option<&redb::ReadTransaction>,
+        child: UuidBytes,
+    ) -> Result<Vec<UuidBytes>, StorageError> {
+        let key = child.as_bytes().to_vec();
+        let rows: Vec<Child> = db
+            .get_by_index_all_tx::<Child>(txn, AVAIL_CHILDREN_BY_CHILD_TBL, &key)
+            .await?;
+        // Filter out self-edges just in case
+        Ok(rows
+            .into_iter()
+            .filter(|r| r.parent != child)
+            .map(|r| r.parent)
+            .collect())
+    }
+
+    pub async fn is_root(
+        db: &KuramotoDb,
+        txn: Option<&redb::ReadTransaction>,
+        id: UuidBytes,
+    ) -> Result<bool, StorageError> {
+        Ok(Self::parents_of(db, txn, id).await?.is_empty())
     }
 }
 

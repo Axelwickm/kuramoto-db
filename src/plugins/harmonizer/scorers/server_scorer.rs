@@ -252,7 +252,7 @@ mod tests {
         clock::MockClock,
         plugins::harmonizer::{
             availability::{Availability, roots_for_peer},
-            child_set::ChildSet,
+            child_set::{ChildSet, Child, DigestChunk},
             harmonizer::PeerContext,
             optimizer::{Action, ActionSet, AvailabilityDraft, BasicOptimizer, Caps, Optimizer},
             range_cube::RangeCube,
@@ -283,6 +283,8 @@ mod tests {
         )
         .await;
         db.create_table_and_indexes::<Availability>().unwrap();
+        db.create_table_and_indexes::<Child>().unwrap();
+        db.create_table_and_indexes::<DigestChunk>().unwrap();
         db
     }
 
@@ -304,13 +306,8 @@ mod tests {
             let leaf = Availability {
                 key: id,
                 peer_id: peer,
-                parent: Some(UuidBytes::new()), // arbitrary; roots index doesn't use this
                 range: cube(dim, &lo, &hi),
                 level: 0,
-                children: ChildSet {
-                    parent: id,
-                    children: vec![], // leaf ⇒ 0 children for range_cover frontier
-                },
                 schema_hash: 0,
                 version: 0,
                 updated_at: 0,
@@ -325,19 +322,19 @@ mod tests {
         let root = Availability {
             key: rid,
             peer_id: peer,
-            parent: None,                           // root
             range: cube(dim, &[base], &[base + n]), // covers all
             level: 3,
-            children: ChildSet {
-                parent: rid,
-                children: leaf_ids.clone(),
-            },
             schema_hash: 0,
             version: 0,
             updated_at: 0,
             complete: true,
         };
         db.put(root).await.unwrap();
+        // Link root -> leaves via child table
+        let mut cs = ChildSet::open(db, rid).await.unwrap();
+        for id in &leaf_ids {
+            cs.add_child(db, *id).await.unwrap();
+        }
 
         (rid, leaf_ids)
     }
@@ -377,13 +374,8 @@ mod tests {
         let foreign = Availability {
             key: UuidBytes::new(),
             peer_id: UuidBytes::new(), // different peer
-            parent: None,
             range: cube(dim, &[12], &[13]),
             level: 0,
-            children: ChildSet {
-                parent: UuidBytes::new(),
-                children: vec![],
-            },
             schema_hash: 0,
             version: 0,
             updated_at: 0,
@@ -449,19 +441,19 @@ mod tests {
         let r2 = Availability {
             key: UuidBytes::new(),
             peer_id: ctx.peer_id,
-            parent: None,
             range: cube(dim, &[30], &[33]),
             level: 4,
-            children: ChildSet {
-                parent: UuidBytes::new(),
-                children: leaves.clone(),
-            },
             schema_hash: 0,
             version: 0,
             updated_at: 0,
             complete: true,
         };
+        let r2_id = r2.key;
         db.put(r2).await.unwrap();
+        let mut cs2 = ChildSet::open(&db, r2_id).await.unwrap();
+        for id in &leaves {
+            cs2.add_child(&db, *id).await.unwrap();
+        }
 
         // Sanity: two roots exist
         let txn = db.begin_read_txn().unwrap();
