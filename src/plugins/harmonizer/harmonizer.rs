@@ -227,7 +227,7 @@ impl Harmonizer {
             maxs.push(hi_excl);
         }
 
-        RangeCube { dims, mins, maxs }
+        RangeCube::new(dims, mins, maxs).expect("leaf_range constructed with aligned dims")
     }
 
     /// Returns **owned** bytes (no lifetimes). If your index key encodes PK as suffix/prefix,
@@ -314,7 +314,10 @@ impl Plugin for Harmonizer {
 
         println!(
             "before_update: enqueue avail id={:?} level={} mins={:?} maxs={:?}",
-            avail_id, avail.level, avail.range.mins, avail.range.maxs
+            avail_id,
+            avail.level,
+            avail.range.mins(),
+            avail.range.maxs()
         );
 
         let avail_pk = avail.primary_key();

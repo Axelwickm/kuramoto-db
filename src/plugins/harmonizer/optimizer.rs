@@ -216,7 +216,7 @@ struct PlannerGen {
 impl CandidateGen<PlanState> for PlannerGen {
     fn candidates(&self, s: &PlanState) -> Vec<Action> {
         let steps = step_ladder(8); // TODO: make adjustable
-        let d = s.focus.range.mins.len().min(s.focus.range.maxs.len());
+        let d = s.focus.range.mins().len().min(s.focus.range.maxs().len());
         let mut out: Vec<Action> = Vec::with_capacity(8);
 
         // Identity
@@ -231,9 +231,9 @@ impl CandidateGen<PlanState> for PlannerGen {
         for &st in &steps {
             for ax in 0..d {
                 // min -= Δ
-                if let Some(min2) = be_add_signed(&s.focus.range.mins[ax], -(st as i128)) {
+                if let Some(min2) = be_add_signed(&s.focus.range.mins()[ax], -(st as i128)) {
                     let mut r = s.focus.range.clone();
-                    r.mins[ax] = min2;
+                    r.set_min(ax, min2);
                     if !range_is_empty(&r) {
                         out.push(Action::Insert(AvailabilityDraft {
                             level: s.focus.level,
@@ -243,9 +243,9 @@ impl CandidateGen<PlanState> for PlannerGen {
                     }
                 }
                 // max += Δ
-                if let Some(max2) = be_add_signed(&s.focus.range.maxs[ax], st as i128) {
+                if let Some(max2) = be_add_signed(&s.focus.range.maxs()[ax], st as i128) {
                     let mut r = s.focus.range.clone();
-                    r.maxs[ax] = max2;
+                    r.set_max(ax, max2);
                     if !range_is_empty(&r) {
                         out.push(Action::Insert(AvailabilityDraft {
                             level: s.focus.level,
@@ -256,12 +256,12 @@ impl CandidateGen<PlanState> for PlannerGen {
                 }
                 // grow both
                 if let (Some(min2), Some(max2)) = (
-                    be_add_signed(&s.focus.range.mins[ax], -(st as i128)),
-                    be_add_signed(&s.focus.range.maxs[ax], st as i128),
+                    be_add_signed(&s.focus.range.mins()[ax], -(st as i128)),
+                    be_add_signed(&s.focus.range.maxs()[ax], st as i128),
                 ) {
                     let mut r = s.focus.range.clone();
-                    r.mins[ax] = min2;
-                    r.maxs[ax] = max2;
+                    r.set_min(ax, min2);
+                    r.set_max(ax, max2);
                     if !range_is_empty(&r) {
                         out.push(Action::Insert(AvailabilityDraft {
                             level: s.focus.level,
@@ -318,17 +318,17 @@ impl<'a> PlannerEval<'a> {
 
     fn range_key(r: &RangeCube) -> Vec<u8> {
         let mut k = Vec::with_capacity(64);
-        for d in &r.dims {
+        for d in r.dims() {
             k.extend_from_slice(&d.hash.to_be_bytes());
             k.push(0xFE);
         }
         k.push(0xF0);
-        for m in &r.mins {
+        for m in r.mins() {
             k.extend_from_slice(m);
             k.push(0xFD);
         }
         k.push(0xE0);
-        for m in &r.maxs {
+        for m in r.maxs() {
             k.extend_from_slice(m);
             k.push(0xFB);
         }
@@ -440,12 +440,12 @@ fn draft_eq(a: &AvailabilityDraft, b: &AvailabilityDraft) -> bool {
     a.level == b.level && a.complete == b.complete && ranges_equal(&a.range, &b.range)
 }
 fn ranges_equal(x: &RangeCube, y: &RangeCube) -> bool {
-    if x.dims.len() != y.dims.len() || x.mins.len() != y.mins.len() || x.maxs.len() != y.maxs.len()
+    if x.dims().len() != y.dims().len() || x.mins().len() != y.mins().len() || x.maxs().len() != y.maxs().len()
     {
         return false;
     }
-    for i in 0..x.mins.len() {
-        if x.mins[i] != y.mins[i] || x.maxs[i] != y.maxs[i] {
+    for i in 0..x.mins().len() {
+        if x.mins()[i] != y.mins()[i] || x.maxs()[i] != y.maxs()[i] {
             return false;
         }
     }
@@ -455,8 +455,8 @@ fn ranges_equal(x: &RangeCube, y: &RangeCube) -> bool {
 /*──────────────────────── range / byte math ─────────────────────────*/
 
 fn range_is_empty(r: &RangeCube) -> bool {
-    let n = r.mins.len().min(r.maxs.len());
-    (0..n).any(|i| r.maxs[i] <= r.mins[i])
+    let n = r.mins().len().min(r.maxs().len());
+    (0..n).any(|i| r.maxs()[i] <= r.mins()[i])
 }
 
 pub fn step_ladder(n: usize) -> Vec<usize> {
@@ -566,14 +566,16 @@ mod tests {
     };
 
     fn draft(level: u16, mins: &[&[u8]], maxs: &[&[u8]]) -> AvailabilityDraft {
+        let len = mins.len().min(maxs.len());
+        let dims: smallvec::SmallVec<[TableHash; 4]> = (0..len)
+            .map(|i| TableHash { hash: i as u64 })
+            .collect();
+        let mins_sv: smallvec::SmallVec<[Vec<u8>; 4]> = mins.iter().map(|m| m.to_vec()).collect();
+        let maxs_sv: smallvec::SmallVec<[Vec<u8>; 4]> = maxs.iter().map(|m| m.to_vec()).collect();
         AvailabilityDraft {
             level,
             complete: true,
-            range: RangeCube {
-                dims: smallvec![], // tests don't depend on dims here
-                mins: mins.iter().map(|m| m.to_vec()).collect(),
-                maxs: maxs.iter().map(|m| m.to_vec()).collect(),
-            },
+            range: RangeCube::new(dims, mins_sv, maxs_sv).unwrap(),
         }
     }
 

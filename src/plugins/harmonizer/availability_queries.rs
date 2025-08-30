@@ -144,11 +144,11 @@ async fn storage_atom_count_in_cube_tx(
     }
     let mut by_parent: BTreeMap<u64, Group> = BTreeMap::new();
 
-    let n = cube.dims.len().min(cube.mins.len()).min(cube.maxs.len());
+    let n = cube.dims().len().min(cube.mins().len()).min(cube.maxs().len());
     for i in 0..n {
-        let h = cube.dims[i].hash;
-        let lo = cube.mins[i].clone();
-        let hi = cube.maxs[i].clone();
+        let h = cube.dims()[i].hash;
+        let lo = cube.mins()[i].clone();
+        let hi = cube.maxs()[i].clone();
 
         if let Some(data_tbl) = db.resolve_data_table_by_hash(h) {
             by_parent
@@ -341,11 +341,12 @@ mod tests {
     // ---------- Helpers ----------
 
     fn cube(dim: TableHash, min: &[u8], max: &[u8]) -> RangeCube {
-        RangeCube {
-            dims: smallvec![dim],
-            mins: smallvec![min.to_vec()],
-            maxs: smallvec![max.to_vec()],
-        }
+        RangeCube::new(
+            smallvec![dim],
+            smallvec![min.to_vec()],
+            smallvec![max.to_vec()],
+        )
+        .unwrap()
     }
 
     async fn fresh_db() -> Arc<KuramotoDb> {
@@ -674,11 +675,12 @@ mod tests {
         let tag_dim = TableHash::from(&IDX_TAG);
 
         // PK [2,5) → {2,3,4}, tag==2   → {3,4,5}; intersection = {3,4} → 2 items
-        let r = RangeCube {
-            dims: smallvec![pk_dim, tag_dim],
-            mins: smallvec![2u64.to_be_bytes().to_vec(), vec![2u8]],
-            maxs: smallvec![5u64.to_be_bytes().to_vec(), vec![3u8]],
-        };
+        let r = RangeCube::new(
+            smallvec![pk_dim, tag_dim],
+            smallvec![2u64.to_be_bytes().to_vec(), vec![2u8]],
+            smallvec![5u64.to_be_bytes().to_vec(), vec![3u8]],
+        )
+        .unwrap();
 
         let n = super::storage_atom_count_in_cube_tx(&db, None, &r)
             .await
@@ -695,11 +697,12 @@ mod tests {
         // uniq in [12,14) → uniq = 12,13 → ids {3,4}
         // tag == 2        → ids {3,4,5}
         // intersection    → {3,4} → 2
-        let r = RangeCube {
-            dims: smallvec![uniq_dim, tag_dim],
-            mins: smallvec![vec![12u8], vec![2u8]],
-            maxs: smallvec![vec![14u8], vec![3u8]],
-        };
+        let r = RangeCube::new(
+            smallvec![uniq_dim, tag_dim],
+            smallvec![vec![12u8], vec![2u8]],
+            smallvec![vec![14u8], vec![3u8]],
+        )
+        .unwrap();
 
         let n = super::storage_atom_count_in_cube_tx(&db, None, &r)
             .await

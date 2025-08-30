@@ -141,11 +141,12 @@ mod tests {
     use tempfile::tempdir;
 
     fn cube(dim: TableHash, min: &[u8], max: &[u8]) -> RangeCube {
-        RangeCube {
-            dims: smallvec![dim],
-            mins: smallvec![min.to_vec()],
-            maxs: smallvec![max.to_vec()],
-        }
+        RangeCube::new(
+            smallvec![dim],
+            smallvec![min.to_vec()],
+            smallvec![max.to_vec()],
+        )
+        .unwrap()
     }
 
     async fn fresh_db() -> Arc<KuramotoDb> {

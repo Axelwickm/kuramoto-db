@@ -63,17 +63,17 @@ fn peer_key_bytes(p: &UuidBytes) -> Vec<u8> {
 }
 fn range_key(r: &RangeCube) -> Vec<u8> {
     let mut k = Vec::with_capacity(64);
-    for d in &r.dims {
+    for d in r.dims() {
         k.extend_from_slice(&d.hash.to_be_bytes());
         k.push(0xFE);
     }
     k.push(0xF0);
-    for m in &r.mins {
+    for m in r.mins() {
         k.extend_from_slice(m);
         k.push(0xFD);
     }
     k.push(0xE0);
-    for m in &r.maxs {
+    for m in r.maxs() {
         k.extend_from_slice(m);
         k.push(0xFB);
     }
@@ -266,11 +266,12 @@ mod tests {
     use tempfile::tempdir;
 
     fn cube(dim: TableHash, min: &[u8], max_excl: &[u8]) -> RangeCube {
-        RangeCube {
-            dims: smallvec![dim],
-            mins: smallvec![min.to_vec()],
-            maxs: smallvec![max_excl.to_vec()],
-        }
+        RangeCube::new(
+            smallvec![dim],
+            smallvec![min.to_vec()],
+            smallvec![max_excl.to_vec()],
+        )
+        .unwrap()
     }
 
     async fn fresh_db() -> Arc<KuramotoDb> {
@@ -619,8 +620,8 @@ mod tests {
             seeds = seeds
                 .iter()
                 .map(|s| {
-                    let mut lo = s.range.mins[0].clone();
-                    let mut hi = s.range.maxs[0].clone();
+                    let mut lo = s.range.mins()[0].clone();
+                    let mut hi = s.range.maxs()[0].clone();
                     if !lo.is_empty() {
                         lo[0] = lo[0].saturating_add(3);
                     }
