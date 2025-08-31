@@ -23,9 +23,9 @@ use std::sync::Mutex;
 use crate::{
     KuramotoDb,
     plugins::harmonizer::{
-        availability::Availability,
+        availability::{Availability, AVAILABILITY_BY_PEER},
         availability::roots_for_peer,
-        availability_queries::range_cover,
+        availability_queries::{range_cover, resolve_child_avail},
         harmonizer::PeerContext,
         range_cube::RangeCube,
         scorers::Scorer,
@@ -175,11 +175,56 @@ impl Optimizer for BasicOptimizer {
 
         let mut merged: ActionSet = Vec::new();
 
+
         let mut search = BeamSearch::new(cfg);
 
         for seed in seeds {
+            // Build delete candidates for this seed.
+            // Preferred: if seed corresponds to an existing availability, enumerate its children by ID.
+            // Fallback: frontier walk by range for hypothetical seeds.
+            let mut dels: Vec<UuidBytes> = Vec::new();
+
+            // Try to locate an exact existing availability matching the seed (peer, level, geometry).
+            let peer_key = self.ctx.peer_id.as_bytes().to_vec();
+            let locals: Vec<Availability> = db
+                .get_by_index_all_tx::<Availability>(Some(txn), AVAILABILITY_BY_PEER, &peer_key)
+                .await?;
+            let existing = locals.iter().find(|a| {
+                a.complete && a.level == seed.level && ranges_equal(&a.range, &seed.range)
+            });
+
+            if let Some(parent) = existing {
+                // Enumerate children via ChildSet; optimizer proposes deletions, scorer will decide value.
+                let cs = crate::plugins::harmonizer::child_set::ChildSet::open_tx(db, txn, parent.key)
+                    .await
+                    .unwrap_or(crate::plugins::harmonizer::child_set::ChildSet { parent: parent.key, children: vec![] });
+                for cid in cs.children.iter() {
+                    if let Some(child) = resolve_child_avail(db, Some(txn), cid).await? {
+                        if child.peer_id != self.ctx.peer_id || !child.complete {
+                            continue;
+                        }
+                        dels.push(child.key);
+                    }
+                }
+            } else {
+                // Hypothetical seed: enumerate local frontier nodes under the seed range (root-scoped)
+                let roots = roots_for_peer(db, Some(txn), &self.ctx.peer_id).await?;
+                let root_ids: Vec<_> = roots.into_iter().map(|r| r.key).collect();
+                let mut qcache = None;
+                let (frontier, no_overlap) = range_cover(db, Some(txn), &seed.range, &root_ids, None, &vec![], &mut qcache).await?;
+                if !no_overlap {
+                    for a in frontier.into_iter() {
+                        if a.peer_id == self.ctx.peer_id && a.complete && seed.range.contains(&a.range) {
+                            if let Some(av) = resolve_child_avail(db, Some(txn), &a.key).await? {
+                                dels.push(av.key);
+                            }
+                        }
+                    }
+                }
+            }
+
             let start = PlanState::new(seed.clone());
-            let g = PlannerGen { caps: self.caps };
+            let g = PlannerGen { caps: self.caps, deletes: dels };
             let eval = PlannerEval::new(db, txn, &self.ctx, &*self.scorer);
 
             let Some(path) = search.propose_step(&start, &g, &eval).await else {
@@ -200,11 +245,12 @@ impl Optimizer for BasicOptimizer {
             }
         }
 
-        if merged.is_empty() {
+        let out = if merged.is_empty() {
             Ok(None)
         } else {
             Ok(Some(merged))
-        }
+        };
+        out
     }
 }
 
@@ -212,6 +258,7 @@ impl Optimizer for BasicOptimizer {
 
 struct PlannerGen {
     caps: Caps,
+    deletes: Vec<UuidBytes>,
 }
 impl CandidateGen<PlanState> for PlannerGen {
     fn candidates(&self, s: &PlanState) -> Vec<Action> {
@@ -273,11 +320,21 @@ impl CandidateGen<PlanState> for PlannerGen {
             }
         }
 
-        // De-dup by (level, range, complete), capped
+        // Add Delete candidates from scorer-provided pool (attached to generator)
+        for id in &self.deletes {
+            out.push(Action::Delete(*id));
+        }
+
+        // De-dup by (level, range, complete) and unique Delete ids, capped
         let mut uniq: ActionSet = Vec::with_capacity(out.len());
         for a in out.into_iter() {
             if let Action::Insert(ref d) = a {
                 if contains_insert(&uniq, d) {
+                    continue;
+                }
+            }
+            if let Action::Delete(id) = a {
+                if uniq.iter().any(|u| matches!(u, Action::Delete(x) if *x == id)) {
                     continue;
                 }
             }
@@ -357,8 +414,9 @@ impl<'a> PlannerEval<'a> {
             }
         }
         let roots_ids = self.ensure_roots().await?;
+        let mut qcache = None;
         let (frontier, no_overlap) =
-            range_cover(self.db, Some(self.txn), target, &roots_ids, None).await?;
+            range_cover(self.db, Some(self.txn), target, &roots_ids, None, &vec![], &mut qcache).await?;
         let mut seen = HashSet::<UuidBytes>::new();
         if !no_overlap {
             for a in frontier {
@@ -589,6 +647,8 @@ mod tests {
         )
         .await;
         db.create_table_and_indexes::<Availability>().unwrap();
+        db.create_table_and_indexes::<crate::plugins::harmonizer::child_set::Child>().unwrap();
+        db.create_table_and_indexes::<crate::plugins::harmonizer::child_set::DigestChunk>().unwrap();
         db
     }
 
@@ -630,6 +690,22 @@ mod tests {
             _overlay: &ActionSet,
         ) -> f32 {
             a.range.approx_volume() as f32 + (a.level as f32) * 2.0
+        }
+    }
+
+    /// Prefers having at least one delete in the overlay.
+    struct DeleteFavorScorer;
+    #[async_trait::async_trait]
+    impl Scorer for DeleteFavorScorer {
+        async fn score(
+            &self,
+            _db: &KuramotoDb,
+            _txn: &ReadTransaction,
+            _ctx: &PeerContext,
+            _a: &AvailabilityDraft,
+            overlay: &ActionSet,
+        ) -> f32 {
+            overlay.iter().filter(|x| matches!(x, Action::Delete(_))).count() as f32
         }
     }
 
@@ -681,5 +757,55 @@ mod tests {
         );
         // No explicit deletes in this planner
         assert!(!plan.iter().any(|a| matches!(a, Action::Delete(_))));
+    }
+
+    #[tokio::test]
+    async fn planner_generates_delete_candidates() {
+        let db = fresh_db().await;
+        let ctx = PeerContext { peer_id: UuidBytes::new() };
+
+        // Create a leaf and a parent that contains it; parent is root (no parent edge)
+        use crate::tables::TableHash;
+        let dim = TableHash { hash: 1 };
+        let leaf = Availability {
+            key: UuidBytes::new(),
+            peer_id: ctx.peer_id,
+            range: RangeCube::new(
+                smallvec![dim],
+                smallvec![vec![0x10]],
+                smallvec![vec![0x11]],
+            ).unwrap(),
+            level: 0,
+            schema_hash: 0,
+            version: 0,
+            updated_at: 0,
+            complete: true,
+        };
+        db.put(leaf.clone()).await.unwrap();
+        let parent = Availability {
+            key: UuidBytes::new(),
+            peer_id: ctx.peer_id,
+            range: RangeCube::new(
+                smallvec![dim],
+                smallvec![vec![0x10]],
+                smallvec![vec![0x12]],
+            ).unwrap(),
+            level: 1,
+            schema_hash: 0,
+            version: 0,
+            updated_at: 0,
+            complete: true,
+        };
+        let pid = parent.key;
+        db.put(parent.clone()).await.unwrap();
+        // Link parent -> leaf
+        let mut cs = ChildSet::open(&db, pid).await.unwrap();
+        cs.add_child(&db, leaf.key).await.unwrap();
+
+        let opt = BasicOptimizer::new(Box::new(DeleteFavorScorer), ctx.clone()).with_caps(caps());
+        let seed = AvailabilityDraft { level: 0, range: leaf.range.clone(), complete: true };
+        let txn = db.begin_read_txn().unwrap();
+        let plan = opt.propose(&db, &txn, &[seed]).await.unwrap().unwrap();
+        assert!(plan.iter().any(|a| matches!(a, Action::Delete(_))), "expected a delete candidate to be proposed");
     }
 }

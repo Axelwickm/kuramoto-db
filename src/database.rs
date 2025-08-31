@@ -62,10 +62,29 @@ pub enum WriteRequest {
     },
 }
 
+// Small helper to construct an IndexRemoveRequest from other modules.
+pub fn make_index_remove(table: StaticTableDef, key: Vec<u8>) -> IndexRemoveRequest {
+    IndexRemoveRequest { table, key }
+}
+
 type TablePutFn = dyn for<'a> Fn(
         &'a KuramotoDb,
         &'a [u8],
     ) -> Pin<Box<dyn Future<Output = Result<(), StorageError>> + Send + 'a>>
+    + Send
+    + Sync;
+
+type TableDeleteFn = dyn for<'a> Fn(
+        &'a KuramotoDb,
+        &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = Result<(), StorageError>> + Send + 'a>>
+    + Send
+    + Sync;
+
+type TableDeletePlanFn = dyn for<'a> Fn(
+        &'a KuramotoDb,
+        &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = Result<WriteRequest, StorageError>> + Send + 'a>>
     + Send
     + Sync;
 
@@ -95,6 +114,8 @@ pub struct KuramotoDb {
     plugins: Vec<Arc<dyn Plugin>>,
 
     entity_putters: RwLock<HashMap<String, Arc<TablePutFn>>>,
+    entity_deleters: RwLock<HashMap<String, Arc<TableDeleteFn>>>,
+    entity_delete_planners: RwLock<HashMap<String, Arc<TableDeletePlanFn>>>,
     data_table_by_hash: RwLock<HashMap<u64, StaticTableDef>>,
     index_table_by_hash: RwLock<HashMap<u64, (StaticTableDef, StaticTableDef)>>,
 }
@@ -117,6 +138,8 @@ impl KuramotoDb {
             data_table_by_hash: RwLock::new(HashMap::new()),
             index_table_by_hash: RwLock::new(HashMap::new()),
             entity_putters: RwLock::new(HashMap::new()),
+            entity_deleters: RwLock::new(HashMap::new()),
+            entity_delete_planners: RwLock::new(HashMap::new()),
         });
 
         for p in &sys.plugins {
@@ -144,6 +167,70 @@ impl KuramotoDb {
                         // decode via E and call the normal typed put()
                         let e = E::load_and_migrate(bytes)?;
                         db.put::<E>(e).await
+                    })
+                }),
+            );
+        }
+        {
+            // Register a generic deleter for this entity table
+            let mut m = self.entity_deleters.write().unwrap();
+            m.insert(
+                E::table_def().name().to_string(),
+                Arc::new(|db, pk| {
+                    Box::pin(async move { db.delete::<E>(pk).await })
+                }),
+            );
+        }
+        {
+            // Register a generic delete planner that builds a WriteRequest::Delete
+            let mut m = self.entity_delete_planners.write().unwrap();
+            m.insert(
+                E::table_def().name().to_string(),
+                Arc::new(|db, pk| {
+                    Box::pin(async move {
+                        // Fetch the current entity so we can generate all index keys to remove
+                        let old_entity = db.get_data::<E>(pk).await?;
+                        let old_meta = db.get_meta::<E>(pk).await?;
+                        let now = db.clock.now();
+                        let meta = BlobMeta {
+                            deleted_at: Some(now),
+                            updated_at: now,
+                            ..old_meta
+                        };
+
+                        let index_removes: Vec<IndexRemoveRequest> = E::indexes()
+                            .iter()
+                            .map(|idx| {
+                                let raw = (idx.key_fn)(&old_entity);
+                                let stored = match idx.cardinality {
+                                    IndexCardinality::Unique => raw,
+                                    IndexCardinality::NonUnique => {
+                                        // replicate encode_nonunique_key()
+                                        let mut out = Vec::with_capacity(raw.len() + 1 + pk.len());
+                                        out.extend_from_slice(&raw);
+                                        out.push(0);
+                                        out.extend_from_slice(pk);
+                                        out
+                                    }
+                                };
+                                IndexRemoveRequest {
+                                    table: idx.table_def,
+                                    key: stored,
+                                }
+                            })
+                            .collect();
+
+                        Ok(WriteRequest::Delete {
+                            data_table: &E::table_def(),
+                            meta_table: &E::meta_table_def(),
+                            key: pk.to_vec(),
+                            meta: bincode::encode_to_vec(
+                                meta,
+                                bincode::config::standard(),
+                            )
+                            .map_err(|e| StorageError::Bincode(e.to_string()))?,
+                            index_removes,
+                        })
                     })
                 }),
             );
@@ -763,6 +850,46 @@ impl KuramotoDb {
 
         // Now no lock/guard is live across this await.
         put(self, bytes).await
+    }
+
+    /// Delete by table name + primary key using registered entity deleter.
+    pub async fn delete_by_table_pk(
+        &self,
+        table_name: &str,
+        pk: &[u8],
+    ) -> Result<(), StorageError> {
+        // Take a clone of the Arc<deleter> while holding the read lock,
+        // then drop the lock before we .await, so the future is Send.
+        let deleter = {
+            let m = self.entity_deleters.read().unwrap();
+            m.get(table_name).cloned()
+        };
+
+        let Some(del) = deleter else {
+            return Err(StorageError::Other(format!(
+                "no entity registered for table '{table_name}'"
+            )));
+        };
+
+        del(self, pk).await
+    }
+
+    /// Build a WriteRequest::Delete for given table name + pk using registered delete planner.
+    pub async fn plan_delete_by_table_pk(
+        &self,
+        table_name: &str,
+        pk: &[u8],
+    ) -> Result<WriteRequest, StorageError> {
+        let planner = {
+            let m = self.entity_delete_planners.read().unwrap();
+            m.get(table_name).cloned()
+        };
+        let Some(plan) = planner else {
+            return Err(StorageError::Other(format!(
+                "no entity registered for table '{table_name}'"
+            )));
+        };
+        plan(self, pk).await
     }
 
     pub async fn put<E: StorageEntity>(&self, entity: E) -> Result<(), StorageError> {
@@ -2012,6 +2139,71 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn plan_delete_by_table_pk_builds_and_applies() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = Arc::new(MockClock::new(0));
+        let db = KuramotoDb::new(dir.path().join("plan_del.redb").to_str().unwrap(), clock, vec![]).await;
+        db.create_table_and_indexes::<TestEntity>().unwrap();
+
+        // Seed two rows with same value so non-unique index has multiple entries
+        let a = TestEntity { id: 1, name: "Alice".into(), value: 7 };
+        let b = TestEntity { id: 2, name: "Bob".into(), value: 7 };
+        db.put(a.clone()).await.unwrap();
+        db.put(b.clone()).await.unwrap();
+
+        // Plan delete for Alice
+        let req = db
+            .plan_delete_by_table_pk(TEST_TABLE.name(), &a.id.to_be_bytes())
+            .await
+            .unwrap();
+
+        // Apply it via raw_write
+        db.raw_write(req).await.unwrap();
+
+        // Alice gone; Bob remains
+        assert!(db.get_data::<TestEntity>(&a.id.to_be_bytes()).await.is_err());
+        let got_b = db.get_data::<TestEntity>(&b.id.to_be_bytes()).await.unwrap();
+        assert_eq!(got_b.name, "Bob");
+
+        // Unique index for name must not have Alice
+        let idx_a = db.get_index(&TEST_NAME_INDEX, b"Alice").await.unwrap();
+        assert!(idx_a.is_none());
+
+        // Non-unique index for value must still have Bob's pk
+        let pks = db
+            .get_index_all(&TEST_VALUE_INDEX, &7i32.to_be_bytes())
+            .await
+            .unwrap();
+        assert_eq!(pks.len(), 1);
+        assert_eq!(pks[0], b.id.to_be_bytes());
+    }
+
+    #[tokio::test]
+    async fn delete_by_table_pk_executes_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = Arc::new(MockClock::new(0));
+        let db = KuramotoDb::new(dir.path().join("del_by_tbl.redb").to_str().unwrap(), clock, vec![]).await;
+        db.create_table_and_indexes::<TestEntity>().unwrap();
+
+        let e = TestEntity { id: 10, name: "Z".into(), value: 99 };
+        db.put(e.clone()).await.unwrap();
+
+        // Sanity index present
+        let has = db.get_index(&TEST_NAME_INDEX, b"Z").await.unwrap();
+        assert_eq!(has, Some(e.id.to_be_bytes().to_vec()));
+
+        // Delete by table name
+        db.delete_by_table_pk(TEST_TABLE.name(), &e.id.to_be_bytes())
+            .await
+            .unwrap();
+
+        // Gone + index removed
+        assert!(db.get_data::<TestEntity>(&e.id.to_be_bytes()).await.is_err());
+        let gone = db.get_index(&TEST_NAME_INDEX, b"Z").await.unwrap();
+        assert!(gone.is_none());
     }
 
     #[tokio::test]

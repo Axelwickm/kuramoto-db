@@ -4,15 +4,13 @@
 
 use async_trait::async_trait;
 use redb::ReadTransaction;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 use crate::{
     KuramotoDb,
     plugins::harmonizer::{
-        availability::Availability,
-        availability::roots_for_peer,
-        availability_queries::{count_replications, range_cover},
+        availability_queries::{local_child_count_under_peer, peer_contains_range_local, AvailabilityQueryCache},
         harmonizer::PeerContext,
         optimizer::{Action, ActionSet, AvailabilityDraft},
         range_cube::RangeCube,
@@ -50,9 +48,8 @@ impl Default for ServerScorerParams {
 
 #[derive(Default)]
 struct ScorerCaches {
-    roots: Mutex<HashMap<(usize, Vec<u8>), Vec<UuidBytes>>>,
-    frontier: Mutex<HashMap<(usize, Vec<u8>, Vec<u8>), Vec<UuidBytes>>>,
     repl: Mutex<HashMap<(usize, Vec<u8>), usize>>,
+    child_counts: Mutex<HashMap<(usize, Vec<u8>, Vec<u8>), usize>>,
 }
 
 fn txntag(txn: &ReadTransaction) -> usize {
@@ -84,6 +81,7 @@ fn range_key(r: &RangeCube) -> Vec<u8> {
 pub struct ServerScorer {
     params: ServerScorerParams,
     caches: ScorerCaches,
+    query_cache: Mutex<Option<AvailabilityQueryCache>>, // shared per-txn cache
 }
 
 impl ServerScorer {
@@ -91,6 +89,18 @@ impl ServerScorer {
         Self {
             params,
             caches: ScorerCaches::default(),
+            query_cache: Mutex::new(None),
+        }
+    }
+
+    fn ensure_cache_for_txn(&self, txn: &ReadTransaction) {
+        let mut guard = self.query_cache.lock().unwrap();
+        let needs = match guard.as_ref() {
+            Some(c) => !c.compatible_txn(Some(txn)),
+            None => true,
+        };
+        if needs {
+            *guard = Some(AvailabilityQueryCache::new(txn));
         }
     }
 
@@ -98,8 +108,11 @@ impl ServerScorer {
         &self,
         db: &KuramotoDb,
         txn: &ReadTransaction,
+        ctx: &PeerContext,
         cand: &AvailabilityDraft,
+        overlay: &ActionSet,
     ) -> Result<usize, StorageError> {
+        self.ensure_cache_for_txn(txn);
         let tk = txntag(txn);
         let rk = range_key(&cand.range);
         {
@@ -109,7 +122,30 @@ impl ServerScorer {
                 return Ok(*v);
             }
         }
-        let v = count_replications(db, Some(txn), &cand.range, |_a| true, None).await?;
+        // NOTE: Avoid global scans. Count local coverage via roots/frontier,
+        // and optionally ask a remote probe for non-local replicas.
+        let has_local = {
+            let mut local_cache = {
+                let mut guard = self.query_cache.lock().unwrap();
+                guard.take()
+            };
+            let mut opt_ref: Option<&mut AvailabilityQueryCache> = local_cache.as_mut().map(|c| c as _);
+            let res = peer_contains_range_local(
+                db,
+                Some(txn),
+                &ctx.peer_id,
+                &cand.range,
+                overlay,
+                &mut opt_ref,
+            )
+            .await?;
+            {
+                let mut guard = self.query_cache.lock().unwrap();
+                *guard = local_cache;
+            }
+            res
+        };
+        let mut v = if has_local { 1 } else { 0 };
         {
             let mut repl = self.caches.repl.lock().unwrap();
             if repl.len() > 4096 {
@@ -118,72 +154,6 @@ impl ServerScorer {
             repl.insert((tk, rk), v);
         }
         Ok(v)
-    }
-
-    async fn roots_for_peer(
-        &self,
-        db: &KuramotoDb,
-        txn: &ReadTransaction,
-        peer: &UuidBytes,
-    ) -> Result<Vec<UuidBytes>, StorageError> {
-        let tk = txntag(txn);
-        let pk = peer_key_bytes(peer);
-        {
-            let roots = self.caches.roots.lock().unwrap();
-            if let Some(v) = roots.get(&(tk, pk.clone())) {
-                // println!("Root cache hit");
-                return Ok(v.clone());
-            }
-        }
-        let roots = roots_for_peer(db, Some(txn), peer).await?;
-        let ids: Vec<UuidBytes> = roots.into_iter().map(|r| r.key).collect();
-        {
-            let mut roots = self.caches.roots.lock().unwrap();
-            if roots.len() > 1024 {
-                roots.clear();
-            }
-            roots.insert((tk, pk), ids.clone());
-        }
-        Ok(ids)
-    }
-
-    async fn frontier_ids(
-        &self,
-        db: &KuramotoDb,
-        txn: &ReadTransaction,
-        ctx: &PeerContext,
-        range: &RangeCube,
-    ) -> Result<Vec<UuidBytes>, StorageError> {
-        let tk = txntag(txn);
-        let pk = peer_key_bytes(&ctx.peer_id);
-        let rk = range_key(range);
-        {
-            let fr = self.caches.frontier.lock().unwrap();
-            if let Some(v) = fr.get(&(tk, pk.clone(), rk.clone())) {
-                // println!("Fronteir cache hit");
-                return Ok(v.clone());
-            }
-        }
-
-        let roots_ids = self.roots_for_peer(db, txn, &ctx.peer_id).await?;
-        let (frontier, no_overlap) = range_cover(db, Some(txn), range, &roots_ids, None).await?;
-        let mut seen = HashSet::<UuidBytes>::new();
-        if !no_overlap {
-            for a in frontier {
-                if a.peer_id == ctx.peer_id && a.complete && range.contains(&a.range) {
-                    let _ = seen.insert(a.key);
-                }
-            }
-        }
-        let ids: Vec<UuidBytes> = seen.into_iter().collect();
-        {
-            let mut fr = self.caches.frontier.lock().unwrap();
-            if fr.len() > 4 * 4096 {
-                fr.clear();
-            }
-            fr.insert((tk, pk, rk), ids.clone());
-        }
-        Ok(ids)
     }
 
     fn child_count_score(&self, child_count: usize) -> f32 {
@@ -200,14 +170,52 @@ impl ServerScorer {
         cand: &AvailabilityDraft,
         overlay: &ActionSet,
     ) -> Result<usize, StorageError> {
-        let mut deleted = HashSet::<UuidBytes>::new();
-        for a in overlay {
-            if let Action::Delete(id) = a {
-                deleted.insert(*id);
+        self.ensure_cache_for_txn(txn);
+        let tk = txntag(txn);
+        let pk = peer_key_bytes(&ctx.peer_id);
+        let rk = range_key(&cand.range);
+        if overlay.is_empty() {
+            if let Some(cached) = self
+                .caches
+                .child_counts
+                .lock()
+                .unwrap()
+                .get(&(tk, pk.clone(), rk.clone()))
+                .copied()
+            {
+                return Ok(cached);
             }
         }
-        let ids = self.frontier_ids(db, txn, ctx, &cand.range).await?;
-        let count = ids.iter().filter(|id| !deleted.contains(id)).count();
+
+        let count = {
+            let mut local_cache = {
+                let mut guard = self.query_cache.lock().unwrap();
+                guard.take()
+            };
+            let mut opt_ref: Option<&mut AvailabilityQueryCache> = local_cache.as_mut().map(|c| c as _);
+            let res = local_child_count_under_peer(
+                db,
+                Some(txn),
+                &ctx.peer_id,
+                &cand.range,
+                overlay,
+                &mut opt_ref,
+            )
+            .await?;
+            {
+                let mut guard = self.query_cache.lock().unwrap();
+                *guard = local_cache;
+            }
+            res
+        };
+
+        if overlay.is_empty() {
+            let mut cc = self.caches.child_counts.lock().unwrap();
+            if cc.len() > 4 * 4096 {
+                cc.clear();
+            }
+            cc.insert((tk, pk, rk), count);
+        }
         Ok(count)
     }
 }
@@ -222,7 +230,7 @@ impl Scorer for ServerScorer {
         cand: &AvailabilityDraft,
         overlay: &ActionSet,
     ) -> f32 {
-        let replicas = match self.replication_count(db, txn, cand).await {
+        let replicas = match self.replication_count(db, txn, ctx, cand, overlay).await {
             Ok(n) => n as i32,
             Err(_) => 0,
         };
@@ -252,7 +260,7 @@ mod tests {
         clock::MockClock,
         plugins::harmonizer::{
             availability::{Availability, roots_for_peer},
-            child_set::{ChildSet, Child, DigestChunk},
+            child_set::{Child, ChildSet, DigestChunk},
             harmonizer::PeerContext,
             optimizer::{Action, ActionSet, AvailabilityDraft, BasicOptimizer, Caps, Optimizer},
             range_cube::RangeCube,

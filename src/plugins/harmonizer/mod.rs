@@ -2,6 +2,7 @@ mod availability;
 mod availability_queries;
 mod child_set;
 pub mod harmonizer;
+pub mod peer_probe;
 mod optimizer;
 mod protocol;
 mod range_cube;
