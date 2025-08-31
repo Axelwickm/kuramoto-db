@@ -179,49 +179,40 @@ impl Optimizer for BasicOptimizer {
         let mut search = BeamSearch::new(cfg);
 
         for seed in seeds {
-            // Build delete candidates for this seed.
-            // Preferred: if seed corresponds to an existing availability, enumerate its children by ID.
-            // Fallback: frontier walk by range for hypothetical seeds.
-            let mut dels: Vec<UuidBytes> = Vec::new();
+            // Build delete candidates for this seed by walking the local frontier under the seed range.
+            // For every touched availability, propose deleting it and its parent(s).
+            let mut dels_set: std::collections::HashSet<UuidBytes> = std::collections::HashSet::new();
 
-            // Try to locate an exact existing availability matching the seed (peer, level, geometry).
-            let peer_key = self.ctx.peer_id.as_bytes().to_vec();
-            let locals: Vec<Availability> = db
-                .get_by_index_all_tx::<Availability>(Some(txn), AVAILABILITY_BY_PEER, &peer_key)
-                .await?;
-            let existing = locals.iter().find(|a| {
-                a.complete && a.level == seed.level && ranges_equal(&a.range, &seed.range)
-            });
-
-            if let Some(parent) = existing {
-                // Enumerate children via ChildSet; optimizer proposes deletions, scorer will decide value.
-                let cs = crate::plugins::harmonizer::child_set::ChildSet::open_tx(db, txn, parent.key)
-                    .await
-                    .unwrap_or(crate::plugins::harmonizer::child_set::ChildSet { parent: parent.key, children: vec![] });
-                for cid in cs.children.iter() {
-                    if let Some(child) = resolve_child_avail(db, Some(txn), cid).await? {
-                        if child.peer_id != self.ctx.peer_id || !child.complete {
-                            continue;
-                        }
-                        dels.push(child.key);
-                    }
-                }
-            } else {
-                // Hypothetical seed: enumerate local frontier nodes under the seed range (root-scoped)
-                let roots = roots_for_peer(db, Some(txn), &self.ctx.peer_id).await?;
-                let root_ids: Vec<_> = roots.into_iter().map(|r| r.key).collect();
-                let mut qcache = None;
-                let (frontier, no_overlap) = range_cover(db, Some(txn), &seed.range, &root_ids, None, &vec![], &mut qcache).await?;
-                if !no_overlap {
-                    for a in frontier.into_iter() {
-                        if a.peer_id == self.ctx.peer_id && a.complete && seed.range.contains(&a.range) {
-                            if let Some(av) = resolve_child_avail(db, Some(txn), &a.key).await? {
-                                dels.push(av.key);
+            let roots = roots_for_peer(db, Some(txn), &self.ctx.peer_id).await?;
+            let root_ids: Vec<_> = roots.into_iter().map(|r| r.key).collect();
+            let mut qcache = None;
+            let (frontier, no_overlap) =
+                range_cover(db, Some(txn), &seed.range, &root_ids, None, &vec![], &mut qcache).await?;
+            if !no_overlap {
+                for a in frontier.into_iter() {
+                    // local, complete nodes touched by this seed
+                    if a.peer_id == self.ctx.peer_id && a.complete && a.range.overlaps(&seed.range) {
+                        dels_set.insert(a.key);
+                        // Propose deleting immediate parents as well (if any)
+                        let parents = crate::plugins::harmonizer::child_set::ChildSet::parents_of(
+                            db,
+                            Some(txn),
+                            a.key,
+                        )
+                        .await
+                        .unwrap_or_default();
+                        for pid in parents {
+                            if let Some(pav) = resolve_child_avail(db, Some(txn), &pid).await? {
+                                if pav.peer_id == self.ctx.peer_id && pav.complete {
+                                    dels_set.insert(pav.key);
+                                }
                             }
                         }
                     }
                 }
             }
+
+            let mut dels: Vec<UuidBytes> = dels_set.into_iter().collect();
 
             let start = PlanState::new(seed.clone());
             let g = PlannerGen { caps: self.caps, deletes: dels };

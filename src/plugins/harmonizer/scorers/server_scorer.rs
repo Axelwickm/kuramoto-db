@@ -187,26 +187,52 @@ impl ServerScorer {
             }
         }
 
+        // Compute base frontier without overlay and apply only overlay deletes.
+        use crate::plugins::harmonizer::optimizer::Action;
+        let deleted: std::collections::HashSet<_> = overlay
+            .iter()
+            .filter_map(|a| match a { Action::Delete(id) => Some(*id), _ => None })
+            .collect();
+
         let count = {
             let mut local_cache = {
                 let mut guard = self.query_cache.lock().unwrap();
                 guard.take()
             };
             let mut opt_ref: Option<&mut AvailabilityQueryCache> = local_cache.as_mut().map(|c| c as _);
-            let res = local_child_count_under_peer(
+            // roots for peer (no overlay needed)
+            let roots = crate::plugins::harmonizer::availability::roots_for_peer(db, Some(txn), &ctx.peer_id).await?;
+            let root_ids: Vec<_> = roots.into_iter().map(|r| r.key).collect();
+            // Base frontier with empty overlay
+            let (frontier, no_overlap) = crate::plugins::harmonizer::availability_queries::range_cover(
                 db,
                 Some(txn),
-                &ctx.peer_id,
                 &cand.range,
-                overlay,
+                &root_ids,
+                None,
+                &vec![],
                 &mut opt_ref,
             )
             .await?;
+            let mut seen = std::collections::HashSet::new();
+            let mut c = 0usize;
+            if !no_overlap {
+                for a in frontier {
+                    if a.peer_id == ctx.peer_id
+                        && a.complete
+                        && cand.range.contains(&a.range)
+                        && !deleted.contains(&a.key)
+                        && seen.insert(a.key)
+                    {
+                        c += 1;
+                    }
+                }
+            }
             {
                 let mut guard = self.query_cache.lock().unwrap();
                 *guard = local_cache;
             }
-            res
+            c
         };
 
         if overlay.is_empty() {

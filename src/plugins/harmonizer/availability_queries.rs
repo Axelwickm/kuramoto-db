@@ -653,25 +653,17 @@ pub async fn local_child_count_under_peer(
 
     let mut seen = HashSet::<UuidBytes>::new();
     let mut count = 0usize;
-    for a in frontier {
+    for a in frontier.iter() {
         if a.peer_id == *peer && a.complete && cube.contains(&a.range) && seen.insert(a.key) {
             count += 1;
         }
     }
-    // Consider overlay inserts for this peer as well. Dedup by geometry/level against what we already counted.
+    // Count overlay-only inserts as present for availability queries.
+    // Dedup by (level, geometry) against already-counted nodes.
     let mut geom_seen: HashSet<(u16, Vec<Vec<u8>>, Vec<Vec<u8>>)> = HashSet::new();
-    for a in db
-        .range_by_pk_tx::<Availability>(txn, &[], &[0xFF], None)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-    {
+    for a in frontier.iter() {
         if a.peer_id == *peer && a.complete && cube.contains(&a.range) {
-            geom_seen.insert((
-                a.level,
-                a.range.mins().to_vec(),
-                a.range.maxs().to_vec(),
-            ));
+            geom_seen.insert((a.level, a.range.mins().to_vec(), a.range.maxs().to_vec()));
         }
     }
     for act in overlay {
