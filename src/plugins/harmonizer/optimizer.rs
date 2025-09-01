@@ -431,8 +431,21 @@ impl<'a> PlannerEval<'a> {
             }
         }
 
-        let ids = self.local_child_ids(&s.focus.range).await?;
-        let adopts = ids.iter().any(|id| !deleted.contains(id));
+        // Level-aware adoption: level 0 adopts if there are storage atoms in range;
+        // otherwise adopt if there is at least one contained availability child.
+        let adopts = if s.focus.level == 0 {
+            // Level 0 adopts if there are underlying storage atoms in range
+            let n = crate::plugins::harmonizer::availability_queries::storage_atom_count_in_cube_tx(
+                self.db,
+                Some(self.txn),
+                &s.focus.range,
+            )
+            .await?;
+            n.unwrap_or(0) > 0
+        } else {
+            let ids = self.local_child_ids(&s.focus.range).await?;
+            ids.iter().any(|id| !deleted.contains(id))
+        };
         if adopts {
             push_insert(&mut eff, s.focus.clone());
         }
@@ -603,6 +616,7 @@ mod tests {
     use smallvec::smallvec;
     use std::sync::Arc;
     use tempfile::tempdir;
+    use crate::plugins::harmonizer::SyncTester;
 
     use crate::{
         clock::MockClock,
@@ -724,6 +738,20 @@ mod tests {
         let txn = db.begin_read_txn().unwrap();
         let got = opt.propose(&db, &txn, &[base]).await.unwrap();
         assert!(got.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sync_tester_optimizer_smoke() {
+        // Basic smoke: ensure SyncTester can run alongside optimizer code paths without panics
+        let peers = vec![UuidBytes::new(), UuidBytes::new()];
+        let mut t = SyncTester::new(&peers, &[], Default::default()).await;
+        // No watched tables or entities needed here; just step the system
+        t.step(5).await;
+        // Integrity check (no availability yet) should be clean
+        for n in t.peers().iter() {
+            let errs = crate::plugins::harmonizer::integrity_run_all(&n.db, None, n.peer_id, false).await.unwrap();
+            assert!(errs.is_empty());
+        }
     }
 
     #[tokio::test]

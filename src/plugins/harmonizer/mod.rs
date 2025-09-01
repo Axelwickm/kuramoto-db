@@ -1,5 +1,6 @@
 mod availability;
 mod availability_queries;
+mod integrity;
 mod child_set;
 pub mod harmonizer;
 pub mod peer_probe;
@@ -9,3 +10,11 @@ mod range_cube;
 mod riblt;
 pub mod scorers;
 pub mod search;
+mod sync_tester;
+
+pub use availability::*;
+pub use availability_queries::*;
+pub use integrity::*;
+pub use protocol::*;
+pub use optimizer::{BasicOptimizer, AvailabilityDraft, Optimizer};
+pub use sync_tester::SyncTester;

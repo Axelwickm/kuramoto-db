@@ -13,7 +13,8 @@ use crate::{
     storage_error::StorageError,
     uuid_bytes::UuidBytes,
 };
-use crate::plugins::harmonizer::optimizer::Action::{Delete, Insert};
+use crate::plugins::harmonizer::optimizer::Action::Delete;
+use crate::plugins::harmonizer::optimizer::Action::Insert;
 
 /*──────────────────────── Query cache (snapshot-aware) ─────────────────────*/
 
@@ -147,35 +148,7 @@ pub async fn range_cover(
         .await?;
     }
 
-    // Overlay-aware inserts: treat draft inserts as present during planning.
-    // These may not be connected to the current root set; include any that
-    // intersect the target and respect the level limit, and mark as touched.
-    if !overlay.is_empty() {
-        for act in overlay {
-            if let Insert(d) = act {
-                if let Some(max_lvl) = level_limit {
-                    if d.level as usize > max_lvl {
-                        continue;
-                    }
-                }
-                if d.range.intersect(target).is_some() {
-                    touched = true;
-                    results.push(Availability {
-                        key: super_synth_key_from_draft(d),
-                        peer_id: UuidBytes::from_bytes([0u8; 16]), // peer is unknown at this scope
-                        range: d.range.clone(),
-                        level: d.level,
-                        schema_hash: 0,
-                        version: 0,
-                        updated_at: 0,
-                        complete: d.complete,
-                    });
-                }
-            }
-        }
-    }
-
-    // Dedup (roots may share subtrees or overlay may add duplicates)
+    // Dedup by key (roots may share subtrees)
     let mut seen = HashSet::<UuidBytes>::new();
     results.retain(|a| seen.insert(a.key));
 
@@ -225,29 +198,12 @@ async fn resolve_child_avail_cached(
 
 /// Deterministically synthesize a pseudo-key from an availability draft.
 /// This is only used to make overlay inserts act like regular rows during planning-time queries.
-fn super_synth_key_from_draft(d: &AvailabilityDraft) -> UuidBytes {
-    use std::hash::{Hash, Hasher};
-    // Build a simple 128-bit hash from draft fields using two SipHashers.
-    let mut h1 = std::collections::hash_map::DefaultHasher::new();
-    let mut h2 = std::collections::hash_map::DefaultHasher::new();
-    d.level.hash(&mut h1);
-    d.complete.hash(&mut h1);
-    // mix mins into h1, maxs into h2, and dims into both
-    for dim in d.range.dims() { dim.hash.hash(&mut h1); dim.hash.hash(&mut h2); }
-    for m in d.range.mins() { m.hash(&mut h1); }
-    for m in d.range.maxs() { m.hash(&mut h2); }
-    let a = h1.finish();
-    let b = h2.finish();
-    let mut out = [0u8; 16];
-    out[0..8].copy_from_slice(&a.to_be_bytes());
-    out[8..16].copy_from_slice(&b.to_be_bytes());
-    UuidBytes::from_bytes(out)
-}
+// No overlay insert synthesis here — range_cover deals only with availability rows in DB.
 
 /// Try to count storage atoms in `cube` **without deserializing entities**.
 /// Returns `Ok(Some(count))` if the cube could be resolved to registered tables; `Ok(None)`
 /// if the dims are unknown (caller should fall back to availability counting).
-async fn storage_atom_count_in_cube_tx(
+pub(crate) async fn storage_atom_count_in_cube_tx(
     db: &KuramotoDb,
     txn: Option<&ReadTransaction>,
     cube: &RangeCube,
@@ -439,6 +395,49 @@ pub async fn storage_atom_pks_in_cube_tx(
     Ok(Some(out))
 }
 
+/*──────────────────────── Level‑aware child counting ─────────────────────*/
+
+// No per-cube memo for atoms; compute directly for clarity.
+
+/// Count children under `cube` for a given candidate `level`.
+///
+/// - If `level == 0`: children are storage atoms only. If cube doesn't resolve to
+///   known storage tables, returns 0.
+/// - If `level > 0`: children are availability nodes reachable from local roots; overlay
+///   deletes/inserts are respected similar to frontier counting.
+pub async fn child_count(
+    db: &KuramotoDb,
+    txn: Option<&ReadTransaction>,
+    peer: &UuidBytes,
+    cube: &RangeCube,
+    level: u16,
+    overlay: &ActionSet,
+    cache: &mut Option<&mut AvailabilityQueryCache>,
+) -> Result<usize, StorageError> {
+    if level == 0 {
+        // Storage atoms only. Cache by cube geometry per-txn.
+        // Level 0: count storage atoms in the cube (direct, no extra memoization here)
+        return Ok(storage_atom_count_in_cube_tx(db, txn, cube).await?.unwrap_or(0));
+    }
+
+    // Availability frontier counting (local, complete, contained) with overlay
+    let roots: Vec<Availability> = roots_for_peer_cached(db, txn, peer, cache).await?;
+    let root_ids: Vec<UuidBytes> = roots.iter().map(|r| r.key).collect();
+
+    let (frontier, no_overlap) = range_cover(db, txn, cube, &root_ids, None, overlay, cache).await?;
+    if no_overlap {
+        return Ok(0);
+    }
+    let mut seen = HashSet::<UuidBytes>::new();
+    let mut count = 0usize;
+    for a in frontier.iter() {
+        if a.peer_id == *peer && a.complete && cube.contains(&a.range) && seen.insert(a.key) {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
 /// Return true if the given peer has a local complete availability that fully contains `target`.
 /// Snapshot-aware and root-scoped via `roots_for_peer` + `range_cover`.
 pub async fn peer_contains_range_local(
@@ -449,24 +448,23 @@ pub async fn peer_contains_range_local(
     overlay: &ActionSet,
     cache: &mut Option<&mut AvailabilityQueryCache>,
 ) -> Result<bool, StorageError> {
-    let roots = roots_for_peer_cached(db, txn, peer, cache).await?;
-    let root_ids: Vec<UuidBytes> = roots.into_iter().map(|r| r.key).collect();
-    let (frontier, no_overlap) =
-        range_cover(db, txn, target, &root_ids, None, overlay, cache).await?;
-    if no_overlap {
-        return Ok(false);
-    }
-    for a in frontier {
-        if a.peer_id == *peer && a.complete && a.range.contains(target) {
-            return Ok(true);
-        }
-    }
-    // Also consider overlay inserts as if present for this peer
+    // First honor overlay inserts: if any complete draft contains target, return true.
     for act in overlay {
         if let Insert(d) = act {
             if d.complete && d.range.contains(target) {
                 return Ok(true);
             }
+        }
+    }
+
+    let roots = roots_for_peer_cached(db, txn, peer, cache).await?;
+    let root_ids: Vec<UuidBytes> = roots.into_iter().map(|r| r.key).collect();
+    let (frontier, no_overlap) =
+        range_cover(db, txn, target, &root_ids, None, overlay, cache).await?;
+    // Do not early-return on no_overlap; overlay may cover target even if roots don't.
+    for a in frontier {
+        if a.peer_id == *peer && a.complete && a.range.contains(target) {
+            return Ok(true);
         }
     }
     Ok(false)
@@ -645,11 +643,8 @@ pub async fn local_child_count_under_peer(
     let roots: Vec<Availability> = roots_for_peer_cached(db, txn, peer, cache).await?;
     let root_ids: Vec<UuidBytes> = roots.iter().map(|r| r.key).collect();
 
-    let (frontier, no_overlap) =
+    let (frontier, _no_overlap) =
         range_cover(db, txn, cube, &root_ids, None, overlay, cache).await?;
-    if no_overlap {
-        return Ok(0);
-    }
 
     let mut seen = HashSet::<UuidBytes>::new();
     let mut count = 0usize;
@@ -938,7 +933,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn range_cover_includes_overlay_inserts() {
+    // Overlay inserts should not modify range_cover (DB-only),
+    // but must be visible via helpers (containment/child count).
+    async fn overlay_inserts_affect_helpers_not_range_cover() {
         let db = fresh_db().await;
         let dim = TableHash { hash: 43 };
 
@@ -951,13 +948,25 @@ mod tests {
         };
         let overlay = vec![Action::Insert(draft)];
 
-        // No roots; overlay insert intersects target → should be returned
+        // Range-cover with no roots remains empty
         let (nodes, no_overlap) = range_cover(&db, None, &target, &[], None, &overlay, &mut None)
             .await
             .unwrap();
-        assert!(!no_overlap);
-        assert_eq!(nodes.len(), 1);
-        assert!(nodes[0].range.contains(&target));
+        assert!(no_overlap);
+        assert!(nodes.is_empty());
+
+        // Containment helper should see overlay
+        let peer = UuidBytes::new();
+        let ok = super::peer_contains_range_local(&db, None, &peer, &target, &overlay, &mut None)
+            .await
+            .unwrap();
+        assert!(ok);
+
+        // Level-0 child_count uses storage atoms only → 0 here (no data rows)
+        let cnt0 = super::child_count(&db, None, &peer, &target, 0, &overlay, &mut None)
+            .await
+            .unwrap();
+        assert_eq!(cnt0, 0);
     }
 
     #[tokio::test]
@@ -1075,7 +1084,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn overlay_precedence_over_cache_and_db() {
+    async fn overlay_precedence_in_helpers_over_db_and_cache() {
         let db = fresh_db().await;
         let dim = TableHash { hash: 78 };
 
@@ -1116,13 +1125,21 @@ mod tests {
 
         let target = cube(dim, b"m", b"n");
         let mut cache_ref = cache_owner.as_mut().map(|c| c as _);
-        let (nodes, _no_overlap) = range_cover(&db, Some(&txn), &target, &[root.key], None, &overlay, &mut cache_ref)
+        let (_nodes, _no_overlap) = range_cover(&db, Some(&txn), &target, &[root.key], None, &overlay, &mut cache_ref)
             .await
             .unwrap();
 
-        // The DB leaf is deleted, but overlay insert intersects the target → nodes non-empty
-        assert!(nodes.iter().all(|a| a.key != leaf_db.key));
-        assert!(!nodes.is_empty());
+        // The DB leaf is deleted, but overlay insert intersects the target → helpers see it
+        let peer = leaf_db.peer_id;
+        let ok = super::peer_contains_range_local(&db, Some(&txn), &peer, &target, &overlay, &mut None)
+            .await
+            .unwrap();
+        assert!(ok);
+        // Level-0 child_count still counts storage atoms only → 0 here (overlay only)
+        let cnt0 = super::child_count(&db, Some(&txn), &peer, &target, 0, &overlay, &mut None)
+            .await
+            .unwrap();
+        assert_eq!(cnt0, 0);
     }
 
     #[tokio::test]
@@ -1291,6 +1308,74 @@ mod tests {
             db.put(e).await.unwrap();
         }
         db
+    }
+
+    #[tokio::test]
+    async fn child_count_level0_counts_storage_atoms() {
+        let db = db_with_tent().await;
+        let pk_dim = TableHash::from(TEnt::table_def());
+        // PK range: [2,5) → ids 2,3,4 ⇒ 3 children at level 0
+        let r = cube(pk_dim, &2u64.to_be_bytes(), &5u64.to_be_bytes());
+        let peer = UuidBytes::new();
+        let n = super::child_count(&db, None, &peer, &r, 0, &vec![], &mut None)
+            .await
+            .unwrap();
+        assert_eq!(n, 3);
+    }
+
+    #[tokio::test]
+    async fn child_count_level1_counts_availabilities() {
+        use crate::plugins::harmonizer::availability::Availability;
+        use crate::plugins::harmonizer::child_set::ChildSet;
+
+        let dir = tempdir().unwrap();
+        let clock = Arc::new(MockClock::new(0));
+        let db = KuramotoDb::new(
+            dir.path().join("lvlaware.redb").to_str().unwrap(),
+            clock,
+            vec![],
+        )
+        .await;
+        db.create_table_and_indexes::<Availability>().unwrap();
+        db.create_table_and_indexes::<crate::plugins::harmonizer::child_set::Child>().unwrap();
+        db.create_table_and_indexes::<crate::plugins::harmonizer::child_set::DigestChunk>().unwrap();
+
+        let dim = TableHash { hash: 42 };
+        let peer = UuidBytes::new();
+
+        // Create one level-0 leaf and a level-1 parent covering it; link parent->leaf
+        let leaf = Availability {
+            key: UuidBytes::new(),
+            peer_id: peer,
+            range: cube(dim, b"b", b"c"),
+            level: 0,
+            schema_hash: 0,
+            version: 0,
+            updated_at: 0,
+            complete: true,
+        };
+        let parent = Availability {
+            key: UuidBytes::new(),
+            peer_id: peer,
+            range: cube(dim, b"a", b"z"),
+            level: 1,
+            schema_hash: 0,
+            version: 0,
+            updated_at: 0,
+            complete: true,
+        };
+        let pid = parent.key;
+        db.put(leaf.clone()).await.unwrap();
+        db.put(parent.clone()).await.unwrap();
+        let mut cs = ChildSet::open(&db, pid).await.unwrap();
+        cs.add_child(&db, leaf.key).await.unwrap();
+
+        // Count children under the parent's cube for level>0 must use availability frontier
+        let r = cube(dim, b"a", b"z");
+        let n = super::child_count(&db, None, &peer, &r, 1, &vec![], &mut None)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
     }
 
     #[tokio::test]

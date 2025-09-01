@@ -10,9 +10,9 @@ use std::sync::Mutex;
 use crate::{
     KuramotoDb,
     plugins::harmonizer::{
-        availability_queries::{local_child_count_under_peer, peer_contains_range_local, AvailabilityQueryCache},
+        availability_queries::{peer_contains_range_local, AvailabilityQueryCache, child_count},
         harmonizer::PeerContext,
-        optimizer::{Action, ActionSet, AvailabilityDraft},
+        optimizer::{ActionSet, AvailabilityDraft},
         range_cube::RangeCube,
         scorers::Scorer,
     },
@@ -174,6 +174,7 @@ impl ServerScorer {
         let tk = txntag(txn);
         let pk = peer_key_bytes(&ctx.peer_id);
         let rk = range_key(&cand.range);
+
         if overlay.is_empty() {
             if let Some(cached) = self
                 .caches
@@ -187,52 +188,29 @@ impl ServerScorer {
             }
         }
 
-        // Compute base frontier without overlay and apply only overlay deletes.
-        use crate::plugins::harmonizer::optimizer::Action;
-        let deleted: std::collections::HashSet<_> = overlay
-            .iter()
-            .filter_map(|a| match a { Action::Delete(id) => Some(*id), _ => None })
-            .collect();
-
+        // Use level-aware child counting with cache shared via AvailabilityQueryCache
         let count = {
             let mut local_cache = {
                 let mut guard = self.query_cache.lock().unwrap();
                 guard.take()
             };
             let mut opt_ref: Option<&mut AvailabilityQueryCache> = local_cache.as_mut().map(|c| c as _);
-            // roots for peer (no overlay needed)
-            let roots = crate::plugins::harmonizer::availability::roots_for_peer(db, Some(txn), &ctx.peer_id).await?;
-            let root_ids: Vec<_> = roots.into_iter().map(|r| r.key).collect();
-            // Base frontier with empty overlay
-            let (frontier, no_overlap) = crate::plugins::harmonizer::availability_queries::range_cover(
+            let res = child_count(
                 db,
                 Some(txn),
+                &ctx.peer_id,
                 &cand.range,
-                &root_ids,
-                None,
-                &vec![],
+                cand.level,
+                overlay,
                 &mut opt_ref,
             )
             .await?;
-            let mut seen = std::collections::HashSet::new();
-            let mut c = 0usize;
-            if !no_overlap {
-                for a in frontier {
-                    if a.peer_id == ctx.peer_id
-                        && a.complete
-                        && cand.range.contains(&a.range)
-                        && !deleted.contains(&a.key)
-                        && seen.insert(a.key)
-                    {
-                        c += 1;
-                    }
-                }
-            }
+            // restore cache
             {
                 let mut guard = self.query_cache.lock().unwrap();
                 *guard = local_cache;
             }
-            c
+            res
         };
 
         if overlay.is_empty() {
@@ -298,6 +276,8 @@ mod tests {
     use smallvec::smallvec;
     use std::sync::Arc;
     use tempfile::tempdir;
+    use redb::TableHandle;
+    use crate::storage_entity::StorageEntity;
 
     fn cube(dim: TableHash, min: &[u8], max_excl: &[u8]) -> RangeCube {
         RangeCube::new(
@@ -307,6 +287,8 @@ mod tests {
         )
         .unwrap()
     }
+
+    
 
     async fn fresh_db() -> Arc<KuramotoDb> {
         let dir = tempdir().unwrap();
@@ -392,6 +374,8 @@ mod tests {
             complete: true,
         }
     }
+
+    
 
     /* ---------- Unit tests for child_count_local ---------- */
 
@@ -689,5 +673,94 @@ mod tests {
             exact_k >= 3,
             "expected at least 3 parents to capture exactly k=3 leaves; got {exact_k}"
         );
+    }
+
+    // ───── Entities + replication tests (3 peers, k=2) ─────
+
+    #[derive(Clone, Debug, PartialEq, bincode::Encode, bincode::Decode)]
+    struct TestEnt { id: u32 }
+    impl StorageEntity for TestEnt {
+        const STRUCT_VERSION: u8 = 0;
+        fn primary_key(&self) -> Vec<u8> { self.id.to_le_bytes().to_vec() }
+        fn table_def() -> crate::StaticTableDef { static T: redb::TableDefinition<'static, &'static [u8], Vec<u8>> = redb::TableDefinition::new("test_ent"); &T }
+        fn meta_table_def() -> crate::StaticTableDef { static M: redb::TableDefinition<'static, &'static [u8], Vec<u8>> = redb::TableDefinition::new("test_ent_meta"); &M }
+        fn load_and_migrate(data: &[u8]) -> Result<Self, crate::storage_error::StorageError> {
+            match data.first().copied() {
+                Some(0) => bincode::decode_from_slice::<Self, _>(&data[1..], bincode::config::standard())
+                    .map(|(v, _)| v)
+                    .map_err(|e| crate::storage_error::StorageError::Bincode(e.to_string())),
+                _ => Err(crate::storage_error::StorageError::Bincode("bad version".into())),
+            }
+        }
+        fn indexes() -> &'static [crate::storage_entity::IndexSpec<Self>] { &[] }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn three_peers_replicate_k2_single_insert() {
+        use crate::plugins::harmonizer::SyncTester;
+        let peers = vec![UuidBytes::new(), UuidBytes::new(), UuidBytes::new()];
+        let params = ServerScorerParams { replication_target: 2, replication_weight: 5.0, ..Default::default() };
+        let mut t = SyncTester::new(&peers, &[TestEnt::table_def().name()], params).await;
+        for n in t.peers_mut() { n.db.create_table_and_indexes::<TestEnt>().unwrap(); }
+        // Broadcast to both remotes
+        for i in 0..t.peers().len() { for j in 0..t.peers().len() { if i != j { t.peers()[i].harmonizer.add_peer(t.peers()[j].peer_id).await; } } }
+        // Insert one row on origin
+        let enc = |e: &TestEnt| { let mut out = Vec::new(); out.push(0); out.extend(bincode::encode_to_vec(e, bincode::config::standard()).unwrap()); out };
+        t.insert_bytes(peers[0], TestEnt::table_def().name(), enc(&TestEnt { id: 1 })).await;
+        // Wait until all peers have the row or timeout (wall clock watchdog in SyncTester)
+        let _rep = t
+            .run_until_async(
+                10_000,
+                Some(std::time::Duration::from_secs(5)),
+                |st| {
+                    Box::pin(async move {
+                        for n in st.peers().iter() {
+                            if n.db.get_data::<TestEnt>(&1u32.to_le_bytes()).await.is_err() { return false; }
+                        }
+                        true
+                    })
+                },
+            )
+            .await;
+        for n in t.peers().iter() { let got: TestEnt = n.db.get_data::<TestEnt>(&1u32.to_le_bytes()).await.unwrap(); assert_eq!(got, TestEnt { id: 1 }); }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn three_peers_replicate_k2_spread_many_rows() {
+        use crate::plugins::harmonizer::SyncTester;
+        let peers = vec![UuidBytes::new(), UuidBytes::new(), UuidBytes::new()];
+        let params = ServerScorerParams { replication_target: 2, replication_weight: 5.0, ..Default::default() };
+        let mut t = SyncTester::new(&peers, &[TestEnt::table_def().name()], params).await;
+        for n in t.peers_mut() { n.db.create_table_and_indexes::<TestEnt>().unwrap(); }
+        for i in 0..t.peers().len() { for j in 0..t.peers().len() { if i != j { t.peers()[i].harmonizer.add_peer(t.peers()[j].peer_id).await; } } }
+        let enc = |e: &TestEnt| { let mut out = Vec::new(); out.push(0); out.extend(bincode::encode_to_vec(e, bincode::config::standard()).unwrap()); out };
+        let total = 60u32;
+        for id in 1..=total { t.insert_bytes(peers[0], TestEnt::table_def().name(), enc(&TestEnt { id })).await; }
+        // Wait for all peers to ingest all rows (or timeout)
+        let _rep = t
+            .run_until_async(
+                20_000,
+                Some(std::time::Duration::from_secs(8)),
+                |st| {
+                    Box::pin(async move {
+                        for n in st.peers().iter() {
+                            for id in 1..=total {
+                                if n.db.get_data::<TestEnt>(&id.to_le_bytes()).await.is_err() { return false; }
+                            }
+                        }
+                        true
+                    })
+                },
+            )
+            .await;
+        let mut counts = Vec::new();
+        for n in t.peers().iter() {
+            let mut ok = 0; for id in 1..=total { if n.db.get_data::<TestEnt>(&id.to_le_bytes()).await.is_ok() { ok += 1; } }
+            counts.push(ok);
+        }
+        assert_eq!(counts.len(), 3);
+        assert!(counts.iter().all(|&c| c == total as usize), "each peer should hold all rows; got counts={counts:?}");
+        let a = counts[1] as i32; let b = counts[2] as i32; let diff = (a - b).abs();
+        assert!(diff as f32 <= (total as f32 * 0.1), "replicas should be roughly balanced across remotes: {a} vs {b}");
     }
 }
