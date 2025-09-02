@@ -6,7 +6,7 @@ use redb::ReadTransaction;
 pub mod communication;
 pub mod harmonizer;
 
-use crate::{KuramotoDb, WriteBatch, storage_error::StorageError};
+use crate::{KuramotoDb, WriteBatch, storage_error::StorageError, WriteOrigin};
 
 // Just to hash the name into something nice and stable.
 pub const fn fnv1a_16(s: &str) -> u16 {
@@ -31,6 +31,18 @@ pub trait Plugin: Send + Sync + 'static {
         txn: &ReadTransaction,
         batch: &mut WriteBatch,
     ) -> Result<(), StorageError>;
+
+    /// Origin-aware hook. Default forwards to `before_update` for backwards compatibility.
+    async fn before_update_with_origin(
+        &self,
+        db: &KuramotoDb,
+        txn: &ReadTransaction,
+        batch: &mut WriteBatch,
+        origin: WriteOrigin,
+    ) -> Result<(), StorageError> {
+        let _ = origin; // default impl ignores origin
+        self.before_update(db, txn, batch).await
+    }
 }
 
 /*───────────────────────────────────────────────────────────────*/

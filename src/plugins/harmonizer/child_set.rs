@@ -166,6 +166,67 @@ impl StorageEntity for DigestChunk {
     }
 }
 
+/*──────────────────── Digest helpers (chunk0 / small digest) ───────────────────*/
+
+/// Fetch the first digest chunk (chunk_no = 0) for a parent, if present, using an optional snapshot.
+pub async fn get_digest_chunk0_tx(
+    db: &KuramotoDb,
+    txn: Option<&redb::ReadTransaction>,
+    parent: UuidBytes,
+) -> Result<Option<DigestChunk>, crate::storage_error::StorageError> {
+    let mut key = parent.as_bytes().to_vec();
+    key.extend_from_slice(&0u32.to_le_bytes());
+    match db.get_data_tx::<DigestChunk>(txn, &key).await {
+        Ok(v) => Ok(Some(v)),
+        Err(crate::storage_error::StorageError::NotFound) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Compute a small digest by hashing the bytes of chunk0 (FNV-1a 64-bit).
+/// Returns Ok(None) if no chunk0 exists yet.
+pub async fn small_digest_cell0_tx(
+    db: &KuramotoDb,
+    txn: Option<&redb::ReadTransaction>,
+    parent: UuidBytes,
+) -> Result<Option<u64>, crate::storage_error::StorageError> {
+    if let Some(ch) = get_digest_chunk0_tx(db, txn, parent).await? {
+        let mut hash: u64 = 0xcbf29ce484222325; // FNV offset basis
+        const FNV_PRIME: u64 = 0x100000001b3;
+        for b in ch.bytes.iter() {
+            hash ^= *b as u64;
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        Ok(Some(hash))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Convenience: non-tx helper returning the small digest for cell0 (if exists).
+pub async fn small_digest_cell0(db: &KuramotoDb, parent: UuidBytes) -> Result<Option<u64>, StorageError> {
+    small_digest_cell0_tx(db, None, parent).await
+}
+
+/// Convenience: fetch chunk0 raw bytes (if present) without a supplied snapshot.
+pub async fn chunk0(db: &KuramotoDb, parent: UuidBytes) -> Result<Option<Vec<u8>>, StorageError> {
+    Ok(get_digest_chunk0_tx(db, None, parent)
+        .await?
+        .map(|ch| ch.bytes))
+}
+
+/// Count direct children for a parent using current state.
+pub async fn child_count(db: &KuramotoDb, parent: UuidBytes) -> Result<u32, StorageError> {
+    let cs = ChildSet::open(db, parent).await?;
+    Ok(cs.count() as u32)
+}
+
+/// Compare two cell0 digests with constant-time equality.
+pub fn cell0_eq(local: u64, remote: u64) -> bool {
+    // Constant-time-ish compare for primitive values.
+    (local ^ remote) == 0
+}
+
 /*──────────────── prefix‑scan helper ───────────────────────────*/
 
 async fn scan_prefix<E: StorageEntity>(

@@ -20,6 +20,9 @@ pub static AVAILABILITIES_META_TABLE: StaticTableDef = &TableDefinition::new("av
 
 /// Secondary index: `peer_id` → availability rows
 pub static AVAILABILITY_BY_PEER: StaticTableDef = &TableDefinition::new("availability_by_peer");
+/// Secondary index: `(peer_id, complete_flag)` → availability rows (complete_flag: 0=incomplete,1=complete)
+pub static AVAILABILITY_INCOMPLETE_BY_PEER: StaticTableDef =
+    &TableDefinition::new("availability_incomplete_by_peer");
 
 /*──────────────────────── Model ───────────────────────*/
 
@@ -53,6 +56,17 @@ pub static AVAILABILITY_INDEXES: &[IndexSpec<AvailabilityV0>] = &[
         name: "by_peer",
         key_fn: |a| a.peer_id.as_bytes().to_vec(),
         table_def: &AVAILABILITY_BY_PEER,
+        cardinality: IndexCardinality::NonUnique,
+    },
+    // Lookup of incomplete nodes per peer: key = peer_id • complete_flag
+    IndexSpec::<AvailabilityV0> {
+        name: "by_peer_complete",
+        key_fn: |a| {
+            let mut k = a.peer_id.as_bytes().to_vec();
+            k.push(if a.complete { 1 } else { 0 });
+            k
+        },
+        table_def: &AVAILABILITY_INCOMPLETE_BY_PEER,
         cardinality: IndexCardinality::NonUnique,
     },
 ];

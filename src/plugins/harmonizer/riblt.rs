@@ -306,6 +306,26 @@ impl<const BYTES: usize, S: Symbol<BYTES>> Decoder<BYTES, S> {
     }
 }
 
+/// Convenience: try to decode deltas for 16-byte UUID symbols using a pre-materialised slice of remote cells.
+/// Returns Some((remote_only, local_only)) if decoding completes from the provided cells; otherwise None.
+pub fn decode_delta_16_uuid(
+    local: &[crate::uuid_bytes::UuidBytes],
+    remote_cells: &[CodedSymbol<16, crate::uuid_bytes::UuidBytes>],
+) -> Option<(
+    std::collections::HashSet<crate::uuid_bytes::UuidBytes>,
+    std::collections::HashSet<crate::uuid_bytes::UuidBytes>,
+)> {
+    let mut dec = Decoder::<16, crate::uuid_bytes::UuidBytes>::new(local);
+    for c in remote_cells.iter().cloned() {
+        dec.ingest(c);
+    }
+    if dec.is_decoded {
+        Some(dec.finish())
+    } else {
+        None
+    }
+}
+
 impl Symbol<8> for u64 {
     fn encode(&self) -> [u8; 8] {
         self.to_le_bytes()

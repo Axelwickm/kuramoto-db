@@ -4,10 +4,12 @@ use redb::{ReadTransaction, TableHandle};
 use smallvec::smallvec;
 use std::collections::BTreeMap;
 use std::sync::{OnceLock, Weak};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{collections::HashSet, sync::Arc};
 use tokio::sync::mpsc;
 
 use crate::plugins::harmonizer::child_set::{Child, DigestChunk, Enc, CELLS_PER_CHUNK, STORED_CHUNKS};
+use crate::plugins::harmonizer::riblt::Decoder as RibltDecoder;
 use crate::plugins::harmonizer::optimizer::{Action as OptAction, AvailabilityDraft};
 use crate::plugins::harmonizer::optimizer::{BasicOptimizer, Optimizer};
 use crate::plugins::harmonizer::range_cube::RangeCube;
@@ -19,6 +21,7 @@ use crate::plugins::harmonizer::{
     },
 };
 use crate::plugins::harmonizer::availability::{roots_for_peer, AVAILABILITY_BY_PEER};
+use crate::plugins::harmonizer::availability::AVAILABILITY_INCOMPLETE_BY_PEER;
 use crate::plugins::harmonizer::availability_queries::range_cover;
 use crate::plugins::harmonizer::protocol::GetChildrenByRange;
 use crate::plugins::{
@@ -27,8 +30,8 @@ use crate::plugins::{
 };
 use crate::tables::TableHash;
 use crate::{
-    KuramotoDb, StaticTableDef, WriteBatch, plugins::Plugin, storage_entity::StorageEntity,
-    storage_error::StorageError, uuid_bytes::UuidBytes,
+    KuramotoDb, StaticTableDef, WriteBatch, WriteOrigin, plugins::Plugin,
+    storage_entity::StorageEntity, storage_error::StorageError, uuid_bytes::UuidBytes,
 };
 use crate::{
     database::{IndexPutRequest, WriteRequest},
@@ -57,6 +60,10 @@ pub struct Harmonizer {
     outbox_tx: mpsc::Sender<OutboxItem>,
     peers: Arc<tokio::sync::RwLock<Vec<PeerId>>>, // dynamic peers
     peer_ctx: PeerContext,
+    // Suppress outbox/send for the next before_update invocation(s) when we ingest
+    // data originating from a remote peer or local Completer. Minimal cascade guard.
+    suppress_outbox_once: Arc<AtomicBool>,
+    in_flight_repairs: Arc<tokio::sync::RwLock<std::collections::HashSet<UuidBytes>>>,
 }
 
 impl Harmonizer {
@@ -80,10 +87,14 @@ impl Harmonizer {
             peers: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             db: OnceLock::new(),
             peer_ctx,
+            suppress_outbox_once: Arc::new(AtomicBool::new(false)),
+            in_flight_repairs: Arc::new(tokio::sync::RwLock::new(std::collections::HashSet::new())),
         });
 
         hz.start_inbox_worker(inbox_rx);
         hz.start_outbox_worker(outbox_rx);
+        // Start the completer loop: only repair incomplete nodes via existing transport
+        hz.start_completer(std::time::Duration::from_millis(500), 32);
 
         hz
     }
@@ -172,6 +183,96 @@ impl Harmonizer {
                                     },
                                 )
                             }
+                            HarmonizerMsg::GetChildrenDigest(req) => {
+                                let db = match this.db.get().and_then(|w| w.upgrade()) {
+                                    Some(db) => db,
+                                    None => {
+                                        let _ = respond.send(Err("no db".into()));
+                                        continue;
+                                    }
+                                };
+                                if req.chunk_no != 0 {
+                                    // MVP supports only chunk 0
+                                    let _ = respond.send(Err("unsupported chunk".into()));
+                                    continue;
+                                }
+                                let bytes = match crate::plugins::harmonizer::child_set::get_digest_chunk0_tx(&db, None, req.parent_uuid).await {
+                                    Ok(Some(ch)) => ch.bytes,
+                                    Ok(None) => Vec::new(),
+                                    Err(e) => {
+                                        let _ = respond.send(Err(e.to_string()));
+                                        continue;
+                                    }
+                                };
+                                HarmonizerResp::Digest(
+                                    crate::plugins::harmonizer::protocol::DigestChunkResponse {
+                                        bytes,
+                                    },
+                                )
+                            }
+                            HarmonizerMsg::GetChildrenHeaders(req) => {
+                                let db = match this.db.get().and_then(|w| w.upgrade()) {
+                                    Some(db) => db,
+                                    None => {
+                                        let _ = respond.send(Err("no db".into()));
+                                        continue;
+                                    }
+                                };
+                                let start_ord: u32 = req
+                                    .cursor
+                                    .as_ref()
+                                    .and_then(|v| {
+                                        if v.len() == 4 { Some(u32::from_le_bytes([v[0], v[1], v[2], v[3]])) } else { None }
+                                    })
+                                    .unwrap_or(0);
+                                let max = req.max.min(1024) as usize; // safety cap
+
+                                // Scan child rows by PK prefix: parent • ordinal (le)
+                                let mut lo = req.parent_uuid.as_bytes().to_vec();
+                                lo.extend_from_slice(&start_ord.to_le_bytes());
+                                let mut hi = req.parent_uuid.as_bytes().to_vec();
+                                hi.push(0xFF);
+                                let rows: Vec<Child> = match db.range_by_pk::<Child>(&lo, &hi, Some(max + 1)).await {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        let _ = respond.send(Err(e.to_string()));
+                                        continue;
+                                    }
+                                };
+                                // Build headers for up to max children
+                                let mut headers = Vec::new();
+                                let mut next_cursor: Option<Vec<u8>> = None;
+                                for (i, row) in rows.iter().take(max).enumerate() {
+                                    // load availability for child_id
+                                    let av: Availability = match db.get_data::<Availability>(row.child_id.as_bytes()).await {
+                                        Ok(v) => v,
+                                        Err(_) => continue,
+                                    };
+                                    // compute small_digest via child set of the child (not necessary for leafs; set 0)
+                                    let cs = match ChildSet::open(&db, av.key).await { Ok(cs) => cs, Err(_) => ChildSet { parent: av.key, children: vec![] } };
+                                    let hdr = crate::plugins::harmonizer::protocol::AvailabilityHeader {
+                                        availability_id: av.key,
+                                        level: av.level,
+                                        range: av.range.clone(),
+                                        child_count: cs.count() as u32,
+                                        small_digest: 0,
+                                        complete: av.complete,
+                                    };
+                                    headers.push(hdr);
+                                    if i + 1 == max {
+                                        // next cursor = last consumed ordinal + 1
+                                        let next_ord = row.ordinal.saturating_add(1);
+                                        next_cursor = Some(next_ord.to_le_bytes().to_vec());
+                                    }
+                                }
+                                HarmonizerResp::Children(
+                                    crate::plugins::harmonizer::protocol::ChildrenResponse {
+                                        items: vec![],
+                                        next: next_cursor,
+                                        headers,
+                                    },
+                                )
+                            }
                             HarmonizerMsg::GetChildrenByAvailability(_req) => {
                                 // Not implemented in this step; return no headers.
                                 HarmonizerResp::Children(
@@ -196,11 +297,15 @@ impl Harmonizer {
                                     headers: vec![],
                                 })
                             }
+                            HarmonizerMsg::UpdateHint(_) => {
+                                // Accept hints but do not act in MVP
+                                HarmonizerResp::Update(UpdateResponse { accepted: true, need: None, headers: vec![] })
+                            }
                         };
                         let _ = respond.send(Ok(resp));
                     }
 
-                    ProtoCommand::HandleNotify { peer: _peer, msg } => {
+                    ProtoCommand::HandleNotify { peer, msg } => {
                         match msg {
                             HarmonizerMsg::UpdateWithAttestation(req) => {
                                 // upgrade DB handle
@@ -215,12 +320,50 @@ impl Harmonizer {
                                 };
 
                                 // apply raw bytes to the named table (this will trigger our own before_update)
-                                if let Err(e) =
-                                    db.put_by_table_bytes(&req.table, &req.entity_bytes).await
+                                // Mark suppress_outbox to avoid re-broadcast cascades for this ingest.
+                                this.suppress_outbox_once.store(true, Ordering::SeqCst);
+                                if let Err(e) = db
+                                    .put_by_table_bytes_with_origin(
+                                        &req.table,
+                                        &req.entity_bytes,
+                                        crate::WriteOrigin::RemoteIngest,
+                                    )
+                                    .await
                                 {
                                     tracing::warn!(error = %e, "harmonizer: put_by_table_bytes failed");
                                 }
                                 // v0: do nothing else (no drift check, no reply, no rebroadcast)
+                            }
+                            HarmonizerMsg::UpdateHint(hint) => {
+                                // Ensure parent rows exist (by uuid/level/range) and trigger repair using the notifying peer.
+                                if let Some(db) = this.db.get().and_then(|w| w.upgrade()) {
+                                    let now = db.get_clock().now();
+                                    for t in hint.touched {
+                                        // create or update availability row for this uuid
+                                        let av = Availability {
+                                            key: t.uuid,
+                                            peer_id: this.peer_ctx.peer_id,
+                                            range: hint.range.clone(),
+                                            level: t.level,
+                                            schema_hash: 0,
+                                            version: 0,
+                                            updated_at: now,
+                                            complete: t.complete,
+                                        };
+                                        let _ = db.put(av).await;
+                                        // schedule repair with in-flight guard
+                                        let this2 = this.clone();
+                                        tokio::spawn(async move {
+                                            // in-flight check
+                                            let mut guard = this2.in_flight_repairs.write().await;
+                                            if !guard.insert(t.uuid) { return; }
+                                            drop(guard);
+                                            let _ = this2.repair_parent_with_peer(peer, t.uuid).await;
+                                            let mut guard2 = this2.in_flight_repairs.write().await;
+                                            guard2.remove(&t.uuid);
+                                        });
+                                    }
+                                }
                             }
                             _ => {
                                 // ignore other notify types in v0
@@ -314,6 +457,195 @@ impl Harmonizer {
             stored.to_vec()
         }
     }
+
+    /*──────────────────────────── Repair helpers ───────────────────────────*/
+    /// Compute FNV-1a 64-bit hash over provided bytes (matches `small_digest_cell0_tx`).
+    fn fnv1a64(bytes: &[u8]) -> u64 {
+        let mut hash: u64 = 0xcbf29ce484222325;
+        const FNV_PRIME: u64 = 0x100000001b3;
+        for b in bytes {
+            hash ^= *b as u64;
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        hash
+    }
+
+    async fn fetch_remote_chunk0(&self, peer: PeerId, parent: UuidBytes) -> Result<Vec<u8>, StorageError> {
+        let req = crate::plugins::harmonizer::protocol::HarmonizerMsg::GetChildrenDigest(
+            crate::plugins::harmonizer::protocol::GetChildrenDigest { parent_uuid: parent, chunk_no: 0 },
+        );
+        let resp = self
+            .router
+            .request_on::<_, crate::plugins::harmonizer::protocol::HarmonizerResp>(
+                PROTO_HARMONIZER,
+                peer,
+                &req,
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            .map_err(|e| StorageError::Other(e.to_string()))?;
+        match resp {
+            crate::plugins::harmonizer::protocol::HarmonizerResp::Digest(d) => Ok(d.bytes),
+            _ => Err(StorageError::Other("unexpected response type".into())),
+        }
+    }
+
+    async fn fetch_remote_child_ids(&self, peer: PeerId, parent: UuidBytes) -> Result<Vec<UuidBytes>, StorageError> {
+        let mut cursor: Option<Vec<u8>> = None;
+        let mut out = Vec::<UuidBytes>::new();
+        loop {
+            let req = crate::plugins::harmonizer::protocol::HarmonizerMsg::GetChildrenHeaders(
+                crate::plugins::harmonizer::protocol::GetChildrenHeaders { parent_uuid: parent, cursor: cursor.clone(), max: 256 },
+            );
+            let resp = self
+                .router
+                .request_on::<_, crate::plugins::harmonizer::protocol::HarmonizerResp>(
+                    PROTO_HARMONIZER,
+                    peer,
+                    &req,
+                    std::time::Duration::from_secs(3),
+                )
+                .await
+                .map_err(|e| StorageError::Other(e.to_string()))?;
+            let r = match resp {
+                crate::plugins::harmonizer::protocol::HarmonizerResp::Children(c) => c,
+                _ => return Err(StorageError::Other("unexpected response type".into())),
+            };
+            for h in r.headers {
+                out.push(h.availability_id);
+            }
+            cursor = r.next;
+            if cursor.is_none() { break; }
+        }
+        Ok(out)
+    }
+
+    /// Try to reconcile local child set with remote peer for the given parent.
+    /// Gate on cell0 equality; on mismatch attempt RIBLT using chunk0; then fallback to header-diff.
+    pub async fn repair_parent_with_peer(&self, peer: PeerId, parent: UuidBytes) -> Result<(), StorageError> {
+        let db = self.db.get().and_then(|w| w.upgrade()).ok_or_else(|| StorageError::Other("no db".into()))?;
+
+        // Local small digest (if any)
+        let local_cell0 = crate::plugins::harmonizer::child_set::small_digest_cell0(&db, parent).await?;
+
+        // Remote chunk0 and digest
+        let remote_chunk0 = self.fetch_remote_chunk0(peer, parent).await.unwrap_or_default();
+        let remote_cell0 = if remote_chunk0.is_empty() { None } else { Some(Self::fnv1a64(&remote_chunk0)) };
+
+        if let (Some(lc), Some(rc)) = (local_cell0, remote_cell0) {
+            if crate::plugins::harmonizer::child_set::cell0_eq(lc, rc) {
+                return Ok(()); // fast-path: equal
+            }
+        }
+
+        // Prepare local child set and attempt IBF using remote chunk0 symbols
+        let mut local_cs = ChildSet::open(&db, parent).await?;
+        if !remote_chunk0.is_empty() {
+            if let Ok((remote_cells, _)) = bincode::decode_from_slice::<Vec<crate::plugins::harmonizer::child_set::Cell>, _>(&remote_chunk0, bincode::config::standard()) {
+                if let Some((remote_only, local_only)) = crate::plugins::harmonizer::riblt::decode_delta_16_uuid(&local_cs.children, &remote_cells) {
+                    // Apply deletions first, then additions
+                    for cid in local_only.into_iter() {
+                        let _ = local_cs.remove_child(&db, cid).await;
+                    }
+                    for cid in remote_only.into_iter() {
+                        let _ = local_cs.add_child(&db, cid).await;
+                    }
+                    return Ok(());
+                }
+            }
+        }
+
+        // Fallback: fetch headers and reconcile via set-diff
+        let remote_ids = self.fetch_remote_child_ids(peer, parent).await.unwrap_or_default();
+        if remote_ids.is_empty() {
+            return Ok(());
+        }
+        let local_set: std::collections::HashSet<UuidBytes> = local_cs.children.iter().copied().collect();
+        let remote_set: std::collections::HashSet<UuidBytes> = remote_ids.iter().copied().collect();
+        // Deletes
+        for cid in local_set.difference(&remote_set) {
+            let _ = local_cs.remove_child(&db, *cid).await;
+        }
+        // Adds
+        for cid in remote_set.difference(&local_set) {
+            let _ = local_cs.add_child(&db, *cid).await;
+        }
+        Ok(())
+    }
+
+    /// Structural completer MVP: repair a parent and descend up to `max_depth`.
+    pub async fn complete_availability(
+        &self,
+        parent: UuidBytes,
+        max_depth: usize,
+        mut budget: Option<usize>,
+    ) -> Result<(), StorageError> {
+        if budget == Some(0) { return Ok(()); }
+        let peers = self.peers.read().await.clone();
+        let Some(&peer) = peers.first() else { return Ok(()); };
+        let db = self.db.get().and_then(|w| w.upgrade()).ok_or_else(|| StorageError::Other("no db".into()))?;
+
+        // Iterative DFS with explicit stack to avoid recursive async.
+        let mut stack: Vec<(UuidBytes, usize)> = vec![(parent, max_depth)];
+        while let Some((pid, depth)) = stack.pop() {
+            if budget == Some(0) { break; }
+            self.repair_parent_with_peer(peer, pid).await?;
+            if let Some(b) = budget.as_mut() { *b = b.saturating_sub(1); }
+            if depth == 0 { continue; }
+            let cs = ChildSet::open(&db, pid).await?;
+            for cid in cs.children.iter().copied() {
+                stack.push((cid, depth - 1));
+            }
+        }
+        Ok(())
+    }
+
+    /// Scan for incomplete local nodes and trigger repairs using the first known peer.
+    pub async fn tick_completer(&self, max: usize) -> Result<usize, StorageError> {
+        let db = self.db.get().and_then(|w| w.upgrade()).ok_or_else(|| StorageError::Other("no db".into()))?;
+        let peers = self.peers.read().await.clone();
+        let Some(&peer) = peers.first() else { return Ok(0) }; // nobody to ask
+
+        // Build index prefix for (peer_id, complete=0)
+        let mut lo = self.peer_ctx.peer_id.as_bytes().to_vec();
+        lo.push(0); // incomplete flag
+        let mut hi = lo.clone();
+        hi.push(0x01); // half-open
+
+        let pks = db
+            .collect_pks_in_index_range_tx(None, AVAILABILITY_INCOMPLETE_BY_PEER, &lo, &hi, Some(max))
+            .await?;
+
+        let mut scheduled = 0usize;
+        for pk in pks {
+            if pk.len() != 16 { continue; }
+            let mut idb = [0u8; 16];
+            idb.copy_from_slice(&pk);
+            let id = UuidBytes::from_bytes(idb);
+            // in-flight guard
+            let mut guard = self.in_flight_repairs.write().await;
+            if !guard.insert(id) { continue; }
+            drop(guard);
+            let _ = self.repair_parent_with_peer(peer, id).await;
+            let mut g = self.in_flight_repairs.write().await;
+            g.remove(&id);
+            scheduled += 1;
+        }
+        Ok(scheduled)
+    }
+
+    /// Start a background task that periodically runs the completer tick with the
+    /// given `interval` and `max_per_tick`.
+    pub fn start_completer(self: &Arc<Self>, interval: std::time::Duration, max_per_tick: usize) {
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            loop {
+                ticker.tick().await;
+                let _ = this.tick_completer(max_per_tick).await;
+            }
+        });
+    }
 }
 
 #[async_trait]
@@ -323,6 +655,19 @@ impl Plugin for Harmonizer {
         db: &KuramotoDb,
         txn: &ReadTransaction,
         batch: &mut WriteBatch,
+    ) -> Result<(), StorageError> {
+        // Delegate to origin-aware path with default LocalCommit
+        self
+            .before_update_with_origin(db, txn, batch, WriteOrigin::LocalCommit)
+            .await
+    }
+
+    async fn before_update_with_origin(
+        &self,
+        db: &KuramotoDb,
+        txn: &ReadTransaction,
+        batch: &mut WriteBatch,
+        origin: WriteOrigin,
     ) -> Result<(), StorageError> {
         let Some(first) = batch.get(0) else {
             return Ok(());
@@ -404,19 +749,36 @@ impl Plugin for Harmonizer {
             value,
             meta,
             index_removes: Vec::new(),
-            index_puts: vec![crate::database::IndexPutRequest {
-                table: AVAILABILITY_BY_PEER,
-                key: by_peer_key,
-                value: avail_pk,
-                unique: false,
-            }],
+            index_puts: {
+                // by_peer
+                let mut v = vec![crate::database::IndexPutRequest {
+                    table: AVAILABILITY_BY_PEER,
+                    key: by_peer_key,
+                    value: avail_pk.clone(),
+                    unique: false,
+                }];
+                // by_peer_complete (complete=true → flag=1)
+                let mut by_peer_comp = peer_id.as_bytes().to_vec();
+                by_peer_comp.push(1);
+                by_peer_comp.push(0);
+                by_peer_comp.extend_from_slice(&avail_pk);
+                v.push(crate::database::IndexPutRequest {
+                    table: AVAILABILITY_INCOMPLETE_BY_PEER,
+                    key: by_peer_comp,
+                    value: avail_pk.clone(),
+                    unique: false,
+                });
+                v
+            },
         });
 
         println!("before_update: batch size after enqueue={}", batch.len());
 
         // --- 2) broadcast inline attestation (v0) to known peers ---
+        // Origin gating: only emit for LocalCommit; suppress for Completer/RemoteIngest.
+        let suppress = self.suppress_outbox_once.swap(false, Ordering::SeqCst);
         let peers = { self.peers.read().await.clone() }; // drop lock before awaits
-        if !peers.is_empty() {
+        if !peers.is_empty() && !suppress && matches!(origin, WriteOrigin::LocalCommit) {
             let b = avail_id.as_bytes();
             debug_assert_eq!(b.len(), 16, "UuidBytes must be 16 bytes");
             let hi = u64::from_le_bytes(b[0..8].try_into().unwrap());
@@ -453,6 +815,9 @@ impl Plugin for Harmonizer {
         let inserts = vec![seed];
 
         println!("before_update: running optimizer.propose()");
+
+        // Collect touched parent nodes for hinting
+        let mut touched: Vec<crate::plugins::harmonizer::protocol::UpdateHintTouched> = Vec::new();
 
         if let Some(plan) = self.optimizer.propose(db, txn, &inserts).await? {
             println!("before_update: optimizer returned {} actions", plan.len());
@@ -497,12 +862,26 @@ impl Plugin for Harmonizer {
                             value: parent.to_bytes(),
                             meta: meta2,
                             index_removes: Vec::new(),
-                            index_puts: vec![crate::database::IndexPutRequest {
-                                table: AVAILABILITY_BY_PEER,
-                                key: by_peer_key,
-                                value: parent_pk,
-                                unique: false,
-                            }],
+                            index_puts: {
+                                let mut v = vec![crate::database::IndexPutRequest {
+                                    table: AVAILABILITY_BY_PEER,
+                                    key: by_peer_key,
+                                    value: parent_pk.clone(),
+                                    unique: false,
+                                }];
+                                // by_peer_complete (true)
+                                let mut by_peer_comp = peer_id.as_bytes().to_vec();
+                                by_peer_comp.push(1);
+                                by_peer_comp.push(0);
+                                by_peer_comp.extend_from_slice(&parent_pk);
+                                v.push(crate::database::IndexPutRequest {
+                                    table: AVAILABILITY_INCOMPLETE_BY_PEER,
+                                    key: by_peer_comp,
+                                    value: parent_pk.clone(),
+                                    unique: false,
+                                });
+                                v
+                            },
                         });
 
                         // Determine adopted children (local, complete, contained) using snapshot
@@ -575,6 +954,8 @@ impl Plugin for Harmonizer {
                                     buf.push(enc.next_coded());
                                 }
                                 let bytes = bincode::encode_to_vec(&buf, bincode::config::standard()).unwrap();
+                                // small digest for cell0
+                                let digest = if chunk_no == 0 { Some(Self::fnv1a64(&bytes)) } else { None };
                                 let chunk = DigestChunk {
                                     parent: id,
                                     chunk_no: chunk_no as u32,
@@ -589,6 +970,15 @@ impl Plugin for Harmonizer {
                                     index_puts: Vec::new(),
                                     index_removes: Vec::new(),
                                 });
+                                if let Some(cell0) = digest {
+                                    touched.push(crate::plugins::harmonizer::protocol::UpdateHintTouched {
+                                        uuid: id,
+                                        level: d.level,
+                                        complete: true,
+                                        child_count: child_ids.len() as u32,
+                                        cell0,
+                                    });
+                                }
                             }
                         }
                     }
@@ -698,19 +1088,48 @@ impl Plugin for Harmonizer {
                             let mut idx_key = existing.peer_id.as_bytes().to_vec();
                             idx_key.push(0);
                             idx_key.extend_from_slice(id.as_bytes());
+                            // Non-unique index remove for by_peer_complete flag
+                            let mut idx_key2 = existing.peer_id.as_bytes().to_vec();
+                            idx_key2.push(if existing.complete { 1 } else { 0 });
+                            idx_key2.push(0);
+                            idx_key2.extend_from_slice(id.as_bytes());
                             batch.push(WriteRequest::Delete {
                                 data_table: AVAILABILITIES_TABLE,
                                 meta_table: AVAILABILITIES_META_TABLE,
                                 key: id.as_bytes().to_vec(),
                                 meta: meta2,
-                                index_removes: vec![crate::database::make_index_remove(
-                                    AVAILABILITY_BY_PEER,
-                                    idx_key,
-                                )],
+                                index_removes: vec![
+                                    crate::database::make_index_remove(
+                                        AVAILABILITY_BY_PEER,
+                                        idx_key,
+                                    ),
+                                    crate::database::make_index_remove(
+                                        AVAILABILITY_INCOMPLETE_BY_PEER,
+                                        idx_key2,
+                                    ),
+                                ],
                             });
                         }
                     }
                 }
+            }
+        }
+
+        // Emit UpdateHint for parents when origin is LocalCommit (and not suppressed)
+        let suppress = self.suppress_outbox_once.swap(false, Ordering::SeqCst);
+        let peers = { self.peers.read().await.clone() };
+        if !touched.is_empty() && !peers.is_empty() && !suppress && matches!(origin, WriteOrigin::LocalCommit) {
+            let hint = crate::plugins::harmonizer::protocol::UpdateHint {
+                range: avail.range.clone(),
+                epoch: now,
+                touched,
+            };
+            let msg = HarmonizerMsg::UpdateHint(hint);
+            for &peer in &peers {
+                let _ = self
+                    .outbox_tx
+                    .send(OutboxItem::Notify { peer, msg: msg.clone() })
+                    .await;
             }
         }
 
@@ -723,6 +1142,8 @@ impl Plugin for Harmonizer {
         db.create_table_and_indexes::<DigestChunk>().unwrap();
         self.db.set(Arc::downgrade(&db)).unwrap();
     }
+
+    
 
     // async fn try_complete_incomplete_nodes(&self, db: &KuramotoDb) -> Result<(), StorageError> {
     //     let self_peer = /* TODO: real peer id */;
@@ -849,7 +1270,8 @@ mod tests {
         let local_peer = PeerContext {
             peer_id: UuidBytes::new(),
         };
-        let optimizer = Arc::new(BasicOptimizer::new(Box::new(NullScore), local_peer.clone()));
+        use crate::plugins::harmonizer::scorers::server_scorer::{ServerScorer, ServerScorerParams};
+        let optimizer = Arc::new(BasicOptimizer::new(Box::new(ServerScorer::new(ServerScorerParams::default())), local_peer.clone()));
         let hz = Harmonizer::new(
             router,
             optimizer,
@@ -920,8 +1342,8 @@ mod tests {
         let opt_a = Arc::new(BasicOptimizer::new(Box::new(sc_a), peer_a.clone()));
         let opt_b = Arc::new(BasicOptimizer::new(Box::new(sc_b), peer_b.clone()));
         let opt_c = Arc::new(BasicOptimizer::new(Box::new(sc_c), peer_c.clone()));
-        let hz_a = Harmonizer::new(rtr_a.clone(), opt_a, HashSet::from([Foo::table_def().name()]), peer_a);
-        let hz_b = Harmonizer::new(rtr_b.clone(), opt_b, HashSet::from([Foo::table_def().name()]), peer_b);
+        let hz_a = Harmonizer::new(rtr_a.clone(), opt_a, HashSet::from([Foo::table_def().name()]), peer_a.clone());
+        let hz_b = Harmonizer::new(rtr_b.clone(), opt_b, HashSet::from([Foo::table_def().name()]), peer_b.clone());
         let hz_c = Harmonizer::new(rtr_c.clone(), opt_c, HashSet::from([Foo::table_def().name()]), peer_c);
 
         // peers for notifications
@@ -1120,7 +1542,8 @@ mod tests {
         let local_peer = PeerContext {
             peer_id: UuidBytes::new(),
         };
-        let optimizer = Arc::new(BasicOptimizer::new(Box::new(NullScore), local_peer.clone()));
+        use crate::plugins::harmonizer::scorers::server_scorer::{ServerScorer, ServerScorerParams};
+        let optimizer = Arc::new(BasicOptimizer::new(Box::new(ServerScorer::new(ServerScorerParams::default())), local_peer.clone()));
         let hz_a = Harmonizer::new(
             rtr_a,
             optimizer,
@@ -1191,6 +1614,288 @@ mod tests {
         );
     }
 
+    /// RPC: GetChildrenDigest returns chunk0 bytes for a parent with children.
+    #[tokio::test(start_paused = true)]
+    async fn rpc_get_children_digest_chunk0_smoke() {
+        let clock = Arc::new(MockClock::new(0));
+        let rtr_a = Router::new(RouterConfig::default(), clock.clone());
+        let rtr_b = Router::new(RouterConfig::default(), clock.clone());
+
+        // in-mem link
+        let ns: u64 = rand::rng().random();
+        let pid_a = pid(1);
+        let pid_b = pid(2);
+        let conn_a = InMemConnector::with_namespace(pid_a, ns);
+        let conn_b = InMemConnector::with_namespace(pid_b, ns);
+        let resolver = InMemResolver;
+        let a_to_b = conn_a
+            .dial(&resolver.resolve(pid_b).await.unwrap())
+            .await
+            .unwrap();
+        let b_to_a = conn_b
+            .dial(&resolver.resolve(pid_a).await.unwrap())
+            .await
+            .unwrap();
+        rtr_a.connect_peer(pid_b, a_to_b);
+        rtr_b.connect_peer(pid_a, b_to_a);
+
+        // Harmonizer A
+        let local_peer = PeerContext { peer_id: UuidBytes::new() };
+        use crate::plugins::harmonizer::scorers::server_scorer::{ServerScorer, ServerScorerParams};
+        let optimizer = Arc::new(BasicOptimizer::new(Box::new(ServerScorer::new(ServerScorerParams::default())), local_peer.clone()));
+        let hz_a = Harmonizer::new(rtr_a.clone(), optimizer, HashSet::from([Foo::table_def().name()]), local_peer);
+
+        // DB + seed data
+        let dir = tempdir().unwrap();
+        let db = KuramotoDb::new(dir.path().join("chunk.redb").to_str().unwrap(), clock.clone(), vec![hz_a.clone()])
+            .await;
+        db.create_table_and_indexes::<Foo>().unwrap();
+        // Insert two leaves -> optimizer creates a parent with children + digest chunk0
+        db.put(Foo { id: 10 }).await.unwrap();
+        db.put(Foo { id: 11 }).await.unwrap();
+        spin().await;
+
+        // find a parent that has at least one child; synthesize if absent
+        let avs: Vec<Availability> = db.range_by_pk::<Availability>(&[], &[0xFF], None).await.unwrap();
+        let mut parent: Option<Availability> = None;
+        for a in avs.iter().filter(|a| a.level >= 1) {
+            let mut lo = a.key.as_bytes().to_vec();
+            let mut hi = lo.clone();
+            hi.push(0xFF);
+            let kids: Vec<Child> = db.range_by_pk::<Child>(&lo, &hi, None).await.unwrap();
+            if !kids.is_empty() {
+                parent = Some(a.clone());
+                break;
+            }
+        }
+        let parent = if let Some(p) = parent { p } else {
+            // Synthesize a parent with two children so chunk0 is non-empty
+            let leaves: Vec<Availability> = db.range_by_pk::<Availability>(&[], &[0xFF], None).await.unwrap().into_iter().filter(|a| a.level == 0).collect();
+            assert!(leaves.len() >= 2, "need >=2 leaves");
+            let pid = UuidBytes::new();
+            let now = db.get_clock().now();
+            let pav = Availability { key: pid, peer_id: UuidBytes::new(), range: leaves[0].range.clone(), level: 1, schema_hash: 0, version: 0, updated_at: now, complete: true };
+            db.put(pav.clone()).await.unwrap();
+            let mut cs = ChildSet::open(&db, pid).await.unwrap();
+            cs.add_child(&db, leaves[0].key).await.unwrap();
+            cs.add_child(&db, leaves[1].key).await.unwrap();
+            pav
+        };
+
+        // request chunk0 from B -> A
+        let req = crate::plugins::harmonizer::protocol::HarmonizerMsg::GetChildrenDigest(
+            crate::plugins::harmonizer::protocol::GetChildrenDigest { parent_uuid: parent.key, chunk_no: 0 },
+        );
+        let bytes = rtr_b
+            .request_on::<_, crate::plugins::harmonizer::protocol::HarmonizerResp>(
+                PROTO_HARMONIZER,
+                pid_a,
+                &req,
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        let resp = match bytes { crate::plugins::harmonizer::protocol::HarmonizerResp::Digest(d) => d, _ => panic!("wrong resp") };
+        assert!(!resp.bytes.is_empty(), "chunk0 should be non-empty");
+
+        // verify matches DB read of chunk0
+        let mut pk = parent.key.as_bytes().to_vec();
+        pk.extend_from_slice(&0u32.to_le_bytes());
+        let ch: DigestChunk = db.get_data::<DigestChunk>(&pk).await.unwrap();
+        assert_eq!(resp.bytes, ch.bytes);
+    }
+
+    /// RPC: GetChildrenHeaders pages over child Availability headers for a parent.
+    #[tokio::test(start_paused = true)]
+    async fn rpc_get_children_headers_pages() {
+        let clock = Arc::new(MockClock::new(0));
+        let rtr_a = Router::new(RouterConfig::default(), clock.clone());
+        let rtr_b = Router::new(RouterConfig::default(), clock.clone());
+
+        // link
+        let ns: u64 = rand::rng().random();
+        let pid_a = pid(3);
+        let pid_b = pid(4);
+        let conn_a = InMemConnector::with_namespace(pid_a, ns);
+        let conn_b = InMemConnector::with_namespace(pid_b, ns);
+        let resolver = InMemResolver;
+        let a_to_b = conn_a.dial(&resolver.resolve(pid_b).await.unwrap()).await.unwrap();
+        let b_to_a = conn_b.dial(&resolver.resolve(pid_a).await.unwrap()).await.unwrap();
+        rtr_a.connect_peer(pid_b, a_to_b);
+        rtr_b.connect_peer(pid_a, b_to_a);
+
+        // Harmonizer A
+        let local_peer = PeerContext { peer_id: UuidBytes::new() };
+        use crate::plugins::harmonizer::scorers::server_scorer::{ServerScorer, ServerScorerParams};
+        let optimizer = Arc::new(BasicOptimizer::new(Box::new(ServerScorer::new(ServerScorerParams::default())), local_peer.clone()));
+        let hz_a = Harmonizer::new(rtr_a.clone(), optimizer, HashSet::from([Foo::table_def().name()]), local_peer);
+
+        let dir = tempdir().unwrap();
+        let db = KuramotoDb::new(dir.path().join("headers.redb").to_str().unwrap(), clock.clone(), vec![hz_a.clone()]).await;
+        db.create_table_and_indexes::<Foo>().unwrap();
+        for id in 20..=23 { db.put(Foo { id }).await.unwrap(); }
+        spin().await;
+
+        // pick a parent with children; if absent, synthesize one for this RPC test
+        let avs: Vec<Availability> = db.range_by_pk::<Availability>(&[], &[0xFF], None).await.unwrap();
+        let mut parent: Option<Availability> = None;
+        for a in avs.iter().filter(|a| a.level >= 1) {
+            let mut lo = a.key.as_bytes().to_vec();
+            let mut hi = lo.clone();
+            hi.push(0xFF);
+            let kids: Vec<Child> = db.range_by_pk::<Child>(&lo, &hi, None).await.unwrap();
+            if kids.len() >= 2 { parent = Some(a.clone()); break; }
+        }
+        let parent = if let Some(p) = parent { p } else {
+            // Synthesize a minimal parent with two children for paging
+            let leaves: Vec<Availability> = avs.into_iter().filter(|a| a.level == 0).collect();
+            assert!(leaves.len() >= 2, "need at least two leaves to synthesize parent");
+            let pid = UuidBytes::new();
+            let now = db.get_clock().now();
+            let pav = Availability { key: pid, peer_id: UuidBytes::new(), range: leaves[0].range.clone(), level: 1, schema_hash: 0, version: 0, updated_at: now, complete: true };
+            db.put(pav.clone()).await.unwrap();
+            let mut cs = ChildSet::open(&db, pid).await.unwrap();
+            cs.add_child(&db, leaves[0].key).await.unwrap();
+            cs.add_child(&db, leaves[1].key).await.unwrap();
+            pav
+        };
+
+        // page with max=2
+        let mut cursor: Option<Vec<u8>> = None;
+        let mut total = 0usize;
+        for _ in 0..2 {
+            let req = crate::plugins::harmonizer::protocol::HarmonizerMsg::GetChildrenHeaders(
+                crate::plugins::harmonizer::protocol::GetChildrenHeaders { parent_uuid: parent.key, cursor: cursor.clone(), max: 2 },
+            );
+            let resp = rtr_b
+                .request_on::<_, crate::plugins::harmonizer::protocol::HarmonizerResp>(
+                    PROTO_HARMONIZER,
+                    pid_a,
+                    &req,
+                    std::time::Duration::from_secs(1),
+                )
+                .await
+                .unwrap();
+            let r = match resp { crate::plugins::harmonizer::protocol::HarmonizerResp::Children(c) => c, _ => panic!("wrong resp") };
+            total += r.headers.len();
+            cursor = r.next;
+            if cursor.is_none() { break; }
+        }
+        assert!(total >= 2, "should page headers");
+    }
+
+    /// RIBLT-based repair: B is missing one child under a known parent; compare with A using chunk0 only.
+    #[tokio::test(start_paused = true)]
+    async fn ibf_repairs_missing_child_with_chunk0() {
+        let clock = Arc::new(MockClock::new(0));
+        let rtr_a = Router::new(RouterConfig::default(), clock.clone());
+        let rtr_b = Router::new(RouterConfig::default(), clock.clone());
+
+        // connect A<->B
+        let ns: u64 = rand::rng().random();
+        let pid_a = pid(11);
+        let pid_b = pid(12);
+        let conn_a = InMemConnector::with_namespace(pid_a, ns);
+        let conn_b = InMemConnector::with_namespace(pid_b, ns);
+        let resolver = InMemResolver;
+        let a_to_b = conn_a.dial(&resolver.resolve(pid_b).await.unwrap()).await.unwrap();
+        let b_to_a = conn_b.dial(&resolver.resolve(pid_a).await.unwrap()).await.unwrap();
+        rtr_a.connect_peer(pid_b, a_to_b);
+        rtr_b.connect_peer(pid_a, b_to_a);
+
+        // Harmonizers
+        let peer_a = PeerContext { peer_id: UuidBytes::new() };
+        let peer_b = PeerContext { peer_id: UuidBytes::new() };
+        use crate::plugins::harmonizer::scorers::server_scorer::{ServerScorer, ServerScorerParams};
+        let opt_a = Arc::new(BasicOptimizer::new(Box::new(ServerScorer::new(ServerScorerParams::default())), peer_a.clone()));
+        let opt_b = Arc::new(BasicOptimizer::new(Box::new(ServerScorer::new(ServerScorerParams::default())), peer_b.clone()));
+        let hz_a = Harmonizer::new(rtr_a.clone(), opt_a, HashSet::from([Foo::table_def().name()]), peer_a.clone());
+        let hz_b = Harmonizer::new(rtr_b.clone(), opt_b, HashSet::from([Foo::table_def().name()]), peer_b.clone());
+
+        // DBs
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+        let db_a = KuramotoDb::new(dir_a.path().join("a.redb").to_str().unwrap(), clock.clone(), vec![hz_a.clone()]).await;
+        let db_b = KuramotoDb::new(dir_b.path().join("b.redb").to_str().unwrap(), clock.clone(), vec![hz_b.clone()]).await;
+        db_a.create_table_and_indexes::<Foo>().unwrap();
+        db_b.create_table_and_indexes::<Foo>().unwrap();
+
+        // A: insert a few leaves -> parent with children
+        for id in 100..=102 { db_a.put(Foo { id }).await.unwrap(); }
+        spin().await;
+
+        // Find a parent on A with >=2 children
+        let avs: Vec<availability::Availability> = db_a.range_by_pk::<availability::Availability>(&[], &[0xFF], None).await.unwrap();
+        let mut parent: Option<availability::Availability> = None;
+        let mut kids: Vec<Child> = Vec::new();
+        for a in avs.iter().filter(|a| a.level >= 1) {
+            let mut lo = a.key.as_bytes().to_vec();
+            let mut hi = lo.clone();
+            hi.push(0xFF);
+            let c: Vec<Child> = db_a.range_by_pk::<Child>(&lo, &hi, None).await.unwrap();
+            if c.len() >= 2 { parent = Some(a.clone()); kids = c; break; }
+        }
+        let (parent, a_child_ids): (availability::Availability, Vec<UuidBytes>) = if let Some(p) = parent {
+            (p, kids.iter().map(|r| r.child_id).collect())
+        } else {
+            // Synthesize parent with two children
+            let leaves: Vec<availability::Availability> = db_a
+                .range_by_pk::<availability::Availability>(&[], &[0xFF], None)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|a| a.level == 0)
+                .collect();
+            assert!(leaves.len() >= 2, "need >=2 leaves on A");
+            let pid = UuidBytes::new();
+            let nowa = db_a.get_clock().now();
+            let pav = availability::Availability {
+                key: pid,
+                peer_id: peer_a.peer_id,
+                range: leaves[0].range.clone(),
+                level: 1,
+                schema_hash: 0,
+                version: 0,
+                updated_at: nowa,
+                complete: true,
+            };
+            db_a.put(pav.clone()).await.unwrap();
+            let mut cs_a = ChildSet::open(&db_a, pid).await.unwrap();
+            cs_a.add_child(&db_a, leaves[0].key).await.unwrap();
+            cs_a.add_child(&db_a, leaves[1].key).await.unwrap();
+            (pav, vec![leaves[0].key, leaves[1].key])
+        };
+
+        // B: materialize the same parent key/range/level (no children yet)
+        let now = db_b.get_clock().now();
+        let pav = availability::Availability {
+            key: parent.key,
+            peer_id: peer_b.peer_id,
+            range: parent.range.clone(),
+            level: parent.level,
+            schema_hash: 0,
+            version: 0,
+            updated_at: now,
+            complete: true,
+        };
+        db_b.put(pav).await.unwrap();
+        // Seed children on B: all except last
+        let mut cs_b = ChildSet::open(&db_b, parent.key).await.unwrap();
+        for cid in a_child_ids.iter().take(a_child_ids.len() - 1) { cs_b.add_child(&db_b, *cid).await.unwrap(); }
+
+        // Sanity: B missing one child
+        let cs_b2 = ChildSet::open(&db_b, parent.key).await.unwrap();
+        assert_eq!(cs_b2.count() + 1, a_child_ids.len());
+
+        // Repair from A
+        hz_b.repair_parent_with_peer(pid_a, parent.key).await.unwrap();
+
+        let cs_b3 = ChildSet::open(&db_b, parent.key).await.unwrap();
+        let got: std::collections::HashSet<_> = cs_b3.children.iter().copied().collect();
+        let want: std::collections::HashSet<_> = a_child_ids.iter().copied().collect();
+        assert_eq!(got, want, "B child set should match A after repair");
+    }
+
     /// End-to-end: A inserts, Harmonizer sends UpdateWithAttestation,
     /// B ingests via proto handler and writes to its DB.
     #[tokio::test(start_paused = true)]
@@ -1223,7 +1928,8 @@ mod tests {
         let peer_a = PeerContext {
             peer_id: UuidBytes::new(),
         };
-        let opt_a = Arc::new(BasicOptimizer::new(Box::new(NullScore), peer_a.clone()));
+        use crate::plugins::harmonizer::scorers::server_scorer::{ServerScorer, ServerScorerParams};
+        let opt_a = Arc::new(BasicOptimizer::new(Box::new(ServerScorer::new(ServerScorerParams::default())), peer_a.clone()));
         let hz_a = Harmonizer::new(
             rtr_a.clone(),
             opt_a,
@@ -1233,7 +1939,7 @@ mod tests {
         let peer_b = PeerContext {
             peer_id: UuidBytes::new(),
         };
-        let opt_b = Arc::new(BasicOptimizer::new(Box::new(NullScore), peer_b.clone()));
+        let opt_b = Arc::new(BasicOptimizer::new(Box::new(ServerScorer::new(ServerScorerParams::default())), peer_b.clone()));
         let hz_b = Harmonizer::new(
             rtr_b.clone(),
             opt_b,
@@ -1283,5 +1989,72 @@ mod tests {
             "receiver should materialize a leaf availability for the ingested entity"
         );
         assert!(av_b.iter().any(|a| a.level == 0));
+    }
+
+    /// Completer tick repairs an incomplete parent by pulling from a peer via existing RPCs.
+    #[tokio::test(start_paused = true)]
+    async fn completer_tick_repairs_incomplete_parent() {
+        use crate::plugins::harmonizer::availability::Availability;
+        // Routers and link
+        let clock = Arc::new(MockClock::new(0));
+        let rtr_a = Router::new(RouterConfig::default(), clock.clone());
+        let rtr_b = Router::new(RouterConfig::default(), clock.clone());
+        let ns: u64 = rand::rng().random();
+        let pid_a = pid(51);
+        let pid_b = pid(52);
+        let conn_a = InMemConnector::with_namespace(pid_a, ns);
+        let conn_b = InMemConnector::with_namespace(pid_b, ns);
+        let resolver = InMemResolver;
+        let a_to_b = conn_a.dial(&resolver.resolve(pid_b).await.unwrap()).await.unwrap();
+        let b_to_a = conn_b.dial(&resolver.resolve(pid_a).await.unwrap()).await.unwrap();
+        rtr_a.connect_peer(pid_b, a_to_b);
+        rtr_b.connect_peer(pid_a, b_to_a);
+
+        // Harmonizers
+        let peer_a = PeerContext { peer_id: UuidBytes::new() };
+        let peer_b = PeerContext { peer_id: UuidBytes::new() };
+        use crate::plugins::harmonizer::scorers::server_scorer::{ServerScorer, ServerScorerParams};
+        let opt_a = Arc::new(BasicOptimizer::new(Box::new(ServerScorer::new(ServerScorerParams::default())), peer_a.clone()));
+        let opt_b = Arc::new(BasicOptimizer::new(Box::new(ServerScorer::new(ServerScorerParams::default())), peer_b.clone()));
+        let hz_a = Harmonizer::new(rtr_a.clone(), opt_a, HashSet::from([Foo::table_def().name()]), peer_a);
+        let hz_b = Harmonizer::new(rtr_b.clone(), opt_b, HashSet::from([Foo::table_def().name()]), peer_b.clone());
+
+        // DBs
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+        let db_a = KuramotoDb::new(dir_a.path().join("a.redb").to_str().unwrap(), clock.clone(), vec![hz_a.clone()]).await;
+        let db_b = KuramotoDb::new(dir_b.path().join("b.redb").to_str().unwrap(), clock.clone(), vec![hz_b.clone()]).await;
+        db_a.create_table_and_indexes::<Foo>().unwrap();
+        db_b.create_table_and_indexes::<Foo>().unwrap();
+
+        // A: synthesize a parent with two children and materialize chunk0
+        let parent_id = UuidBytes::new();
+        let now = db_a.get_clock().now();
+        let leaf1 = Availability { key: UuidBytes::new(), peer_id: UuidBytes::new(), range: RangeCube::new(smallvec![TableHash { hash: 77 }], smallvec![vec![1]], smallvec![vec![2]]).unwrap(), level: 0, schema_hash: 0, version: 0, updated_at: now, complete: true };
+        let leaf2 = Availability { key: UuidBytes::new(), peer_id: UuidBytes::new(), range: RangeCube::new(smallvec![TableHash { hash: 77 }], smallvec![vec![3]], smallvec![vec![4]]).unwrap(), level: 0, schema_hash: 0, version: 0, updated_at: now, complete: true };
+        let parent = Availability { key: parent_id, peer_id: UuidBytes::new(), range: leaf1.range.clone(), level: 1, schema_hash: 0, version: 0, updated_at: now, complete: true };
+        db_a.put(leaf1.clone()).await.unwrap();
+        db_a.put(leaf2.clone()).await.unwrap();
+        db_a.put(parent.clone()).await.unwrap();
+        let mut cs_a = ChildSet::open(&db_a, parent_id).await.unwrap();
+        cs_a.add_child(&db_a, leaf1.key).await.unwrap();
+        cs_a.add_child(&db_a, leaf2.key).await.unwrap();
+
+        // B: same parent id but incomplete and without children
+        let parent_b = Availability { key: parent_id, peer_id: peer_b.peer_id, range: parent.range.clone(), level: 1, schema_hash: 0, version: 0, updated_at: now, complete: false };
+        db_b.put(parent_b).await.unwrap();
+
+        // Tell B to reach A
+        hz_b.add_peer(pid_a).await;
+
+        // Run completer tick to repair
+        let scheduled = hz_b.tick_completer(10).await.unwrap();
+        assert!(scheduled >= 1, "tick should schedule at least one repair");
+
+        // Verify B now has the same children set as A
+        let cs_b = ChildSet::open(&db_b, parent_id).await.unwrap();
+        let got: std::collections::HashSet<_> = cs_b.children.into_iter().collect();
+        let expect: std::collections::HashSet<_> = [leaf1.key, leaf2.key].into_iter().collect();
+        assert_eq!(got, expect, "completer should repair children via RPCs");
     }
 }

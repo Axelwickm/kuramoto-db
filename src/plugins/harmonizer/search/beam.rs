@@ -530,6 +530,8 @@ where
             per_depth_sort_ms
         );
 
+        // Require strictly greater-than epsilon improvement to accept a plan,
+        // matching the depth==1 behavior above and the public contract ("exceeds eps").
         if best_gain > self.cfg.eps && !best_seq.is_empty() {
             Some(best_seq)
         } else {

@@ -118,42 +118,28 @@ impl ServerScorer {
         {
             let repl = self.caches.repl.lock().unwrap();
             if let Some(v) = repl.get(&(tk, rk.clone())) {
-                // println!("Repl cache hit!");
                 return Ok(*v);
             }
         }
-        // NOTE: Avoid global scans. Count local coverage via roots/frontier,
-        // and optionally ask a remote probe for non-local replicas.
-        let has_local = {
-            let mut local_cache = {
-                let mut guard = self.query_cache.lock().unwrap();
-                guard.take()
-            };
-            let mut opt_ref: Option<&mut AvailabilityQueryCache> = local_cache.as_mut().map(|c| c as _);
-            let res = peer_contains_range_local(
-                db,
-                Some(txn),
-                &ctx.peer_id,
-                &cand.range,
-                overlay,
-                &mut opt_ref,
-            )
-            .await?;
-            {
-                let mut guard = self.query_cache.lock().unwrap();
-                *guard = local_cache;
-            }
-            res
-        };
-        let mut v = if has_local { 1 } else { 0 };
-        {
-            let mut repl = self.caches.repl.lock().unwrap();
-            if repl.len() > 4096 {
-                repl.clear();
-            }
-            repl.insert((tk, rk), v);
+
+        // Global-ish replication count from our current snapshot:
+        // count distinct peers that fully contain this range with a complete availability.
+        // This leverages our ingested remote availabilities; no network probes here.
+        let replicas = crate::plugins::harmonizer::availability_queries::count_replications(
+            db,
+            Some(txn),
+            &cand.range,
+            |a| a.complete,
+            None,
+        )
+        .await?;
+
+        let mut repl = self.caches.repl.lock().unwrap();
+        if repl.len() > 4096 {
+            repl.clear();
         }
-        Ok(v)
+        repl.insert((tk, rk), replicas);
+        Ok(replicas)
     }
 
     fn child_count_score(&self, child_count: usize) -> f32 {
@@ -239,11 +225,12 @@ impl Scorer for ServerScorer {
             Err(_) => 0,
         };
         let target = self.params.replication_target as i32;
-        if replicas < target {
-            return 1.0 + self.params.replication_weight * ((target - replicas) as f32);
-        }
 
+        // Symmetric replication shaping: penalize deviation from target on both sides.
+        // Reducing |replicas - target| increases score; overshooting is discouraged too.
         let mut s = -self.params.rent;
+        let repl_diff = (replicas - target).abs() as f32;
+        s += -self.params.replication_weight * repl_diff;
         let child_count = match self.child_count_local(db, txn, ctx, cand, overlay).await {
             Ok(c) => c,
             Err(_) => 0,
@@ -593,7 +580,13 @@ mod tests {
     #[tokio::test]
     async fn iterative_planning_covers_all_leaves_in_k_sized_parents() {
         let db = fresh_db().await;
-        let dim = TableHash { hash: 16 };
+        // Use a real data-table-backed dim so level-0 growth can be scored via storage atoms.
+        // Register a simple entity table and populate atoms spanning the test window.
+        db.create_table_and_indexes::<TestEnt>().unwrap();
+        for id in 30u32..60u32 {
+            db.put(TestEnt { id }).await.unwrap();
+        }
+        let dim = TableHash::from(TestEnt::table_def());
         let ctx = PeerContext {
             peer_id: UuidBytes::new(),
         };
@@ -736,31 +729,50 @@ mod tests {
         let enc = |e: &TestEnt| { let mut out = Vec::new(); out.push(0); out.extend(bincode::encode_to_vec(e, bincode::config::standard()).unwrap()); out };
         let total = 60u32;
         for id in 1..=total { t.insert_bytes(peers[0], TestEnt::table_def().name(), enc(&TestEnt { id })).await; }
-        // Wait for all peers to ingest all rows (or timeout)
+        // Wait until each row is present on exactly k=2 peers, and one of them is the origin
+        let origin = peers[0];
         let _rep = t
             .run_until_async(
                 20_000,
                 Some(std::time::Duration::from_secs(8)),
                 |st| {
                     Box::pin(async move {
-                        for n in st.peers().iter() {
-                            for id in 1..=total {
-                                if n.db.get_data::<TestEnt>(&id.to_le_bytes()).await.is_err() { return false; }
+                        for id in 1..=total {
+                            let mut count = 0;
+                            let mut origin_has = false;
+                            for n in st.peers().iter() {
+                                let ok = n.db.get_data::<TestEnt>(&id.to_le_bytes()).await.is_ok();
+                                if ok { count += 1; }
+                                if n.peer_id == origin && ok { origin_has = true; }
                             }
+                            if !(origin_has && count == 2) { return false; }
                         }
                         true
                     })
                 },
             )
             .await;
-        let mut counts = Vec::new();
+        // Post-check: each row has exactly 2 replicas and origin holds all rows.
+        for id in 1..=total {
+            let mut count = 0; let mut origin_has = false;
+            for n in t.peers().iter() {
+                let ok = n.db.get_data::<TestEnt>(&id.to_le_bytes()).await.is_ok();
+                if ok { count += 1; }
+                if n.peer_id == origin && ok { origin_has = true; }
+            }
+            assert!(origin_has, "origin should retain row {id}");
+            assert_eq!(count, 2, "row {id} should be replicated to exactly k=2 peers; got {count}");
+        }
+
+        // Balance: origin has all rows; remotes split the rest roughly evenly.
+        let mut origin_count = 0usize; let mut remote_counts = Vec::new();
         for n in t.peers().iter() {
             let mut ok = 0; for id in 1..=total { if n.db.get_data::<TestEnt>(&id.to_le_bytes()).await.is_ok() { ok += 1; } }
-            counts.push(ok);
+            if n.peer_id == origin { origin_count = ok; } else { remote_counts.push(ok); }
         }
-        assert_eq!(counts.len(), 3);
-        assert!(counts.iter().all(|&c| c == total as usize), "each peer should hold all rows; got counts={counts:?}");
-        let a = counts[1] as i32; let b = counts[2] as i32; let diff = (a - b).abs();
-        assert!(diff as f32 <= (total as f32 * 0.1), "replicas should be roughly balanced across remotes: {a} vs {b}");
+        assert_eq!(origin_count, total as usize, "origin should hold all rows");
+        assert_eq!(remote_counts.len(), 2);
+        let a = remote_counts[0] as i32; let b = remote_counts[1] as i32; let diff = (a - b).abs();
+        assert!(diff as f32 <= (total as f32 * 0.2), "replicas should be roughly balanced across remotes: {a} vs {b}");
     }
 }

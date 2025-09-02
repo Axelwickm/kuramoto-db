@@ -38,9 +38,17 @@ pub struct IndexRemoveRequest {
 
 pub type WriteBatch = Vec<WriteRequest>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteOrigin {
+    LocalCommit,
+    Completer,
+    RemoteIngest,
+}
+
 type WriteMsg = (
     WriteBatch,
     tokio::sync::oneshot::Sender<Result<(), StorageError>>,
+    WriteOrigin,
 );
 
 pub enum WriteRequest {
@@ -70,6 +78,7 @@ pub fn make_index_remove(table: StaticTableDef, key: Vec<u8>) -> IndexRemoveRequ
 type TablePutFn = dyn for<'a> Fn(
         &'a KuramotoDb,
         &'a [u8],
+        WriteOrigin,
     ) -> Pin<Box<dyn Future<Output = Result<(), StorageError>> + Send + 'a>>
     + Send
     + Sync;
@@ -77,6 +86,7 @@ type TablePutFn = dyn for<'a> Fn(
 type TableDeleteFn = dyn for<'a> Fn(
         &'a KuramotoDb,
         &'a [u8],
+        WriteOrigin,
     ) -> Pin<Box<dyn Future<Output = Result<(), StorageError>> + Send + 'a>>
     + Send
     + Sync;
@@ -148,8 +158,8 @@ impl KuramotoDb {
 
         let sys2 = sys.clone();
         tokio::spawn(async move {
-            while let Some((batch, reply)) = write_rx.recv().await {
-                let _ = sys2.handle_write(batch, reply).await;
+            while let Some((batch, reply, origin)) = write_rx.recv().await {
+                let _ = sys2.handle_write(batch, reply, origin).await;
             }
         });
         sys
@@ -162,11 +172,11 @@ impl KuramotoDb {
             let mut m = self.entity_putters.write().unwrap();
             m.insert(
                 E::table_def().name().to_string(),
-                Arc::new(|db, bytes| {
+                Arc::new(|db, bytes, origin| {
                     Box::pin(async move {
                         // decode via E and call the normal typed put()
                         let e = E::load_and_migrate(bytes)?;
-                        db.put::<E>(e).await
+                        db.put_with_origin::<E>(e, origin).await
                     })
                 }),
             );
@@ -176,8 +186,8 @@ impl KuramotoDb {
             let mut m = self.entity_deleters.write().unwrap();
             m.insert(
                 E::table_def().name().to_string(),
-                Arc::new(|db, pk| {
-                    Box::pin(async move { db.delete::<E>(pk).await })
+                Arc::new(|db, pk, origin| {
+                    Box::pin(async move { db.delete_with_origin::<E>(pk, origin).await })
                 }),
             );
         }
@@ -835,6 +845,16 @@ impl KuramotoDb {
         table_name: &str,
         bytes: &[u8],
     ) -> Result<(), StorageError> {
+        self.put_by_table_bytes_with_origin(table_name, bytes, WriteOrigin::LocalCommit)
+            .await
+    }
+
+    pub async fn put_by_table_bytes_with_origin(
+        &self,
+        table_name: &str,
+        bytes: &[u8],
+        origin: WriteOrigin,
+    ) -> Result<(), StorageError> {
         // Take a clone of the Arc<putter> while holding the read lock,
         // then drop the lock before we .await, so the future is Send.
         let putter = {
@@ -849,7 +869,7 @@ impl KuramotoDb {
         };
 
         // Now no lock/guard is live across this await.
-        put(self, bytes).await
+        put(self, bytes, origin).await
     }
 
     /// Delete by table name + primary key using registered entity deleter.
@@ -857,6 +877,17 @@ impl KuramotoDb {
         &self,
         table_name: &str,
         pk: &[u8],
+    ) -> Result<(), StorageError> {
+        self
+            .delete_by_table_pk_with_origin(table_name, pk, WriteOrigin::LocalCommit)
+            .await
+    }
+
+    pub async fn delete_by_table_pk_with_origin(
+        &self,
+        table_name: &str,
+        pk: &[u8],
+        origin: WriteOrigin,
     ) -> Result<(), StorageError> {
         // Take a clone of the Arc<deleter> while holding the read lock,
         // then drop the lock before we .await, so the future is Send.
@@ -871,7 +902,7 @@ impl KuramotoDb {
             )));
         };
 
-        del(self, pk).await
+        del(self, pk, origin).await
     }
 
     /// Build a WriteRequest::Delete for given table name + pk using registered delete planner.
@@ -893,6 +924,14 @@ impl KuramotoDb {
     }
 
     pub async fn put<E: StorageEntity>(&self, entity: E) -> Result<(), StorageError> {
+        self.put_with_origin::<E>(entity, WriteOrigin::LocalCommit).await
+    }
+
+    pub async fn put_with_origin<E: StorageEntity>(
+        &self,
+        entity: E,
+        origin: WriteOrigin,
+    ) -> Result<(), StorageError> {
         let (tx, rx) = oneshot::channel();
         let key = entity.primary_key();
         let now = self.clock.now();
@@ -982,7 +1021,7 @@ impl KuramotoDb {
         };
 
         self.write_tx
-            .send((vec![req], tx))
+            .send((vec![req], tx, origin))
             .await
             .map_err(|e| StorageError::Other(format!("Write queue dropped: {}", e)))?;
         rx.await
@@ -990,6 +1029,14 @@ impl KuramotoDb {
     }
 
     pub async fn delete<E: StorageEntity>(&self, key: &[u8]) -> Result<(), StorageError> {
+        self.delete_with_origin::<E>(key, WriteOrigin::LocalCommit).await
+    }
+
+    pub async fn delete_with_origin<E: StorageEntity>(
+        &self,
+        key: &[u8],
+        origin: WriteOrigin,
+    ) -> Result<(), StorageError> {
         let (tx, rx) = oneshot::channel();
         let now = self.clock.now();
 
@@ -1030,7 +1077,7 @@ impl KuramotoDb {
             index_removes,
         };
         self.write_tx
-            .send((vec![req], tx))
+            .send((vec![req], tx, origin))
             .await
             .map_err(|e| StorageError::Other(format!("Write queue dropped: {}", e)))?;
 
@@ -1046,12 +1093,20 @@ impl KuramotoDb {
     }
 
     pub async fn raw_write(&self, req: WriteRequest) -> Result<(), StorageError> {
+        self.raw_write_with_origin(req, WriteOrigin::LocalCommit).await
+    }
+
+    pub async fn raw_write_with_origin(
+        &self,
+        req: WriteRequest,
+        origin: WriteOrigin,
+    ) -> Result<(), StorageError> {
         // create a fresh responder
         let (tx, rx) = oneshot::channel();
 
         // enqueue
         self.write_tx
-            .send((vec![req], tx))
+            .send((vec![req], tx, origin))
             .await
             .map_err(|e| StorageError::Other(format!("Write queue dropped: {}", e)))?;
 
@@ -1065,6 +1120,7 @@ impl KuramotoDb {
         &self,
         mut batch: WriteBatch,
         reply: tokio::sync::oneshot::Sender<Result<(), StorageError>>,
+        origin: WriteOrigin,
     ) -> Result<(), StorageError> {
         let wtxn = self
             .db
@@ -1077,7 +1133,10 @@ impl KuramotoDb {
 
         // Plugins can append/modify requests in `batch` via before_update hooks
         for plugin in self.plugins.iter() {
-            plugin.before_update(self, &rtxn, &mut batch).await?;
+            // Prefer origin-aware hook if implemented (default falls back to before_update)
+            plugin
+                .before_update_with_origin(self, &rtxn, &mut batch, origin)
+                .await?;
         }
 
         // Apply all requests

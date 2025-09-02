@@ -50,6 +50,35 @@ pub struct GetSymbolsByAvailability {
 }
 
 #[derive(Clone, Debug, Encode, Decode)]
+pub struct GetChildrenDigest {
+    pub parent_uuid: UuidBytes,
+    pub chunk_no: u32, // start with 0 only for MVP
+}
+
+#[derive(Clone, Debug, Encode, Decode)]
+pub struct GetChildrenHeaders {
+    pub parent_uuid: UuidBytes,
+    pub cursor: Option<Vec<u8>>, // ordinal encoded as little-endian bytes
+    pub max: u32,
+}
+
+#[derive(Clone, Debug, Encode, Decode)]
+pub struct UpdateHintTouched {
+    pub uuid: UuidBytes,
+    pub level: u16,
+    pub complete: bool,
+    pub child_count: u32,
+    pub cell0: u64,
+}
+
+#[derive(Clone, Debug, Encode, Decode)]
+pub struct UpdateHint {
+    pub range: RangeCube,
+    pub epoch: u64,
+    pub touched: Vec<UpdateHintTouched>,
+}
+
+#[derive(Clone, Debug, Encode, Decode)]
 pub struct UpdateWithAttestation {
     pub table: String,
     pub pk: Vec<u8>,
@@ -73,6 +102,11 @@ pub struct SymbolsResponse {
     pub cells: Vec<Cell>,
     pub next: Option<u32>,
     pub header: Option<AvailabilityHeader>,
+}
+
+#[derive(Clone, Debug, Encode, Decode)]
+pub struct DigestChunkResponse {
+    pub bytes: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Encode, Decode)]
@@ -100,13 +134,17 @@ pub enum HarmonizerMsg {
     GetChildrenByRange(GetChildrenByRange),
     GetChildrenByAvailability(GetChildrenByAvailability),
     GetSymbolsByAvailability(GetSymbolsByAvailability),
+    GetChildrenDigest(GetChildrenDigest),
+    GetChildrenHeaders(GetChildrenHeaders),
     UpdateWithAttestation(UpdateWithAttestation),
+    UpdateHint(UpdateHint),
 }
 
 #[derive(Clone, Debug, Encode, Decode)]
 pub enum HarmonizerResp {
     Children(ChildrenResponse),
     Symbols(SymbolsResponse),
+    Digest(DigestChunkResponse),
     Update(UpdateResponse),
 }
 
