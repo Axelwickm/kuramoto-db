@@ -3,16 +3,23 @@ use bincode::{Decode, Encode};
 use redb::{ReadTransaction, TableHandle};
 use smallvec::smallvec;
 use std::collections::BTreeMap;
-use std::sync::{OnceLock, Weak};
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{OnceLock, Weak};
 use std::{collections::HashSet, sync::Arc};
 use tokio::sync::mpsc;
 
-use crate::plugins::harmonizer::child_set::{Child, DigestChunk, Enc, CELLS_PER_CHUNK, STORED_CHUNKS};
-use crate::plugins::harmonizer::riblt::Decoder as RibltDecoder;
+use crate::plugins::harmonizer::availability::AVAILABILITY_INCOMPLETE_BY_PEER;
+use crate::plugins::harmonizer::availability::{AVAILABILITY_BY_PEER, roots_for_peer};
+use crate::plugins::harmonizer::availability_queries::{peer_contains_range_local, range_cover};
+use crate::plugins::harmonizer::child_set::{
+    CELLS_PER_CHUNK, Child, DigestChunk, Enc, STORED_CHUNKS,
+};
 use crate::plugins::harmonizer::optimizer::{Action as OptAction, AvailabilityDraft};
 use crate::plugins::harmonizer::optimizer::{BasicOptimizer, Optimizer};
+use crate::plugins::harmonizer::protocol::GetChildrenByRange;
 use crate::plugins::harmonizer::range_cube::RangeCube;
+use crate::plugins::harmonizer::riblt::Decoder as RibltDecoder;
 use crate::plugins::harmonizer::{
     child_set::ChildSet,
     protocol::{
@@ -20,10 +27,6 @@ use crate::plugins::harmonizer::{
         UpdateResponse, UpdateWithAttestation, register_harmonizer_protocol,
     },
 };
-use crate::plugins::harmonizer::availability::{roots_for_peer, AVAILABILITY_BY_PEER};
-use crate::plugins::harmonizer::availability::AVAILABILITY_INCOMPLETE_BY_PEER;
-use crate::plugins::harmonizer::availability_queries::range_cover;
-use crate::plugins::harmonizer::protocol::GetChildrenByRange;
 use crate::plugins::{
     communication::router::Router,
     harmonizer::availability::{AVAILABILITIES_META_TABLE, AVAILABILITIES_TABLE, Availability},
@@ -64,6 +67,8 @@ pub struct Harmonizer {
     // data originating from a remote peer or local Completer. Minimal cascade guard.
     suppress_outbox_once: Arc<AtomicBool>,
     in_flight_repairs: Arc<tokio::sync::RwLock<std::collections::HashSet<UuidBytes>>>,
+    // Round-robin index for bootstrap fallback selection of a single peer.
+    rr_idx: Arc<AtomicUsize>,
 }
 
 impl Harmonizer {
@@ -89,6 +94,7 @@ impl Harmonizer {
             peer_ctx,
             suppress_outbox_once: Arc::new(AtomicBool::new(false)),
             in_flight_repairs: Arc::new(tokio::sync::RwLock::new(std::collections::HashSet::new())),
+            rr_idx: Arc::new(AtomicUsize::new(0)),
         });
 
         hz.start_inbox_worker(inbox_rx);
@@ -103,7 +109,9 @@ impl Harmonizer {
         self.peers.write().await.push(p);
     }
 
-    pub fn peers_handle(&self) -> Arc<tokio::sync::RwLock<Vec<PeerId>>> { self.peers.clone() }
+    pub fn peers_handle(&self) -> Arc<tokio::sync::RwLock<Vec<PeerId>>> {
+        self.peers.clone()
+    }
 
     fn start_inbox_worker(self: &Arc<Self>, mut inbox_rx: mpsc::Receiver<ProtoCommand>) {
         let this = Arc::clone(self);
@@ -162,7 +170,10 @@ impl Harmonizer {
                                         // count children via snapshot
                                         let cs = ChildSet::open_tx(&db, &txn, a.key)
                                             .await
-                                            .unwrap_or(ChildSet { parent: a.key, children: vec![] });
+                                            .unwrap_or(ChildSet {
+                                                parent: a.key,
+                                                children: vec![],
+                                            });
                                         let hdr = crate::plugins::harmonizer::protocol::AvailabilityHeader {
                                             availability_id: a.key,
                                             level: a.level,
@@ -172,7 +183,9 @@ impl Harmonizer {
                                             complete: a.complete,
                                         };
                                         headers.push(hdr);
-                                        if (headers.len() as u32) >= req.max { break; }
+                                        if (headers.len() as u32) >= req.max {
+                                            break;
+                                        }
                                     }
                                 }
                                 HarmonizerResp::Children(
@@ -222,7 +235,11 @@ impl Harmonizer {
                                     .cursor
                                     .as_ref()
                                     .and_then(|v| {
-                                        if v.len() == 4 { Some(u32::from_le_bytes([v[0], v[1], v[2], v[3]])) } else { None }
+                                        if v.len() == 4 {
+                                            Some(u32::from_le_bytes([v[0], v[1], v[2], v[3]]))
+                                        } else {
+                                            None
+                                        }
                                     })
                                     .unwrap_or(0);
                                 let max = req.max.min(1024) as usize; // safety cap
@@ -232,32 +249,43 @@ impl Harmonizer {
                                 lo.extend_from_slice(&start_ord.to_le_bytes());
                                 let mut hi = req.parent_uuid.as_bytes().to_vec();
                                 hi.push(0xFF);
-                                let rows: Vec<Child> = match db.range_by_pk::<Child>(&lo, &hi, Some(max + 1)).await {
-                                    Ok(v) => v,
-                                    Err(e) => {
-                                        let _ = respond.send(Err(e.to_string()));
-                                        continue;
-                                    }
-                                };
+                                let rows: Vec<Child> =
+                                    match db.range_by_pk::<Child>(&lo, &hi, Some(max + 1)).await {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            let _ = respond.send(Err(e.to_string()));
+                                            continue;
+                                        }
+                                    };
                                 // Build headers for up to max children
                                 let mut headers = Vec::new();
                                 let mut next_cursor: Option<Vec<u8>> = None;
                                 for (i, row) in rows.iter().take(max).enumerate() {
                                     // load availability for child_id
-                                    let av: Availability = match db.get_data::<Availability>(row.child_id.as_bytes()).await {
+                                    let av: Availability = match db
+                                        .get_data::<Availability>(row.child_id.as_bytes())
+                                        .await
+                                    {
                                         Ok(v) => v,
                                         Err(_) => continue,
                                     };
                                     // compute small_digest via child set of the child (not necessary for leafs; set 0)
-                                    let cs = match ChildSet::open(&db, av.key).await { Ok(cs) => cs, Err(_) => ChildSet { parent: av.key, children: vec![] } };
-                                    let hdr = crate::plugins::harmonizer::protocol::AvailabilityHeader {
-                                        availability_id: av.key,
-                                        level: av.level,
-                                        range: av.range.clone(),
-                                        child_count: cs.count() as u32,
-                                        small_digest: 0,
-                                        complete: av.complete,
+                                    let cs = match ChildSet::open(&db, av.key).await {
+                                        Ok(cs) => cs,
+                                        Err(_) => ChildSet {
+                                            parent: av.key,
+                                            children: vec![],
+                                        },
                                     };
+                                    let hdr =
+                                        crate::plugins::harmonizer::protocol::AvailabilityHeader {
+                                            availability_id: av.key,
+                                            level: av.level,
+                                            range: av.range.clone(),
+                                            child_count: cs.count() as u32,
+                                            small_digest: 0,
+                                            complete: av.complete,
+                                        };
                                     headers.push(hdr);
                                     if i + 1 == max {
                                         // next cursor = last consumed ordinal + 1
@@ -299,7 +327,11 @@ impl Harmonizer {
                             }
                             HarmonizerMsg::UpdateHint(_) => {
                                 // Accept hints but do not act in MVP
-                                HarmonizerResp::Update(UpdateResponse { accepted: true, need: None, headers: vec![] })
+                                HarmonizerResp::Update(UpdateResponse {
+                                    accepted: true,
+                                    need: None,
+                                    headers: vec![],
+                                })
                             }
                         };
                         let _ = respond.send(Ok(resp));
@@ -308,31 +340,53 @@ impl Harmonizer {
                     ProtoCommand::HandleNotify { peer, msg } => {
                         match msg {
                             HarmonizerMsg::UpdateWithAttestation(req) => {
-                                // upgrade DB handle
-                                let db = match this.db.get().and_then(|w| w.upgrade()) {
-                                    Some(db) => db,
-                                    None => {
-                                        tracing::warn!(
-                                            "harmonizer: no DB attached; dropping update"
-                                        );
-                                        continue;
-                                    }
-                                };
+                                // Treat attestation as a hint: record the sender's leaf availability locally
+                                // (for set reconciliation) but do not ingest entity bytes or modify our tree.
+                                if let Some(db) = this.db.get().and_then(|w| w.upgrade()) {
+                                    let now = db.get_clock().now();
+                                    // 1) Record remote leaf availability for reconciliation
+                                    let av = Availability {
+                                        key: req.local_availability_id,
+                                        peer_id: peer,
+                                        range: req.range.clone(),
+                                        level: req.level,
+                                        schema_hash: 0,
+                                        version: 0,
+                                        updated_at: now,
+                                        complete: true,
+                                    };
+                                    let _ = db.put(av).await;
 
-                                // apply raw bytes to the named table (this will trigger our own before_update)
-                                // Mark suppress_outbox to avoid re-broadcast cascades for this ingest.
-                                this.suppress_outbox_once.store(true, Ordering::SeqCst);
-                                if let Err(e) = db
-                                    .put_by_table_bytes_with_origin(
-                                        &req.table,
-                                        &req.entity_bytes,
-                                        crate::WriteOrigin::RemoteIngest,
-                                    )
-                                    .await
-                                {
-                                    tracing::warn!(error = %e, "harmonizer: put_by_table_bytes failed");
+                                    // 2) Consider adopting: seed the optimizer to decide if we should cover this range locally.
+                                    let seed = AvailabilityDraft {
+                                        level: 0,
+                                        range: req.range.clone(),
+                                        complete: true,
+                                    };
+                                    let mut adopted = false;
+                                    if let Ok(txn) = db.begin_read_txn() {
+                                        if let Ok(Some(_plan)) =
+                                            this.optimizer.propose(&db, &txn, &[seed]).await
+                                        {
+                                            adopted = true;
+                                        }
+                                    }
+                                    // Ensure the new data gets covered locally only if the optimizer suggests adoption.
+                                    if adopted {
+                                        this.suppress_outbox_once.store(true, Ordering::SeqCst);
+                                        let _ = db
+                                            .put_by_table_bytes_with_origin(
+                                                &req.table,
+                                                &req.entity_bytes,
+                                                crate::WriteOrigin::RemoteIngest,
+                                            )
+                                            .await;
+                                    }
+                                } else {
+                                    tracing::warn!(
+                                        "harmonizer: no DB attached; dropping attestation hint"
+                                    );
                                 }
-                                // v0: do nothing else (no drift check, no reply, no rebroadcast)
                             }
                             HarmonizerMsg::UpdateHint(hint) => {
                                 // Ensure parent rows exist (by uuid/level/range) and trigger repair using the notifying peer.
@@ -342,7 +396,8 @@ impl Harmonizer {
                                         // create or update availability row for this uuid
                                         let av = Availability {
                                             key: t.uuid,
-                                            peer_id: this.peer_ctx.peer_id,
+                                            // Attribute this availability to the sender peer from the hint
+                                            peer_id: hint.peer_uuid,
                                             range: hint.range.clone(),
                                             level: t.level,
                                             schema_hash: 0,
@@ -356,9 +411,12 @@ impl Harmonizer {
                                         tokio::spawn(async move {
                                             // in-flight check
                                             let mut guard = this2.in_flight_repairs.write().await;
-                                            if !guard.insert(t.uuid) { return; }
+                                            if !guard.insert(t.uuid) {
+                                                return;
+                                            }
                                             drop(guard);
-                                            let _ = this2.repair_parent_with_peer(peer, t.uuid).await;
+                                            let _ =
+                                                this2.repair_parent_with_peer(peer, t.uuid).await;
                                             let mut guard2 = this2.in_flight_repairs.write().await;
                                             guard2.remove(&t.uuid);
                                         });
@@ -470,9 +528,16 @@ impl Harmonizer {
         hash
     }
 
-    async fn fetch_remote_chunk0(&self, peer: PeerId, parent: UuidBytes) -> Result<Vec<u8>, StorageError> {
+    async fn fetch_remote_chunk0(
+        &self,
+        peer: PeerId,
+        parent: UuidBytes,
+    ) -> Result<Vec<u8>, StorageError> {
         let req = crate::plugins::harmonizer::protocol::HarmonizerMsg::GetChildrenDigest(
-            crate::plugins::harmonizer::protocol::GetChildrenDigest { parent_uuid: parent, chunk_no: 0 },
+            crate::plugins::harmonizer::protocol::GetChildrenDigest {
+                parent_uuid: parent,
+                chunk_no: 0,
+            },
         );
         let resp = self
             .router
@@ -490,12 +555,20 @@ impl Harmonizer {
         }
     }
 
-    async fn fetch_remote_child_ids(&self, peer: PeerId, parent: UuidBytes) -> Result<Vec<UuidBytes>, StorageError> {
+    async fn fetch_remote_child_ids(
+        &self,
+        peer: PeerId,
+        parent: UuidBytes,
+    ) -> Result<Vec<UuidBytes>, StorageError> {
         let mut cursor: Option<Vec<u8>> = None;
         let mut out = Vec::<UuidBytes>::new();
         loop {
             let req = crate::plugins::harmonizer::protocol::HarmonizerMsg::GetChildrenHeaders(
-                crate::plugins::harmonizer::protocol::GetChildrenHeaders { parent_uuid: parent, cursor: cursor.clone(), max: 256 },
+                crate::plugins::harmonizer::protocol::GetChildrenHeaders {
+                    parent_uuid: parent,
+                    cursor: cursor.clone(),
+                    max: 256,
+                },
             );
             let resp = self
                 .router
@@ -515,22 +588,40 @@ impl Harmonizer {
                 out.push(h.availability_id);
             }
             cursor = r.next;
-            if cursor.is_none() { break; }
+            if cursor.is_none() {
+                break;
+            }
         }
         Ok(out)
     }
 
     /// Try to reconcile local child set with remote peer for the given parent.
     /// Gate on cell0 equality; on mismatch attempt RIBLT using chunk0; then fallback to header-diff.
-    pub async fn repair_parent_with_peer(&self, peer: PeerId, parent: UuidBytes) -> Result<(), StorageError> {
-        let db = self.db.get().and_then(|w| w.upgrade()).ok_or_else(|| StorageError::Other("no db".into()))?;
+    pub async fn repair_parent_with_peer(
+        &self,
+        peer: PeerId,
+        parent: UuidBytes,
+    ) -> Result<(), StorageError> {
+        let db = self
+            .db
+            .get()
+            .and_then(|w| w.upgrade())
+            .ok_or_else(|| StorageError::Other("no db".into()))?;
 
         // Local small digest (if any)
-        let local_cell0 = crate::plugins::harmonizer::child_set::small_digest_cell0(&db, parent).await?;
+        let local_cell0 =
+            crate::plugins::harmonizer::child_set::small_digest_cell0(&db, parent).await?;
 
         // Remote chunk0 and digest
-        let remote_chunk0 = self.fetch_remote_chunk0(peer, parent).await.unwrap_or_default();
-        let remote_cell0 = if remote_chunk0.is_empty() { None } else { Some(Self::fnv1a64(&remote_chunk0)) };
+        let remote_chunk0 = self
+            .fetch_remote_chunk0(peer, parent)
+            .await
+            .unwrap_or_default();
+        let remote_cell0 = if remote_chunk0.is_empty() {
+            None
+        } else {
+            Some(Self::fnv1a64(&remote_chunk0))
+        };
 
         if let (Some(lc), Some(rc)) = (local_cell0, remote_cell0) {
             if crate::plugins::harmonizer::child_set::cell0_eq(lc, rc) {
@@ -541,8 +632,17 @@ impl Harmonizer {
         // Prepare local child set and attempt IBF using remote chunk0 symbols
         let mut local_cs = ChildSet::open(&db, parent).await?;
         if !remote_chunk0.is_empty() {
-            if let Ok((remote_cells, _)) = bincode::decode_from_slice::<Vec<crate::plugins::harmonizer::child_set::Cell>, _>(&remote_chunk0, bincode::config::standard()) {
-                if let Some((remote_only, local_only)) = crate::plugins::harmonizer::riblt::decode_delta_16_uuid(&local_cs.children, &remote_cells) {
+            if let Ok((remote_cells, _)) = bincode::decode_from_slice::<
+                Vec<crate::plugins::harmonizer::child_set::Cell>,
+                _,
+            >(&remote_chunk0, bincode::config::standard())
+            {
+                if let Some((remote_only, local_only)) =
+                    crate::plugins::harmonizer::riblt::decode_delta_16_uuid(
+                        &local_cs.children,
+                        &remote_cells,
+                    )
+                {
                     // Apply deletions first, then additions
                     for cid in local_only.into_iter() {
                         let _ = local_cs.remove_child(&db, cid).await;
@@ -556,11 +656,15 @@ impl Harmonizer {
         }
 
         // Fallback: fetch headers and reconcile via set-diff
-        let remote_ids = self.fetch_remote_child_ids(peer, parent).await.unwrap_or_default();
+        let remote_ids = self
+            .fetch_remote_child_ids(peer, parent)
+            .await
+            .unwrap_or_default();
         if remote_ids.is_empty() {
             return Ok(());
         }
-        let local_set: std::collections::HashSet<UuidBytes> = local_cs.children.iter().copied().collect();
+        let local_set: std::collections::HashSet<UuidBytes> =
+            local_cs.children.iter().copied().collect();
         let remote_set: std::collections::HashSet<UuidBytes> = remote_ids.iter().copied().collect();
         // Deletes
         for cid in local_set.difference(&remote_set) {
@@ -580,18 +684,32 @@ impl Harmonizer {
         max_depth: usize,
         mut budget: Option<usize>,
     ) -> Result<(), StorageError> {
-        if budget == Some(0) { return Ok(()); }
+        if budget == Some(0) {
+            return Ok(());
+        }
         let peers = self.peers.read().await.clone();
-        let Some(&peer) = peers.first() else { return Ok(()); };
-        let db = self.db.get().and_then(|w| w.upgrade()).ok_or_else(|| StorageError::Other("no db".into()))?;
+        let Some(&peer) = peers.first() else {
+            return Ok(());
+        };
+        let db = self
+            .db
+            .get()
+            .and_then(|w| w.upgrade())
+            .ok_or_else(|| StorageError::Other("no db".into()))?;
 
         // Iterative DFS with explicit stack to avoid recursive async.
         let mut stack: Vec<(UuidBytes, usize)> = vec![(parent, max_depth)];
         while let Some((pid, depth)) = stack.pop() {
-            if budget == Some(0) { break; }
+            if budget == Some(0) {
+                break;
+            }
             self.repair_parent_with_peer(peer, pid).await?;
-            if let Some(b) = budget.as_mut() { *b = b.saturating_sub(1); }
-            if depth == 0 { continue; }
+            if let Some(b) = budget.as_mut() {
+                *b = b.saturating_sub(1);
+            }
+            if depth == 0 {
+                continue;
+            }
             let cs = ChildSet::open(&db, pid).await?;
             for cid in cs.children.iter().copied() {
                 stack.push((cid, depth - 1));
@@ -602,9 +720,15 @@ impl Harmonizer {
 
     /// Scan for incomplete local nodes and trigger repairs using the first known peer.
     pub async fn tick_completer(&self, max: usize) -> Result<usize, StorageError> {
-        let db = self.db.get().and_then(|w| w.upgrade()).ok_or_else(|| StorageError::Other("no db".into()))?;
+        let db = self
+            .db
+            .get()
+            .and_then(|w| w.upgrade())
+            .ok_or_else(|| StorageError::Other("no db".into()))?;
         let peers = self.peers.read().await.clone();
-        let Some(&peer) = peers.first() else { return Ok(0) }; // nobody to ask
+        let Some(&peer) = peers.first() else {
+            return Ok(0);
+        }; // nobody to ask
 
         // Build index prefix for (peer_id, complete=0)
         let mut lo = self.peer_ctx.peer_id.as_bytes().to_vec();
@@ -613,18 +737,28 @@ impl Harmonizer {
         hi.push(0x01); // half-open
 
         let pks = db
-            .collect_pks_in_index_range_tx(None, AVAILABILITY_INCOMPLETE_BY_PEER, &lo, &hi, Some(max))
+            .collect_pks_in_index_range_tx(
+                None,
+                AVAILABILITY_INCOMPLETE_BY_PEER,
+                &lo,
+                &hi,
+                Some(max),
+            )
             .await?;
 
         let mut scheduled = 0usize;
         for pk in pks {
-            if pk.len() != 16 { continue; }
+            if pk.len() != 16 {
+                continue;
+            }
             let mut idb = [0u8; 16];
             idb.copy_from_slice(&pk);
             let id = UuidBytes::from_bytes(idb);
             // in-flight guard
             let mut guard = self.in_flight_repairs.write().await;
-            if !guard.insert(id) { continue; }
+            if !guard.insert(id) {
+                continue;
+            }
             drop(guard);
             let _ = self.repair_parent_with_peer(peer, id).await;
             let mut g = self.in_flight_repairs.write().await;
@@ -657,8 +791,7 @@ impl Plugin for Harmonizer {
         batch: &mut WriteBatch,
     ) -> Result<(), StorageError> {
         // Delegate to origin-aware path with default LocalCommit
-        self
-            .before_update_with_origin(db, txn, batch, WriteOrigin::LocalCommit)
+        self.before_update_with_origin(db, txn, batch, WriteOrigin::LocalCommit)
             .await
     }
 
@@ -774,11 +907,13 @@ impl Plugin for Harmonizer {
 
         println!("before_update: batch size after enqueue={}", batch.len());
 
-        // --- 2) broadcast inline attestation (v0) to known peers ---
+        // --- 2) broadcast inline attestation (v0) selectively ---
         // Origin gating: only emit for LocalCommit; suppress for Completer/RemoteIngest.
+        // Only notify peers whose current roots already cover this range locally.
         let suppress = self.suppress_outbox_once.swap(false, Ordering::SeqCst);
         let peers = { self.peers.read().await.clone() }; // drop lock before awaits
         if !peers.is_empty() && !suppress && matches!(origin, WriteOrigin::LocalCommit) {
+            // Build attestation payload once
             let b = avail_id.as_bytes();
             debug_assert_eq!(b.len(), 16, "UuidBytes must be 16 bytes");
             let hi = u64::from_le_bytes(b[0..8].try_into().unwrap());
@@ -796,7 +931,26 @@ impl Plugin for Harmonizer {
             };
             let msg = HarmonizerMsg::UpdateWithAttestation(att);
 
+            // Select peers with local coverage of this range; if none qualify, fall back to all peers (bootstrap).
+            let mut sent = 0usize;
             for &peer in &peers {
+                if peer == self.peer_ctx.peer_id {
+                    continue;
+                }
+                let mut qcache = None;
+                let ok = peer_contains_range_local(
+                    db,
+                    Some(txn),
+                    &peer,
+                    &avail.range,
+                    &vec![],
+                    &mut qcache,
+                )
+                .await
+                .unwrap_or(false);
+                if !ok {
+                    continue;
+                }
                 let _ = self
                     .outbox_tx
                     .send(OutboxItem::Notify {
@@ -804,6 +958,26 @@ impl Plugin for Harmonizer {
                         msg: msg.clone(),
                     })
                     .await;
+                sent += 1;
+            }
+            if sent == 0 {
+                // Bootstrap fallback: notify a single peer to seed coverage; others learn via UpdateHint.
+                let candidates: Vec<PeerId> = peers
+                    .iter()
+                    .copied()
+                    .filter(|p| *p != self.peer_ctx.peer_id)
+                    .collect();
+                if !candidates.is_empty() {
+                    let idx = self.rr_idx.fetch_add(1, Ordering::Relaxed) % candidates.len();
+                    let peer = candidates[idx];
+                    let _ = self
+                        .outbox_tx
+                        .send(OutboxItem::Notify {
+                            peer,
+                            msg: msg.clone(),
+                        })
+                        .await;
+                }
             }
         }
 
@@ -829,6 +1003,46 @@ impl Plugin for Harmonizer {
                         if d.level == 0 {
                             continue;
                         }
+
+                        // Determine adopted children (local, complete, contained) using snapshot first.
+                        // If none would be adopted, skip materializing this parent entirely.
+                        let roots = roots_for_peer(db, Some(txn), &peer_id).await?;
+                        let root_ids: Vec<_> = roots.into_iter().map(|r| r.key).collect();
+                        let (frontier, no_overlap) = range_cover(
+                            db,
+                            Some(txn),
+                            &d.range,
+                            &root_ids,
+                            None,
+                            &vec![],
+                            &mut None,
+                        )
+                        .await?;
+                        let mut child_ids: Vec<UuidBytes> = Vec::new();
+                        if !no_overlap {
+                            child_ids.extend(
+                                frontier
+                                    .into_iter()
+                                    .filter(|a| {
+                                        a.peer_id == peer_id
+                                            && a.complete
+                                            && d.range.contains(&a.range)
+                                    })
+                                    .map(|a| a.key),
+                            );
+                        }
+                        // Also adopt the leaf from this very batch if the draft contains it.
+                        // This makes parent+child materialize together even in a single write.
+                        if d.range.contains(&avail.range) {
+                            child_ids.push(avail_id);
+                        }
+                        child_ids.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+                        child_ids.dedup_by(|a, b| a.as_bytes() == b.as_bytes());
+                        if child_ids.is_empty() {
+                            continue;
+                        }
+
+                        // Only now materialize the parent row and associated indexes.
                         let id = UuidBytes::new();
                         let now2 = db.get_clock().now();
                         let parent = Availability {
@@ -869,7 +1083,6 @@ impl Plugin for Harmonizer {
                                     value: parent_pk.clone(),
                                     unique: false,
                                 }];
-                                // by_peer_complete (true)
                                 let mut by_peer_comp = peer_id.as_bytes().to_vec();
                                 by_peer_comp.push(1);
                                 by_peer_comp.push(0);
@@ -883,26 +1096,6 @@ impl Plugin for Harmonizer {
                                 v
                             },
                         });
-
-                        // Determine adopted children (local, complete, contained) using snapshot
-                        let roots = roots_for_peer(db, Some(txn), &peer_id).await?;
-                        let root_ids: Vec<_> = roots.into_iter().map(|r| r.key).collect();
-                        let (frontier, no_overlap) =
-                            range_cover(db, Some(txn), &d.range, &root_ids, None, &vec![], &mut None).await?;
-                        // Start with the freshly created leaf if it falls within the parent range
-                        let mut child_ids: Vec<UuidBytes> = Vec::new();
-                        if d.range.contains(&avail.range) {
-                            child_ids.push(avail_id);
-                        }
-                        if !no_overlap {
-                            child_ids.extend(
-                                frontier
-                                    .into_iter()
-                                    .filter(|a| a.peer_id == peer_id && a.complete && d.range.contains(&a.range))
-                                    .map(|a| a.key),
-                            );
-                        }
-                        child_ids.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
 
                         let now_meta = bincode::encode_to_vec(
                             crate::meta::BlobMeta {
@@ -953,9 +1146,15 @@ impl Plugin for Harmonizer {
                                 for _ in 0..CELLS_PER_CHUNK {
                                     buf.push(enc.next_coded());
                                 }
-                                let bytes = bincode::encode_to_vec(&buf, bincode::config::standard()).unwrap();
+                                let bytes =
+                                    bincode::encode_to_vec(&buf, bincode::config::standard())
+                                        .unwrap();
                                 // small digest for cell0
-                                let digest = if chunk_no == 0 { Some(Self::fnv1a64(&bytes)) } else { None };
+                                let digest = if chunk_no == 0 {
+                                    Some(Self::fnv1a64(&bytes))
+                                } else {
+                                    None
+                                };
                                 let chunk = DigestChunk {
                                     parent: id,
                                     chunk_no: chunk_no as u32,
@@ -971,13 +1170,15 @@ impl Plugin for Harmonizer {
                                     index_removes: Vec::new(),
                                 });
                                 if let Some(cell0) = digest {
-                                    touched.push(crate::plugins::harmonizer::protocol::UpdateHintTouched {
-                                        uuid: id,
-                                        level: d.level,
-                                        complete: true,
-                                        child_count: child_ids.len() as u32,
-                                        cell0,
-                                    });
+                                    touched.push(
+                                        crate::plugins::harmonizer::protocol::UpdateHintTouched {
+                                            uuid: id,
+                                            level: d.level,
+                                            complete: true,
+                                            child_count: child_ids.len() as u32,
+                                            cell0,
+                                        },
+                                    );
                                 }
                             }
                         }
@@ -1010,9 +1211,8 @@ impl Plugin for Harmonizer {
                             {
                                 let mut hi = id.as_bytes().to_vec();
                                 hi.push(0xFF);
-                                let rows: Vec<Child> = db
-                                    .range_by_pk::<Child>(id.as_bytes(), &hi, None)
-                                    .await?;
+                                let rows: Vec<Child> =
+                                    db.range_by_pk::<Child>(id.as_bytes(), &hi, None).await?;
                                 let now = db.get_clock().now();
                                 let meta = bincode::encode_to_vec(
                                     crate::meta::BlobMeta {
@@ -1118,17 +1318,26 @@ impl Plugin for Harmonizer {
         // Emit UpdateHint for parents when origin is LocalCommit (and not suppressed)
         let suppress = self.suppress_outbox_once.swap(false, Ordering::SeqCst);
         let peers = { self.peers.read().await.clone() };
-        if !touched.is_empty() && !peers.is_empty() && !suppress && matches!(origin, WriteOrigin::LocalCommit) {
+        // Emit hints on LocalCommit (unless suppressed) AND on RemoteIngest (to propagate coverage),
+        // so peers can converge replication decisions.
+        let should_hint = (!suppress && matches!(origin, WriteOrigin::LocalCommit))
+            || matches!(origin, WriteOrigin::RemoteIngest);
+        if !touched.is_empty() && !peers.is_empty() && should_hint {
             let hint = crate::plugins::harmonizer::protocol::UpdateHint {
+                peer_uuid: self.peer_ctx.peer_id,
                 range: avail.range.clone(),
                 epoch: now,
                 touched,
             };
             let msg = HarmonizerMsg::UpdateHint(hint);
+            // Broadcast hints to all peers (lightweight), regardless of coverage.
             for &peer in &peers {
                 let _ = self
                     .outbox_tx
-                    .send(OutboxItem::Notify { peer, msg: msg.clone() })
+                    .send(OutboxItem::Notify {
+                        peer,
+                        msg: msg.clone(),
+                    })
                     .await;
             }
         }
@@ -1142,8 +1351,6 @@ impl Plugin for Harmonizer {
         db.create_table_and_indexes::<DigestChunk>().unwrap();
         self.db.set(Arc::downgrade(&db)).unwrap();
     }
-
-    
 
     // async fn try_complete_incomplete_nodes(&self, db: &KuramotoDb) -> Result<(), StorageError> {
     //     let self_peer = /* TODO: real peer id */;
@@ -1175,10 +1382,10 @@ mod tests {
         Connector, PeerId, PeerResolver,
         inmem::{InMemConnector, InMemResolver},
     };
+    use crate::plugins::harmonizer::availability;
     use crate::plugins::harmonizer::optimizer::ActionSet;
     use crate::plugins::harmonizer::optimizer::AvailabilityDraft;
     use crate::plugins::harmonizer::scorers::Scorer;
-    use crate::plugins::harmonizer::availability;
     use crate::storage_entity::*;
 
     use bincode::{Decode, Encode};
@@ -1261,7 +1468,10 @@ mod tests {
 
     /* ---------------------- Tests ---------------------- */
 
-    /// Local effect: inserting a watched entity appends exactly one leaf Availability.
+    /// Local effect: inserting a watched entity yields local coverage.
+    /// Assert that local roots cover the inserted atom, and there exists
+    /// a path root -> ... -> leaf whose range still covers that atom.
+    /// Finally, verify the leaf cube resolves to the inserted storage PK.
     #[tokio::test(start_paused = true)]
     async fn inserts_one_availability_per_put() {
         let clock = Arc::new(MockClock::new(0));
@@ -1270,8 +1480,14 @@ mod tests {
         let local_peer = PeerContext {
             peer_id: UuidBytes::new(),
         };
-        use crate::plugins::harmonizer::scorers::server_scorer::{ServerScorer, ServerScorerParams};
-        let optimizer = Arc::new(BasicOptimizer::new(Box::new(ServerScorer::new(ServerScorerParams::default())), local_peer.clone()));
+        let peer_id = local_peer.peer_id; // copy peer id before moving local_peer
+        use crate::plugins::harmonizer::scorers::server_scorer::{
+            ServerScorer, ServerScorerParams,
+        };
+        let optimizer = Arc::new(BasicOptimizer::new(
+            Box::new(ServerScorer::new(ServerScorerParams::default())),
+            local_peer.clone(),
+        ));
         let hz = Harmonizer::new(
             router,
             optimizer,
@@ -1289,25 +1505,80 @@ mod tests {
 
         db.create_table_and_indexes::<Foo>().unwrap();
 
-        db.put(Foo { id: 1 }).await.unwrap();
+        // Insert one atom
+        let foo = Foo { id: 1 };
+        db.put(foo.clone()).await.unwrap();
 
-        let all: Vec<Availability> = db
-            .range_by_pk::<Availability>(&[], &[0xFF], None)
+        // Build the expected leaf cube for this PK (no secondary indexes)
+        let leaf_cube =
+            Harmonizer::leaf_range_from_pk_and_indexes(Foo::table_def(), &foo.primary_key(), &[]);
+
+        // 1) Roots for local peer must cover the leaf cube
+        let roots = availability::roots_for_peer(&db, None, &peer_id)
             .await
             .unwrap();
-        assert_eq!(
-            all.len(),
-            1,
-            "should materialize a single leaf availability"
-        );
-        // Child relations now live in a separate table; leaf completeness and level remain.
-        assert!(all[0].complete);
-        assert_eq!(all[0].level, 0);
+        let mut covering_root: Option<Availability> = None;
+        for r in roots {
+            if r.complete && r.range.contains(&leaf_cube) {
+                covering_root = Some(r);
+                break;
+            }
+        }
+        let mut cur = covering_root.expect("local roots must cover inserted atom");
+
+        // 2) Follow children until we reach a leaf (level 0) that still covers the atom
+        loop {
+            if cur.level == 0 {
+                break;
+            }
+            // scan children of cur and pick one whose range contains the target
+            let mut lo = cur.key.as_bytes().to_vec();
+            let mut hi = lo.clone();
+            hi.push(0xFF);
+            let kids: Vec<Child> = db.range_by_pk::<Child>(&lo, &hi, None).await.unwrap();
+            assert!(!kids.is_empty(), "non-leaf must have children");
+            let mut advanced = false;
+            for k in kids {
+                let av: Availability = db
+                    .get_data::<Availability>(k.child_id.as_bytes())
+                    .await
+                    .unwrap();
+                if av.complete && av.range.contains(&leaf_cube) {
+                    cur = av;
+                    advanced = true;
+                    break;
+                }
+            }
+            assert!(advanced, "no child covers the inserted atom cube");
+        }
+
+        // 3) Leaf cube should resolve to exactly the inserted PK among storage atoms
+        let atoms = crate::plugins::harmonizer::availability_queries::storage_atom_pks_in_cube_tx(
+            &db, None, &cur.range, None,
+        )
+        .await
+        .unwrap()
+        .expect("leaf dims must resolve to storage tables");
+        let foo_tbl = Foo::table_def().name();
+        let mut found = false;
+        for (tbl, pks) in atoms.into_iter() {
+            if tbl.name() == foo_tbl {
+                found = pks
+                    .iter()
+                    .any(|pk| pk.as_slice() == foo.primary_key().as_slice());
+                if found {
+                    break;
+                }
+            }
+        }
+        assert!(found, "leaf cube must include the inserted Foo PK");
     }
 
     #[tokio::test(start_paused = true)]
     async fn router_probe_headers_smoke() {
-        use crate::plugins::harmonizer::scorers::server_scorer::{ServerScorer, ServerScorerParams};
+        use crate::plugins::harmonizer::scorers::server_scorer::{
+            ServerScorer, ServerScorerParams,
+        };
 
         let clock = Arc::new(MockClock::new(0));
         let rtr_a = Router::new(RouterConfig::default(), clock.clone());
@@ -1323,41 +1594,119 @@ mod tests {
         let conn_b = InMemConnector::with_namespace(pid_b, ns);
         let conn_c = InMemConnector::with_namespace(pid_c, ns);
         let resolver = InMemResolver;
-        rtr_a.connect_peer(pid_b, conn_a.dial(&resolver.resolve(pid_b).await.unwrap()).await.unwrap());
-        rtr_b.connect_peer(pid_a, conn_b.dial(&resolver.resolve(pid_a).await.unwrap()).await.unwrap());
-        rtr_a.connect_peer(pid_c, conn_a.dial(&resolver.resolve(pid_c).await.unwrap()).await.unwrap());
-        rtr_c.connect_peer(pid_a, conn_c.dial(&resolver.resolve(pid_a).await.unwrap()).await.unwrap());
-        rtr_b.connect_peer(pid_c, conn_b.dial(&resolver.resolve(pid_c).await.unwrap()).await.unwrap());
-        rtr_c.connect_peer(pid_b, conn_c.dial(&resolver.resolve(pid_b).await.unwrap()).await.unwrap());
+        rtr_a.connect_peer(
+            pid_b,
+            conn_a
+                .dial(&resolver.resolve(pid_b).await.unwrap())
+                .await
+                .unwrap(),
+        );
+        rtr_b.connect_peer(
+            pid_a,
+            conn_b
+                .dial(&resolver.resolve(pid_a).await.unwrap())
+                .await
+                .unwrap(),
+        );
+        rtr_a.connect_peer(
+            pid_c,
+            conn_a
+                .dial(&resolver.resolve(pid_c).await.unwrap())
+                .await
+                .unwrap(),
+        );
+        rtr_c.connect_peer(
+            pid_a,
+            conn_c
+                .dial(&resolver.resolve(pid_a).await.unwrap())
+                .await
+                .unwrap(),
+        );
+        rtr_b.connect_peer(
+            pid_c,
+            conn_b
+                .dial(&resolver.resolve(pid_c).await.unwrap())
+                .await
+                .unwrap(),
+        );
+        rtr_c.connect_peer(
+            pid_b,
+            conn_c
+                .dial(&resolver.resolve(pid_b).await.unwrap())
+                .await
+                .unwrap(),
+        );
 
-        let params = ServerScorerParams { replication_target: 2, ..Default::default() };
+        let params = ServerScorerParams {
+            replication_target: 2,
+            ..Default::default()
+        };
         let sc_a = ServerScorer::new(params.clone());
         let sc_b = ServerScorer::new(params.clone());
         let sc_c = ServerScorer::new(params.clone());
 
         // Harmonizers
-        let peer_a = PeerContext { peer_id: UuidBytes::new() };
-        let peer_b = PeerContext { peer_id: UuidBytes::new() };
-        let peer_c = PeerContext { peer_id: UuidBytes::new() };
+        let peer_a = PeerContext {
+            peer_id: UuidBytes::new(),
+        };
+        let peer_b = PeerContext {
+            peer_id: UuidBytes::new(),
+        };
+        let peer_c = PeerContext {
+            peer_id: UuidBytes::new(),
+        };
         let opt_a = Arc::new(BasicOptimizer::new(Box::new(sc_a), peer_a.clone()));
         let opt_b = Arc::new(BasicOptimizer::new(Box::new(sc_b), peer_b.clone()));
         let opt_c = Arc::new(BasicOptimizer::new(Box::new(sc_c), peer_c.clone()));
-        let hz_a = Harmonizer::new(rtr_a.clone(), opt_a, HashSet::from([Foo::table_def().name()]), peer_a.clone());
-        let hz_b = Harmonizer::new(rtr_b.clone(), opt_b, HashSet::from([Foo::table_def().name()]), peer_b.clone());
-        let hz_c = Harmonizer::new(rtr_c.clone(), opt_c, HashSet::from([Foo::table_def().name()]), peer_c);
+        let hz_a = Harmonizer::new(
+            rtr_a.clone(),
+            opt_a,
+            HashSet::from([Foo::table_def().name()]),
+            peer_a.clone(),
+        );
+        let hz_b = Harmonizer::new(
+            rtr_b.clone(),
+            opt_b,
+            HashSet::from([Foo::table_def().name()]),
+            peer_b.clone(),
+        );
+        let hz_c = Harmonizer::new(
+            rtr_c.clone(),
+            opt_c,
+            HashSet::from([Foo::table_def().name()]),
+            peer_c,
+        );
 
         // peers for notifications
-        hz_a.add_peer(pid_b).await; hz_a.add_peer(pid_c).await;
-        hz_b.add_peer(pid_a).await; hz_b.add_peer(pid_c).await;
-        hz_c.add_peer(pid_a).await; hz_c.add_peer(pid_b).await;
+        hz_a.add_peer(pid_b).await;
+        hz_a.add_peer(pid_c).await;
+        hz_b.add_peer(pid_a).await;
+        hz_b.add_peer(pid_c).await;
+        hz_c.add_peer(pid_a).await;
+        hz_c.add_peer(pid_b).await;
 
         // DBs
         let dir_a = tempdir().unwrap();
         let dir_b = tempdir().unwrap();
         let dir_c = tempdir().unwrap();
-        let db_a = KuramotoDb::new(dir_a.path().join("a.redb").to_str().unwrap(), clock.clone(), vec![hz_a.clone()]).await;
-        let db_b = KuramotoDb::new(dir_b.path().join("b.redb").to_str().unwrap(), clock.clone(), vec![hz_b.clone()]).await;
-        let db_c = KuramotoDb::new(dir_c.path().join("c.redb").to_str().unwrap(), clock.clone(), vec![hz_c.clone()]).await;
+        let db_a = KuramotoDb::new(
+            dir_a.path().join("a.redb").to_str().unwrap(),
+            clock.clone(),
+            vec![hz_a.clone()],
+        )
+        .await;
+        let db_b = KuramotoDb::new(
+            dir_b.path().join("b.redb").to_str().unwrap(),
+            clock.clone(),
+            vec![hz_b.clone()],
+        )
+        .await;
+        let db_c = KuramotoDb::new(
+            dir_c.path().join("c.redb").to_str().unwrap(),
+            clock.clone(),
+            vec![hz_c.clone()],
+        )
+        .await;
         db_a.create_table_and_indexes::<Foo>().unwrap();
         db_b.create_table_and_indexes::<Foo>().unwrap();
         db_c.create_table_and_indexes::<Foo>().unwrap();
@@ -1373,12 +1722,17 @@ mod tests {
             smallvec![pk_dim],
             smallvec![vec![11u8, 0, 0, 0]],
             smallvec![vec![11u8, 0, 0, 0, 1]],
-        ).unwrap();
+        )
+        .unwrap();
         let got_b = rtr_a
             .request_on::<HarmonizerMsg, HarmonizerResp>(
                 PROTO_HARMONIZER,
                 pid_b,
-                &HarmonizerMsg::GetChildrenByRange(GetChildrenByRange { range: cube.clone(), cursor: None, max: 1 }),
+                &HarmonizerMsg::GetChildrenByRange(GetChildrenByRange {
+                    range: cube.clone(),
+                    cursor: None,
+                    max: 1,
+                }),
                 RouterConfig::default().default_timeout,
             )
             .await
@@ -1387,15 +1741,30 @@ mod tests {
             .request_on::<HarmonizerMsg, HarmonizerResp>(
                 PROTO_HARMONIZER,
                 pid_c,
-                &HarmonizerMsg::GetChildrenByRange(GetChildrenByRange { range: cube.clone(), cursor: None, max: 1 }),
+                &HarmonizerMsg::GetChildrenByRange(GetChildrenByRange {
+                    range: cube.clone(),
+                    cursor: None,
+                    max: 1,
+                }),
                 RouterConfig::default().default_timeout,
             )
             .await
             .unwrap();
         let mut seen = 0;
-        if let HarmonizerResp::Children(resp) = got_b { if !resp.headers.is_empty() { seen += 1; } }
-        if let HarmonizerResp::Children(resp) = got_c { if !resp.headers.is_empty() { seen += 1; } }
-        assert!(seen >= 1, "expected at least one remote peer to report coverage headers");
+        if let HarmonizerResp::Children(resp) = got_b {
+            if !resp.headers.is_empty() {
+                seen += 1;
+            }
+        }
+        if let HarmonizerResp::Children(resp) = got_c {
+            if !resp.headers.is_empty() {
+                seen += 1;
+            }
+        }
+        assert!(
+            seen >= 1,
+            "expected at least one remote peer to report coverage headers"
+        );
     }
 
     /// When the optimizer proposes a parent, Harmonizer enqueues the parent and links children
@@ -1467,7 +1836,10 @@ mod tests {
                 found_any = true;
                 for c in &kids {
                     assert_eq!(c.parent, p.key);
-                    let child: Availability = db.get_data::<Availability>(c.child_id.as_bytes()).await.unwrap();
+                    let child: Availability = db
+                        .get_data::<Availability>(c.child_id.as_bytes())
+                        .await
+                        .unwrap();
                     assert_eq!(child.peer_id, p.peer_id);
                 }
                 // Digest chunk for parent must exist (chunk 0)
@@ -1504,7 +1876,10 @@ mod tests {
                 break;
             }
         }
-        assert!(asserted, "no parent with children to assert root properties");
+        assert!(
+            asserted,
+            "no parent with children to assert root properties"
+        );
     }
 
     /// Wiring test: outbox emits UpdateWithAttestation to a peer without a Harmonizer.
@@ -1542,8 +1917,13 @@ mod tests {
         let local_peer = PeerContext {
             peer_id: UuidBytes::new(),
         };
-        use crate::plugins::harmonizer::scorers::server_scorer::{ServerScorer, ServerScorerParams};
-        let optimizer = Arc::new(BasicOptimizer::new(Box::new(ServerScorer::new(ServerScorerParams::default())), local_peer.clone()));
+        use crate::plugins::harmonizer::scorers::server_scorer::{
+            ServerScorer, ServerScorerParams,
+        };
+        let optimizer = Arc::new(BasicOptimizer::new(
+            Box::new(ServerScorer::new(ServerScorerParams::default())),
+            local_peer.clone(),
+        ));
         let hz_a = Harmonizer::new(
             rtr_a,
             optimizer,
@@ -1640,15 +2020,31 @@ mod tests {
         rtr_b.connect_peer(pid_a, b_to_a);
 
         // Harmonizer A
-        let local_peer = PeerContext { peer_id: UuidBytes::new() };
-        use crate::plugins::harmonizer::scorers::server_scorer::{ServerScorer, ServerScorerParams};
-        let optimizer = Arc::new(BasicOptimizer::new(Box::new(ServerScorer::new(ServerScorerParams::default())), local_peer.clone()));
-        let hz_a = Harmonizer::new(rtr_a.clone(), optimizer, HashSet::from([Foo::table_def().name()]), local_peer);
+        let local_peer = PeerContext {
+            peer_id: UuidBytes::new(),
+        };
+        use crate::plugins::harmonizer::scorers::server_scorer::{
+            ServerScorer, ServerScorerParams,
+        };
+        let optimizer = Arc::new(BasicOptimizer::new(
+            Box::new(ServerScorer::new(ServerScorerParams::default())),
+            local_peer.clone(),
+        ));
+        let hz_a = Harmonizer::new(
+            rtr_a.clone(),
+            optimizer,
+            HashSet::from([Foo::table_def().name()]),
+            local_peer,
+        );
 
         // DB + seed data
         let dir = tempdir().unwrap();
-        let db = KuramotoDb::new(dir.path().join("chunk.redb").to_str().unwrap(), clock.clone(), vec![hz_a.clone()])
-            .await;
+        let db = KuramotoDb::new(
+            dir.path().join("chunk.redb").to_str().unwrap(),
+            clock.clone(),
+            vec![hz_a.clone()],
+        )
+        .await;
         db.create_table_and_indexes::<Foo>().unwrap();
         // Insert two leaves -> optimizer creates a parent with children + digest chunk0
         db.put(Foo { id: 10 }).await.unwrap();
@@ -1656,7 +2052,10 @@ mod tests {
         spin().await;
 
         // find a parent that has at least one child; synthesize if absent
-        let avs: Vec<Availability> = db.range_by_pk::<Availability>(&[], &[0xFF], None).await.unwrap();
+        let avs: Vec<Availability> = db
+            .range_by_pk::<Availability>(&[], &[0xFF], None)
+            .await
+            .unwrap();
         let mut parent: Option<Availability> = None;
         for a in avs.iter().filter(|a| a.level >= 1) {
             let mut lo = a.key.as_bytes().to_vec();
@@ -1668,13 +2067,30 @@ mod tests {
                 break;
             }
         }
-        let parent = if let Some(p) = parent { p } else {
+        let parent = if let Some(p) = parent {
+            p
+        } else {
             // Synthesize a parent with two children so chunk0 is non-empty
-            let leaves: Vec<Availability> = db.range_by_pk::<Availability>(&[], &[0xFF], None).await.unwrap().into_iter().filter(|a| a.level == 0).collect();
+            let leaves: Vec<Availability> = db
+                .range_by_pk::<Availability>(&[], &[0xFF], None)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|a| a.level == 0)
+                .collect();
             assert!(leaves.len() >= 2, "need >=2 leaves");
             let pid = UuidBytes::new();
             let now = db.get_clock().now();
-            let pav = Availability { key: pid, peer_id: UuidBytes::new(), range: leaves[0].range.clone(), level: 1, schema_hash: 0, version: 0, updated_at: now, complete: true };
+            let pav = Availability {
+                key: pid,
+                peer_id: UuidBytes::new(),
+                range: leaves[0].range.clone(),
+                level: 1,
+                schema_hash: 0,
+                version: 0,
+                updated_at: now,
+                complete: true,
+            };
             db.put(pav.clone()).await.unwrap();
             let mut cs = ChildSet::open(&db, pid).await.unwrap();
             cs.add_child(&db, leaves[0].key).await.unwrap();
@@ -1684,7 +2100,10 @@ mod tests {
 
         // request chunk0 from B -> A
         let req = crate::plugins::harmonizer::protocol::HarmonizerMsg::GetChildrenDigest(
-            crate::plugins::harmonizer::protocol::GetChildrenDigest { parent_uuid: parent.key, chunk_no: 0 },
+            crate::plugins::harmonizer::protocol::GetChildrenDigest {
+                parent_uuid: parent.key,
+                chunk_no: 0,
+            },
         );
         let bytes = rtr_b
             .request_on::<_, crate::plugins::harmonizer::protocol::HarmonizerResp>(
@@ -1695,7 +2114,10 @@ mod tests {
             )
             .await
             .unwrap();
-        let resp = match bytes { crate::plugins::harmonizer::protocol::HarmonizerResp::Digest(d) => d, _ => panic!("wrong resp") };
+        let resp = match bytes {
+            crate::plugins::harmonizer::protocol::HarmonizerResp::Digest(d) => d,
+            _ => panic!("wrong resp"),
+        };
         assert!(!resp.bytes.is_empty(), "chunk0 should be non-empty");
 
         // verify matches DB read of chunk0
@@ -1719,40 +2141,85 @@ mod tests {
         let conn_a = InMemConnector::with_namespace(pid_a, ns);
         let conn_b = InMemConnector::with_namespace(pid_b, ns);
         let resolver = InMemResolver;
-        let a_to_b = conn_a.dial(&resolver.resolve(pid_b).await.unwrap()).await.unwrap();
-        let b_to_a = conn_b.dial(&resolver.resolve(pid_a).await.unwrap()).await.unwrap();
+        let a_to_b = conn_a
+            .dial(&resolver.resolve(pid_b).await.unwrap())
+            .await
+            .unwrap();
+        let b_to_a = conn_b
+            .dial(&resolver.resolve(pid_a).await.unwrap())
+            .await
+            .unwrap();
         rtr_a.connect_peer(pid_b, a_to_b);
         rtr_b.connect_peer(pid_a, b_to_a);
 
         // Harmonizer A
-        let local_peer = PeerContext { peer_id: UuidBytes::new() };
-        use crate::plugins::harmonizer::scorers::server_scorer::{ServerScorer, ServerScorerParams};
-        let optimizer = Arc::new(BasicOptimizer::new(Box::new(ServerScorer::new(ServerScorerParams::default())), local_peer.clone()));
-        let hz_a = Harmonizer::new(rtr_a.clone(), optimizer, HashSet::from([Foo::table_def().name()]), local_peer);
+        let local_peer = PeerContext {
+            peer_id: UuidBytes::new(),
+        };
+        use crate::plugins::harmonizer::scorers::server_scorer::{
+            ServerScorer, ServerScorerParams,
+        };
+        let optimizer = Arc::new(BasicOptimizer::new(
+            Box::new(ServerScorer::new(ServerScorerParams::default())),
+            local_peer.clone(),
+        ));
+        let hz_a = Harmonizer::new(
+            rtr_a.clone(),
+            optimizer,
+            HashSet::from([Foo::table_def().name()]),
+            local_peer,
+        );
 
         let dir = tempdir().unwrap();
-        let db = KuramotoDb::new(dir.path().join("headers.redb").to_str().unwrap(), clock.clone(), vec![hz_a.clone()]).await;
+        let db = KuramotoDb::new(
+            dir.path().join("headers.redb").to_str().unwrap(),
+            clock.clone(),
+            vec![hz_a.clone()],
+        )
+        .await;
         db.create_table_and_indexes::<Foo>().unwrap();
-        for id in 20..=23 { db.put(Foo { id }).await.unwrap(); }
+        for id in 20..=23 {
+            db.put(Foo { id }).await.unwrap();
+        }
         spin().await;
 
         // pick a parent with children; if absent, synthesize one for this RPC test
-        let avs: Vec<Availability> = db.range_by_pk::<Availability>(&[], &[0xFF], None).await.unwrap();
+        let avs: Vec<Availability> = db
+            .range_by_pk::<Availability>(&[], &[0xFF], None)
+            .await
+            .unwrap();
         let mut parent: Option<Availability> = None;
         for a in avs.iter().filter(|a| a.level >= 1) {
             let mut lo = a.key.as_bytes().to_vec();
             let mut hi = lo.clone();
             hi.push(0xFF);
             let kids: Vec<Child> = db.range_by_pk::<Child>(&lo, &hi, None).await.unwrap();
-            if kids.len() >= 2 { parent = Some(a.clone()); break; }
+            if kids.len() >= 2 {
+                parent = Some(a.clone());
+                break;
+            }
         }
-        let parent = if let Some(p) = parent { p } else {
+        let parent = if let Some(p) = parent {
+            p
+        } else {
             // Synthesize a minimal parent with two children for paging
             let leaves: Vec<Availability> = avs.into_iter().filter(|a| a.level == 0).collect();
-            assert!(leaves.len() >= 2, "need at least two leaves to synthesize parent");
+            assert!(
+                leaves.len() >= 2,
+                "need at least two leaves to synthesize parent"
+            );
             let pid = UuidBytes::new();
             let now = db.get_clock().now();
-            let pav = Availability { key: pid, peer_id: UuidBytes::new(), range: leaves[0].range.clone(), level: 1, schema_hash: 0, version: 0, updated_at: now, complete: true };
+            let pav = Availability {
+                key: pid,
+                peer_id: UuidBytes::new(),
+                range: leaves[0].range.clone(),
+                level: 1,
+                schema_hash: 0,
+                version: 0,
+                updated_at: now,
+                complete: true,
+            };
             db.put(pav.clone()).await.unwrap();
             let mut cs = ChildSet::open(&db, pid).await.unwrap();
             cs.add_child(&db, leaves[0].key).await.unwrap();
@@ -1765,7 +2232,11 @@ mod tests {
         let mut total = 0usize;
         for _ in 0..2 {
             let req = crate::plugins::harmonizer::protocol::HarmonizerMsg::GetChildrenHeaders(
-                crate::plugins::harmonizer::protocol::GetChildrenHeaders { parent_uuid: parent.key, cursor: cursor.clone(), max: 2 },
+                crate::plugins::harmonizer::protocol::GetChildrenHeaders {
+                    parent_uuid: parent.key,
+                    cursor: cursor.clone(),
+                    max: 2,
+                },
             );
             let resp = rtr_b
                 .request_on::<_, crate::plugins::harmonizer::protocol::HarmonizerResp>(
@@ -1776,10 +2247,15 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let r = match resp { crate::plugins::harmonizer::protocol::HarmonizerResp::Children(c) => c, _ => panic!("wrong resp") };
+            let r = match resp {
+                crate::plugins::harmonizer::protocol::HarmonizerResp::Children(c) => c,
+                _ => panic!("wrong resp"),
+            };
             total += r.headers.len();
             cursor = r.next;
-            if cursor.is_none() { break; }
+            if cursor.is_none() {
+                break;
+            }
         }
         assert!(total >= 2, "should page headers");
     }
@@ -1798,34 +2274,77 @@ mod tests {
         let conn_a = InMemConnector::with_namespace(pid_a, ns);
         let conn_b = InMemConnector::with_namespace(pid_b, ns);
         let resolver = InMemResolver;
-        let a_to_b = conn_a.dial(&resolver.resolve(pid_b).await.unwrap()).await.unwrap();
-        let b_to_a = conn_b.dial(&resolver.resolve(pid_a).await.unwrap()).await.unwrap();
+        let a_to_b = conn_a
+            .dial(&resolver.resolve(pid_b).await.unwrap())
+            .await
+            .unwrap();
+        let b_to_a = conn_b
+            .dial(&resolver.resolve(pid_a).await.unwrap())
+            .await
+            .unwrap();
         rtr_a.connect_peer(pid_b, a_to_b);
         rtr_b.connect_peer(pid_a, b_to_a);
 
         // Harmonizers
-        let peer_a = PeerContext { peer_id: UuidBytes::new() };
-        let peer_b = PeerContext { peer_id: UuidBytes::new() };
-        use crate::plugins::harmonizer::scorers::server_scorer::{ServerScorer, ServerScorerParams};
-        let opt_a = Arc::new(BasicOptimizer::new(Box::new(ServerScorer::new(ServerScorerParams::default())), peer_a.clone()));
-        let opt_b = Arc::new(BasicOptimizer::new(Box::new(ServerScorer::new(ServerScorerParams::default())), peer_b.clone()));
-        let hz_a = Harmonizer::new(rtr_a.clone(), opt_a, HashSet::from([Foo::table_def().name()]), peer_a.clone());
-        let hz_b = Harmonizer::new(rtr_b.clone(), opt_b, HashSet::from([Foo::table_def().name()]), peer_b.clone());
+        let peer_a = PeerContext {
+            peer_id: UuidBytes::new(),
+        };
+        let peer_b = PeerContext {
+            peer_id: UuidBytes::new(),
+        };
+        use crate::plugins::harmonizer::scorers::server_scorer::{
+            ServerScorer, ServerScorerParams,
+        };
+        let opt_a = Arc::new(BasicOptimizer::new(
+            Box::new(ServerScorer::new(ServerScorerParams::default())),
+            peer_a.clone(),
+        ));
+        let opt_b = Arc::new(BasicOptimizer::new(
+            Box::new(ServerScorer::new(ServerScorerParams::default())),
+            peer_b.clone(),
+        ));
+        let hz_a = Harmonizer::new(
+            rtr_a.clone(),
+            opt_a,
+            HashSet::from([Foo::table_def().name()]),
+            peer_a.clone(),
+        );
+        let hz_b = Harmonizer::new(
+            rtr_b.clone(),
+            opt_b,
+            HashSet::from([Foo::table_def().name()]),
+            peer_b.clone(),
+        );
 
         // DBs
         let dir_a = tempdir().unwrap();
         let dir_b = tempdir().unwrap();
-        let db_a = KuramotoDb::new(dir_a.path().join("a.redb").to_str().unwrap(), clock.clone(), vec![hz_a.clone()]).await;
-        let db_b = KuramotoDb::new(dir_b.path().join("b.redb").to_str().unwrap(), clock.clone(), vec![hz_b.clone()]).await;
+        let db_a = KuramotoDb::new(
+            dir_a.path().join("a.redb").to_str().unwrap(),
+            clock.clone(),
+            vec![hz_a.clone()],
+        )
+        .await;
+        let db_b = KuramotoDb::new(
+            dir_b.path().join("b.redb").to_str().unwrap(),
+            clock.clone(),
+            vec![hz_b.clone()],
+        )
+        .await;
         db_a.create_table_and_indexes::<Foo>().unwrap();
         db_b.create_table_and_indexes::<Foo>().unwrap();
 
         // A: insert a few leaves -> parent with children
-        for id in 100..=102 { db_a.put(Foo { id }).await.unwrap(); }
+        for id in 100..=102 {
+            db_a.put(Foo { id }).await.unwrap();
+        }
         spin().await;
 
         // Find a parent on A with >=2 children
-        let avs: Vec<availability::Availability> = db_a.range_by_pk::<availability::Availability>(&[], &[0xFF], None).await.unwrap();
+        let avs: Vec<availability::Availability> = db_a
+            .range_by_pk::<availability::Availability>(&[], &[0xFF], None)
+            .await
+            .unwrap();
         let mut parent: Option<availability::Availability> = None;
         let mut kids: Vec<Child> = Vec::new();
         for a in avs.iter().filter(|a| a.level >= 1) {
@@ -1833,38 +2352,43 @@ mod tests {
             let mut hi = lo.clone();
             hi.push(0xFF);
             let c: Vec<Child> = db_a.range_by_pk::<Child>(&lo, &hi, None).await.unwrap();
-            if c.len() >= 2 { parent = Some(a.clone()); kids = c; break; }
+            if c.len() >= 2 {
+                parent = Some(a.clone());
+                kids = c;
+                break;
+            }
         }
-        let (parent, a_child_ids): (availability::Availability, Vec<UuidBytes>) = if let Some(p) = parent {
-            (p, kids.iter().map(|r| r.child_id).collect())
-        } else {
-            // Synthesize parent with two children
-            let leaves: Vec<availability::Availability> = db_a
-                .range_by_pk::<availability::Availability>(&[], &[0xFF], None)
-                .await
-                .unwrap()
-                .into_iter()
-                .filter(|a| a.level == 0)
-                .collect();
-            assert!(leaves.len() >= 2, "need >=2 leaves on A");
-            let pid = UuidBytes::new();
-            let nowa = db_a.get_clock().now();
-            let pav = availability::Availability {
-                key: pid,
-                peer_id: peer_a.peer_id,
-                range: leaves[0].range.clone(),
-                level: 1,
-                schema_hash: 0,
-                version: 0,
-                updated_at: nowa,
-                complete: true,
+        let (parent, a_child_ids): (availability::Availability, Vec<UuidBytes>) =
+            if let Some(p) = parent {
+                (p, kids.iter().map(|r| r.child_id).collect())
+            } else {
+                // Synthesize parent with two children
+                let leaves: Vec<availability::Availability> = db_a
+                    .range_by_pk::<availability::Availability>(&[], &[0xFF], None)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .filter(|a| a.level == 0)
+                    .collect();
+                assert!(leaves.len() >= 2, "need >=2 leaves on A");
+                let pid = UuidBytes::new();
+                let nowa = db_a.get_clock().now();
+                let pav = availability::Availability {
+                    key: pid,
+                    peer_id: peer_a.peer_id,
+                    range: leaves[0].range.clone(),
+                    level: 1,
+                    schema_hash: 0,
+                    version: 0,
+                    updated_at: nowa,
+                    complete: true,
+                };
+                db_a.put(pav.clone()).await.unwrap();
+                let mut cs_a = ChildSet::open(&db_a, pid).await.unwrap();
+                cs_a.add_child(&db_a, leaves[0].key).await.unwrap();
+                cs_a.add_child(&db_a, leaves[1].key).await.unwrap();
+                (pav, vec![leaves[0].key, leaves[1].key])
             };
-            db_a.put(pav.clone()).await.unwrap();
-            let mut cs_a = ChildSet::open(&db_a, pid).await.unwrap();
-            cs_a.add_child(&db_a, leaves[0].key).await.unwrap();
-            cs_a.add_child(&db_a, leaves[1].key).await.unwrap();
-            (pav, vec![leaves[0].key, leaves[1].key])
-        };
 
         // B: materialize the same parent key/range/level (no children yet)
         let now = db_b.get_clock().now();
@@ -1881,14 +2405,18 @@ mod tests {
         db_b.put(pav).await.unwrap();
         // Seed children on B: all except last
         let mut cs_b = ChildSet::open(&db_b, parent.key).await.unwrap();
-        for cid in a_child_ids.iter().take(a_child_ids.len() - 1) { cs_b.add_child(&db_b, *cid).await.unwrap(); }
+        for cid in a_child_ids.iter().take(a_child_ids.len() - 1) {
+            cs_b.add_child(&db_b, *cid).await.unwrap();
+        }
 
         // Sanity: B missing one child
         let cs_b2 = ChildSet::open(&db_b, parent.key).await.unwrap();
         assert_eq!(cs_b2.count() + 1, a_child_ids.len());
 
         // Repair from A
-        hz_b.repair_parent_with_peer(pid_a, parent.key).await.unwrap();
+        hz_b.repair_parent_with_peer(pid_a, parent.key)
+            .await
+            .unwrap();
 
         let cs_b3 = ChildSet::open(&db_b, parent.key).await.unwrap();
         let got: std::collections::HashSet<_> = cs_b3.children.iter().copied().collect();
@@ -1928,8 +2456,13 @@ mod tests {
         let peer_a = PeerContext {
             peer_id: UuidBytes::new(),
         };
-        use crate::plugins::harmonizer::scorers::server_scorer::{ServerScorer, ServerScorerParams};
-        let opt_a = Arc::new(BasicOptimizer::new(Box::new(ServerScorer::new(ServerScorerParams::default())), peer_a.clone()));
+        use crate::plugins::harmonizer::scorers::server_scorer::{
+            ServerScorer, ServerScorerParams,
+        };
+        let opt_a = Arc::new(BasicOptimizer::new(
+            Box::new(ServerScorer::new(ServerScorerParams::default())),
+            peer_a.clone(),
+        ));
         let hz_a = Harmonizer::new(
             rtr_a.clone(),
             opt_a,
@@ -1939,7 +2472,10 @@ mod tests {
         let peer_b = PeerContext {
             peer_id: UuidBytes::new(),
         };
-        let opt_b = Arc::new(BasicOptimizer::new(Box::new(ServerScorer::new(ServerScorerParams::default())), peer_b.clone()));
+        let opt_b = Arc::new(BasicOptimizer::new(
+            Box::new(ServerScorer::new(ServerScorerParams::default())),
+            peer_b.clone(),
+        ));
         let hz_b = Harmonizer::new(
             rtr_b.clone(),
             opt_b,
@@ -2005,34 +2541,109 @@ mod tests {
         let conn_a = InMemConnector::with_namespace(pid_a, ns);
         let conn_b = InMemConnector::with_namespace(pid_b, ns);
         let resolver = InMemResolver;
-        let a_to_b = conn_a.dial(&resolver.resolve(pid_b).await.unwrap()).await.unwrap();
-        let b_to_a = conn_b.dial(&resolver.resolve(pid_a).await.unwrap()).await.unwrap();
+        let a_to_b = conn_a
+            .dial(&resolver.resolve(pid_b).await.unwrap())
+            .await
+            .unwrap();
+        let b_to_a = conn_b
+            .dial(&resolver.resolve(pid_a).await.unwrap())
+            .await
+            .unwrap();
         rtr_a.connect_peer(pid_b, a_to_b);
         rtr_b.connect_peer(pid_a, b_to_a);
 
         // Harmonizers
-        let peer_a = PeerContext { peer_id: UuidBytes::new() };
-        let peer_b = PeerContext { peer_id: UuidBytes::new() };
-        use crate::plugins::harmonizer::scorers::server_scorer::{ServerScorer, ServerScorerParams};
-        let opt_a = Arc::new(BasicOptimizer::new(Box::new(ServerScorer::new(ServerScorerParams::default())), peer_a.clone()));
-        let opt_b = Arc::new(BasicOptimizer::new(Box::new(ServerScorer::new(ServerScorerParams::default())), peer_b.clone()));
-        let hz_a = Harmonizer::new(rtr_a.clone(), opt_a, HashSet::from([Foo::table_def().name()]), peer_a);
-        let hz_b = Harmonizer::new(rtr_b.clone(), opt_b, HashSet::from([Foo::table_def().name()]), peer_b.clone());
+        let peer_a = PeerContext {
+            peer_id: UuidBytes::new(),
+        };
+        let peer_b = PeerContext {
+            peer_id: UuidBytes::new(),
+        };
+        use crate::plugins::harmonizer::scorers::server_scorer::{
+            ServerScorer, ServerScorerParams,
+        };
+        let opt_a = Arc::new(BasicOptimizer::new(
+            Box::new(ServerScorer::new(ServerScorerParams::default())),
+            peer_a.clone(),
+        ));
+        let opt_b = Arc::new(BasicOptimizer::new(
+            Box::new(ServerScorer::new(ServerScorerParams::default())),
+            peer_b.clone(),
+        ));
+        let hz_a = Harmonizer::new(
+            rtr_a.clone(),
+            opt_a,
+            HashSet::from([Foo::table_def().name()]),
+            peer_a,
+        );
+        let hz_b = Harmonizer::new(
+            rtr_b.clone(),
+            opt_b,
+            HashSet::from([Foo::table_def().name()]),
+            peer_b.clone(),
+        );
 
         // DBs
         let dir_a = tempdir().unwrap();
         let dir_b = tempdir().unwrap();
-        let db_a = KuramotoDb::new(dir_a.path().join("a.redb").to_str().unwrap(), clock.clone(), vec![hz_a.clone()]).await;
-        let db_b = KuramotoDb::new(dir_b.path().join("b.redb").to_str().unwrap(), clock.clone(), vec![hz_b.clone()]).await;
+        let db_a = KuramotoDb::new(
+            dir_a.path().join("a.redb").to_str().unwrap(),
+            clock.clone(),
+            vec![hz_a.clone()],
+        )
+        .await;
+        let db_b = KuramotoDb::new(
+            dir_b.path().join("b.redb").to_str().unwrap(),
+            clock.clone(),
+            vec![hz_b.clone()],
+        )
+        .await;
         db_a.create_table_and_indexes::<Foo>().unwrap();
         db_b.create_table_and_indexes::<Foo>().unwrap();
 
         // A: synthesize a parent with two children and materialize chunk0
         let parent_id = UuidBytes::new();
         let now = db_a.get_clock().now();
-        let leaf1 = Availability { key: UuidBytes::new(), peer_id: UuidBytes::new(), range: RangeCube::new(smallvec![TableHash { hash: 77 }], smallvec![vec![1]], smallvec![vec![2]]).unwrap(), level: 0, schema_hash: 0, version: 0, updated_at: now, complete: true };
-        let leaf2 = Availability { key: UuidBytes::new(), peer_id: UuidBytes::new(), range: RangeCube::new(smallvec![TableHash { hash: 77 }], smallvec![vec![3]], smallvec![vec![4]]).unwrap(), level: 0, schema_hash: 0, version: 0, updated_at: now, complete: true };
-        let parent = Availability { key: parent_id, peer_id: UuidBytes::new(), range: leaf1.range.clone(), level: 1, schema_hash: 0, version: 0, updated_at: now, complete: true };
+        let leaf1 = Availability {
+            key: UuidBytes::new(),
+            peer_id: UuidBytes::new(),
+            range: RangeCube::new(
+                smallvec![TableHash { hash: 77 }],
+                smallvec![vec![1]],
+                smallvec![vec![2]],
+            )
+            .unwrap(),
+            level: 0,
+            schema_hash: 0,
+            version: 0,
+            updated_at: now,
+            complete: true,
+        };
+        let leaf2 = Availability {
+            key: UuidBytes::new(),
+            peer_id: UuidBytes::new(),
+            range: RangeCube::new(
+                smallvec![TableHash { hash: 77 }],
+                smallvec![vec![3]],
+                smallvec![vec![4]],
+            )
+            .unwrap(),
+            level: 0,
+            schema_hash: 0,
+            version: 0,
+            updated_at: now,
+            complete: true,
+        };
+        let parent = Availability {
+            key: parent_id,
+            peer_id: UuidBytes::new(),
+            range: leaf1.range.clone(),
+            level: 1,
+            schema_hash: 0,
+            version: 0,
+            updated_at: now,
+            complete: true,
+        };
         db_a.put(leaf1.clone()).await.unwrap();
         db_a.put(leaf2.clone()).await.unwrap();
         db_a.put(parent.clone()).await.unwrap();
@@ -2041,7 +2652,16 @@ mod tests {
         cs_a.add_child(&db_a, leaf2.key).await.unwrap();
 
         // B: same parent id but incomplete and without children
-        let parent_b = Availability { key: parent_id, peer_id: peer_b.peer_id, range: parent.range.clone(), level: 1, schema_hash: 0, version: 0, updated_at: now, complete: false };
+        let parent_b = Availability {
+            key: parent_id,
+            peer_id: peer_b.peer_id,
+            range: parent.range.clone(),
+            level: 1,
+            schema_hash: 0,
+            version: 0,
+            updated_at: now,
+            complete: false,
+        };
         db_b.put(parent_b).await.unwrap();
 
         // Tell B to reach A

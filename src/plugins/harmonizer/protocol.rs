@@ -73,6 +73,9 @@ pub struct UpdateHintTouched {
 
 #[derive(Clone, Debug, Encode, Decode)]
 pub struct UpdateHint {
+    /// Logical UUID of the peer sending this hint.
+    /// Receivers must attribute availabilities to this peer, not to self.
+    pub peer_uuid: UuidBytes,
     pub range: RangeCube,
     pub epoch: u64,
     pub touched: Vec<UpdateHintTouched>,

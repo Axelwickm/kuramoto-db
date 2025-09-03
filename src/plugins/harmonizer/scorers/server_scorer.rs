@@ -700,22 +700,34 @@ mod tests {
         // Insert one row on origin
         let enc = |e: &TestEnt| { let mut out = Vec::new(); out.push(0); out.extend(bincode::encode_to_vec(e, bincode::config::standard()).unwrap()); out };
         t.insert_bytes(peers[0], TestEnt::table_def().name(), enc(&TestEnt { id: 1 })).await;
-        // Wait until all peers have the row or timeout (wall clock watchdog in SyncTester)
+        // Wait until exactly k=2 peers have the row (origin + one remote)
+        let origin = peers[0];
         let _rep = t
             .run_until_async(
                 10_000,
                 Some(std::time::Duration::from_secs(5)),
                 |st| {
                     Box::pin(async move {
+                        let mut count = 0; let mut origin_has = false;
                         for n in st.peers().iter() {
-                            if n.db.get_data::<TestEnt>(&1u32.to_le_bytes()).await.is_err() { return false; }
+                            let ok = n.db.get_data::<TestEnt>(&1u32.to_le_bytes()).await.is_ok();
+                            if ok { count += 1; }
+                            if n.peer_id == origin && ok { origin_has = true; }
                         }
-                        true
+                        origin_has && count == 2
                     })
                 },
             )
             .await;
-        for n in t.peers().iter() { let got: TestEnt = n.db.get_data::<TestEnt>(&1u32.to_le_bytes()).await.unwrap(); assert_eq!(got, TestEnt { id: 1 }); }
+        // Post-check
+        let mut count = 0; let mut origin_has = false;
+        for n in t.peers().iter() {
+            let ok = n.db.get_data::<TestEnt>(&1u32.to_le_bytes()).await.is_ok();
+            if ok { count += 1; }
+            if n.peer_id == origin && ok { origin_has = true; }
+        }
+        assert!(origin_has, "origin should retain the row");
+        assert_eq!(count, 2, "row should be present on exactly k=2 peers");
     }
 
     #[tokio::test(start_paused = true)]
