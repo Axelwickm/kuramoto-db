@@ -223,18 +223,27 @@ impl Optimizer for BasicOptimizer {
             let t_search = Instant::now();
             let Some(path) = search.propose_step(&start, &g, &eval).await else {
                 let (calls, ns) = eval.timing_summary();
-                if calls > 0 { println!("opt.propose_step: scorer_time_ms={} calls={} avg_us={}", ns as f64 / 1e6, calls, (ns / calls as u128) / 1000); }
+                #[cfg(feature = "harmonizer_debug")]
+                if calls > 0 {
+                    tracing::debug!(
+                        scorer_time_ms = % (ns as f64 / 1e6),
+                        calls = calls,
+                        avg_us = %((ns / calls as u128) / 1000),
+                        "opt.propose_step: no path"
+                    );
+                }
                 continue;
             };
             let dt_search = t_search.elapsed().as_millis();
             let (calls, ns) = eval.timing_summary();
+            #[cfg(feature = "harmonizer_debug")]
             if calls > 0 {
-                println!(
-                    "opt.propose_step: took={}ms scorer_time_ms={} calls={} avg_us={}",
-                    dt_search,
-                    ns as f64 / 1e6,
-                    calls,
-                    (ns / calls as u128) / 1000
+                tracing::debug!(
+                    took_ms = %dt_search,
+                    scorer_time_ms = % (ns as f64 / 1e6),
+                    calls = calls,
+                    avg_us = %((ns / calls as u128) / 1000),
+                    "opt.propose_step"
                 );
             }
 
@@ -438,11 +447,13 @@ impl<'a> PlannerEval<'a> {
                 return Ok(v.clone());
             }
         }
+        // Discover local children via frontier DFS under our roots, then filter for contained nodes.
         let roots_ids = self.ensure_roots().await?;
         let mut qcache = None;
         let (frontier, no_overlap) =
-            range_cover(self.db, Some(self.txn), target, &roots_ids, None, &vec![], &mut qcache).await?;
-        let mut seen = HashSet::<UuidBytes>::new();
+            range_cover(self.db, Some(self.txn), target, &roots_ids, None, &vec![], &mut qcache)
+                .await?;
+        let mut seen = std::collections::HashSet::<UuidBytes>::new();
         if !no_overlap {
             for a in frontier {
                 if a.peer_id == self.ctx.peer_id && a.complete && target.contains(&a.range) {
@@ -466,7 +477,8 @@ impl<'a> PlannerEval<'a> {
         }
 
         // Level-aware adoption: level 0 adopts if there are storage atoms in range;
-        // otherwise adopt if there is at least one contained availability child.
+        // for parents (level > 0), adopt only when there are at least two local, complete
+        // contained availability children (bottom-up rule) and none are masked by deletes.
         let adopts = if s.focus.level == 0 {
             // Level 0 adopts if there are underlying storage atoms in range
             let n = crate::plugins::harmonizer::availability_queries::storage_atom_count_in_cube_tx(
@@ -478,7 +490,8 @@ impl<'a> PlannerEval<'a> {
             n.unwrap_or(0) > 0
         } else {
             let ids = self.local_child_ids(&s.focus.range).await?;
-            ids.iter().any(|id| !deleted.contains(id))
+            let kept = ids.iter().filter(|id| !deleted.contains(id)).count();
+            kept >= 2
         };
         if adopts {
             push_insert(&mut eff, s.focus.clone());

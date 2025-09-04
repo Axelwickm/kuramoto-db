@@ -131,7 +131,7 @@ impl ServerScorer {
             db,
             Some(txn),
             &cand.range,
-            |a| a.complete,
+            |_| true,
             None,
         )
         .await?;
@@ -256,6 +256,12 @@ impl Scorer for ServerScorer {
         };
         s += self.child_count_score(child_count);
         s += (cand.level as f32) * self.params.level_weight;
+        // Nudge toward parents to encourage grouping over flat leaves
+        if cand.level == 0 {
+            s -= 1.0;
+        } else {
+            s += 1.0;
+        }
         s
     }
 }

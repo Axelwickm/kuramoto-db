@@ -485,43 +485,44 @@ pub async fn child_count(
         return Ok(out);
     }
 
-    // Availability frontier counting (local, complete, contained) with overlay
-    let t_roots = Instant::now();
-    let roots: Vec<Availability> = roots_for_peer_cached(db, txn, peer, cache).await?;
-    let dt_roots = t_roots.elapsed();
-    let root_ids: Vec<UuidBytes> = roots.iter().map(|r| r.key).collect();
+    // Fast path: count local complete availabilities fully contained in cube using axis-min index.
+    // Then apply overlay semantics: deletes mask; inserts add and dedupe by (level, mins, maxs).
+    let mut candidates = availabilities_contained_in_cube_tx(db, txn, cube, None).await?;
+    // Only count children strictly below the candidate level
+    candidates.retain(|a| a.peer_id == *peer && a.complete && (a.level as u16) < level);
 
-    let t_cover = Instant::now();
-    let (frontier, no_overlap) =
-        range_cover(db, txn, cube, &root_ids, None, overlay, cache).await?;
-    let dt_cover = t_cover.elapsed();
-    if no_overlap {
-        // println!(
-        //     "aq.child_count: level={} roots={} frontier=0 took roots={}ms cover={}ms",
-        //     level,
-        //     root_ids.len(),
-        //     dt_roots.as_millis(),
-        //     dt_cover.as_millis()
-        //);
-        return Ok(0);
+    // Deduplicate by geometry (level + mins/maxs) to avoid double-counting across roots.
+    let mut geom: std::collections::HashSet<(u16, Vec<Vec<u8>>, Vec<Vec<u8>>)> =
+        std::collections::HashSet::new();
+    for a in candidates.iter() {
+        geom.insert((a.level, a.range.mins().to_vec(), a.range.maxs().to_vec()));
     }
-    let mut seen = HashSet::<UuidBytes>::new();
-    let mut count = 0usize;
-    for a in frontier.iter() {
-        if a.peer_id == *peer && a.complete && cube.contains(&a.range) && seen.insert(a.key) {
-            count += 1;
+
+    // Overlay: deletes mask existing; inserts are counted if contained and not already present.
+    use crate::plugins::harmonizer::optimizer::Action::{Delete, Insert};
+    let mut deleted: std::collections::HashSet<UuidBytes> = std::collections::HashSet::new();
+    for act in overlay.iter() {
+        if let Delete(id) = act {
+            deleted.insert(*id);
         }
     }
-    //println!(
-    //     "aq.child_count: level={} roots={} frontier={} out={} took roots={}ms cover={}ms",
-    //     level,
-    //     root_ids.len(),
-    //     frontier.len(),
-    //     count,
-    //     dt_roots.as_millis(),
-    //     dt_cover.as_millis()
-    // );
-    Ok(count)
+    // Filter out any candidate whose id is deleted by overlay.
+    if !deleted.is_empty() {
+        candidates.retain(|a| !deleted.contains(&a.key));
+    }
+
+    for act in overlay.iter() {
+        if let Insert(d) = act {
+            if d.complete && (d.level as u16) < level && cube.contains(&d.range) {
+                let key = (d.level, d.range.mins().to_vec(), d.range.maxs().to_vec());
+                if !geom.contains(&key) {
+                    geom.insert(key);
+                }
+            }
+        }
+    }
+
+    Ok(geom.len())
 }
 
 /// Return true if the given peer has a local complete availability that fully contains `target`.

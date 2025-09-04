@@ -230,6 +230,7 @@ where
             let sc = match self.score_raw(eval, &next).await {
                 Some(s) => s,
                 None => {
+                    #[cfg(feature = "harmonizer_debug")]
                     println!(
                         "search.timing: total={}ms (budget at d1 score)",
                         t_total.elapsed().as_millis()
@@ -332,6 +333,7 @@ where
         d1_sort_ms = t_sort_d1.elapsed().as_millis();
 
         let best_single_gain = kids[0].1 - s0;
+        #[cfg(feature = "harmonizer_debug")]
         println!(
             "search.best_single: gain={:.3} act={:?} (sort_d1={}ms)",
             best_single_gain, kids[0].3, d1_sort_ms
@@ -492,6 +494,7 @@ where
             per_depth_eval_ms.push(eval_ms_this_depth);
             per_depth_sort_ms.push(sort_ms_this_depth);
 
+            #[cfg(feature = "harmonizer_debug")]
             println!(
                 "search.depth{}: expanded={} frontier={} eval={}ms sort={}ms expand={}ms",
                 d,
@@ -505,6 +508,7 @@ where
             frontier = expanded;
         }
 
+        #[cfg(feature = "harmonizer_debug")]
         println!(
             "search.best_seq: depth={} gain={:.3} len={}",
             self.cfg.depth,
@@ -516,6 +520,7 @@ where
             best_seq.len()
         );
 
+        #[cfg(feature = "harmonizer_debug")]
         println!(
             "search.timing: total={}ms | gen={}ms \
              d1={{rollout:{}ms, score:{}ms, sort:{}ms}} \

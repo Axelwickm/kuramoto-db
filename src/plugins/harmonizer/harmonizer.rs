@@ -373,13 +373,15 @@ impl Harmonizer {
                                     let mut adopted = false;
                                     if let Ok(txn) = db.begin_read_txn() {
                                         let t_adopt = std::time::Instant::now();
-                                        if let Ok(Some(_plan)) = this.optimizer.propose(&db, &txn, &[seed]).await {
+                if let Ok(Some(_plan)) = this.optimizer.propose(&db, &txn, &[seed]).await {
                                             adopted = true;
+                                            #[cfg(feature = "harmonizer_debug")]
                                             println!(
                                                 "attest.receive: optimizer proposed adoption ({}ms)",
                                                 t_adopt.elapsed().as_millis()
                                             );
                                         } else {
+                                            #[cfg(feature = "harmonizer_debug")]
                                             println!(
                                                 "attest.receive: optimizer did not propose ({}ms)",
                                                 t_adopt.elapsed().as_millis()
@@ -404,14 +406,13 @@ impl Harmonizer {
                                 }
                             }
                             HarmonizerMsg::UpdateHint(hint) => {
-                                // Ensure parent rows exist (by uuid/level/range) and trigger repair using the notifying peer.
+                                // Upsert headers only; trust remote 'complete' and store range/level.
+                                // Do not fetch or reconcile children here.
                                 if let Some(db) = this.db.get().and_then(|w| w.upgrade()) {
                                     let now = db.get_clock().now();
                                     for t in hint.touched {
-                                        // create or update availability row for this uuid
                                         let av = Availability {
                                             key: t.uuid,
-                                            // Attribute this availability to the sender peer from the hint
                                             peer_id: hint.peer_uuid,
                                             range: hint.range.clone(),
                                             level: t.level,
@@ -421,20 +422,7 @@ impl Harmonizer {
                                             complete: t.complete,
                                         };
                                         let _ = db.put(av).await;
-                                        // schedule repair with in-flight guard
-                                        let this2 = this.clone();
-                                        tokio::spawn(async move {
-                                            // in-flight check
-                                            let mut guard = this2.in_flight_repairs.write().await;
-                                            if !guard.insert(t.uuid) {
-                                                return;
-                                            }
-                                            drop(guard);
-                                            let _ =
-                                                this2.repair_parent_with_peer(peer, t.uuid).await;
-                                            let mut guard2 = this2.in_flight_repairs.write().await;
-                                            guard2.remove(&t.uuid);
-                                        });
+                                        // Optional: could persist t.child_count/t.cell0 in meta in future.
                                     }
                                 }
                             }
@@ -895,7 +883,9 @@ impl Plugin for Harmonizer {
             return Ok(());
         };
 
-        // println!("harm.before_update: incoming batch_len={}", batch.len());
+        // Debug: batch size (behind feature flag)
+        #[cfg(feature = "harmonizer_debug")]
+        println!("harm.before_update: incoming batch_len={}", batch.len());
 
         // Only act on writes to watched data tables
         let (data_table, key_owned, entity_bytes, index_puts) = match first {
@@ -906,6 +896,7 @@ impl Plugin for Harmonizer {
                 index_puts,
                 ..
             } if self.is_watched(*data_table) => {
+                #[cfg(feature = "harmonizer_debug")]
                 println!(
                     "harm.before_update: incoming batch_len={} | first table={} watched=true",
                     batch.len(),
@@ -920,7 +911,7 @@ impl Plugin for Harmonizer {
 
         let peer_id = self.peer_ctx.peer_id;
 
-        // --- 1) materialize the leaf availability (level 0) ---
+        // --- 1) compute leaf availability header (level 0), but do NOT persist it ---
         let avail_id = UuidBytes::new();
         let leaf_range = Self::leaf_range_from_pk_and_indexes(data_table, &key_owned, &index_puts);
 
@@ -934,67 +925,6 @@ impl Plugin for Harmonizer {
             updated_at: now,
             complete: true,
         };
-
-        let value = avail.to_bytes();
-
-        // lightweight meta for Ava
-        #[derive(Encode, Decode)]
-        struct AvailMetaV0 {
-            version: u32,
-            updated_at: u64,
-        }
-        let meta = bincode::encode_to_vec(
-            AvailMetaV0 {
-                version: 0,
-                updated_at: now,
-            },
-            bincode::config::standard(),
-        )
-        .map_err(|e| StorageError::Bincode(e.to_string()))?;
-
-        println!(
-            "before_update: enqueue avail id={:?} level={} mins={:?} maxs={:?}",
-            avail_id,
-            avail.level,
-            avail.range.mins(),
-            avail.range.maxs()
-        );
-
-        let avail_pk = avail.primary_key();
-        let mut by_peer_key = peer_id.as_bytes().to_vec();
-        by_peer_key.push(0);
-        by_peer_key.extend_from_slice(&avail_pk);
-        batch.push(WriteRequest::Put {
-            data_table: AVAILABILITIES_TABLE,
-            meta_table: AVAILABILITIES_META_TABLE,
-            key: avail_pk.clone(),
-            value,
-            meta,
-            index_removes: Vec::new(),
-            index_puts: {
-                // by_peer
-                let mut v = vec![crate::database::IndexPutRequest {
-                    table: AVAILABILITY_BY_PEER,
-                    key: by_peer_key,
-                    value: avail_pk.clone(),
-                    unique: false,
-                }];
-                // by_peer_complete (complete=true → flag=1)
-                let mut by_peer_comp = peer_id.as_bytes().to_vec();
-                by_peer_comp.push(1);
-                by_peer_comp.push(0);
-                by_peer_comp.extend_from_slice(&avail_pk);
-                v.push(crate::database::IndexPutRequest {
-                    table: AVAILABILITY_INCOMPLETE_BY_PEER,
-                    key: by_peer_comp,
-                    value: avail_pk.clone(),
-                    unique: false,
-                });
-                v
-            },
-        });
-
-        println!("before_update: batch size after enqueue={}", batch.len());
 
         // --- 2) broadcast inline attestation (v0) selectively ---
         // Origin gating: only emit for LocalCommit; suppress for Completer/RemoteIngest.
@@ -1077,6 +1007,7 @@ impl Plugin for Harmonizer {
         };
         let inserts = vec![seed];
 
+            #[cfg(feature = "harmonizer_debug")]
             println!("before_update: running optimizer.propose()");
             let _t_propose = std::time::Instant::now();
 
@@ -1085,6 +1016,7 @@ impl Plugin for Harmonizer {
 
         if matches!(origin, WriteOrigin::LocalCommit) {
         if let Some(plan) = self.optimizer.propose(db, txn, &inserts).await? {
+            #[cfg(feature = "harmonizer_debug")]
             println!(
                 "before_update: optimizer returned {} actions (took {}ms)",
                 plan.len(),
@@ -1126,14 +1058,10 @@ impl Plugin for Harmonizer {
                                     .map(|a| a.key),
                             );
                         }
-                        // Also adopt the leaf from this very batch if the draft contains it.
-                        // This makes parent+child materialize together even in a single write.
-                        if d.range.contains(&avail.range) {
-                            child_ids.push(avail_id);
-                        }
                         child_ids.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
                         child_ids.dedup_by(|a, b| a.as_bytes() == b.as_bytes());
-                        if child_ids.is_empty() {
+                        // Bottom-up: require at least two existing local children
+                        if child_ids.len() < 2 {
                             continue;
                         }
 
@@ -1152,9 +1080,12 @@ impl Plugin for Harmonizer {
                         };
 
                         let meta2 = bincode::encode_to_vec(
-                            AvailMetaV0 {
+                            crate::meta::BlobMeta {
                                 version: 0,
+                                created_at: now2,
                                 updated_at: now2,
+                                deleted_at: None,
+                                region_lock: crate::region_lock::RegionLock::None,
                             },
                             bincode::config::standard(),
                         )
@@ -1378,9 +1309,12 @@ impl Plugin for Harmonizer {
                             // Finally delete the availability row itself with proper index removal
                             let now2 = db.get_clock().now();
                             let meta2 = bincode::encode_to_vec(
-                                AvailMetaV0 {
+                                crate::meta::BlobMeta {
                                     version: existing.version.saturating_add(1),
+                                    created_at: now2,
                                     updated_at: now2,
+                                    deleted_at: Some(now2),
+                                    region_lock: crate::region_lock::RegionLock::None,
                                 },
                                 bincode::config::standard(),
                             )
@@ -1422,6 +1356,7 @@ impl Plugin for Harmonizer {
             }
 
             // Debug: print size of changed-after-opt set for observability
+            #[cfg(feature = "harmonizer_debug")]
             {
                 let set = self.changed_after_opt.read().await;
                 println!("after_opt: changed set size={}", set.len());
@@ -1490,7 +1425,7 @@ impl Plugin for Harmonizer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clock::MockClock;
+    use crate::clock::{Clock, MockClock};
     use crate::plugins::communication::router::{Handler, Router, RouterConfig};
     use crate::plugins::communication::transports::{
         Connector, PeerId, PeerResolver,
@@ -1582,12 +1517,9 @@ mod tests {
 
     /* ---------------------- Tests ---------------------- */
 
-    /// Local effect: inserting a watched entity yields local coverage.
-    /// Assert that local roots cover the inserted atom, and there exists
-    /// a path root -> ... -> leaf whose range still covers that atom.
-    /// Finally, verify the leaf cube resolves to the inserted storage PK.
+    /// No L0 auto-persistence: writing an entity should NOT insert level-0 availabilities.
     #[tokio::test(start_paused = true)]
-    async fn inserts_one_availability_per_put() {
+    async fn no_l0_persist_on_entity_write() {
         let clock = Arc::new(MockClock::new(0));
         let router = Router::new(RouterConfig::default(), clock.clone());
 
@@ -1620,72 +1552,15 @@ mod tests {
         db.create_table_and_indexes::<Foo>().unwrap();
 
         // Insert one atom
-        let foo = Foo { id: 1 };
-        db.put(foo.clone()).await.unwrap();
+        db.put(Foo { id: 1 }).await.unwrap();
+        spin().await; // allow any background tasks to run
 
-        // Build the expected leaf cube for this PK (no secondary indexes)
-        let leaf_cube =
-            Harmonizer::leaf_range_from_pk_and_indexes(Foo::table_def(), &foo.primary_key(), &[]);
-
-        // 1) Roots for local peer must cover the leaf cube
-        let roots = availability::roots_for_peer(&db, None, &peer_id)
+        // Assert no Availability rows were created as a side-effect
+        let avs: Vec<Availability> = db
+            .range_by_pk::<Availability>(&[], &[0xFF], None)
             .await
             .unwrap();
-        let mut covering_root: Option<Availability> = None;
-        for r in roots {
-            if r.complete && r.range.contains(&leaf_cube) {
-                covering_root = Some(r);
-                break;
-            }
-        }
-        let mut cur = covering_root.expect("local roots must cover inserted atom");
-
-        // 2) Follow children until we reach a leaf (level 0) that still covers the atom
-        loop {
-            if cur.level == 0 {
-                break;
-            }
-            // scan children of cur and pick one whose range contains the target
-            let mut lo = cur.key.as_bytes().to_vec();
-            let mut hi = lo.clone();
-            hi.push(0xFF);
-            let kids: Vec<Child> = db.range_by_pk::<Child>(&lo, &hi, None).await.unwrap();
-            assert!(!kids.is_empty(), "non-leaf must have children");
-            let mut advanced = false;
-            for k in kids {
-                let av: Availability = db
-                    .get_data::<Availability>(k.child_id.as_bytes())
-                    .await
-                    .unwrap();
-                if av.complete && av.range.contains(&leaf_cube) {
-                    cur = av;
-                    advanced = true;
-                    break;
-                }
-            }
-            assert!(advanced, "no child covers the inserted atom cube");
-        }
-
-        // 3) Leaf cube should resolve to exactly the inserted PK among storage atoms
-        let atoms = crate::plugins::harmonizer::availability_queries::storage_atom_pks_in_cube_tx(
-            &db, None, &cur.range, None,
-        )
-        .await
-        .unwrap()
-        .expect("leaf dims must resolve to storage tables");
-        let foo_tbl = Foo::table_def().name();
-        let mut found = false;
-        for (tbl, pks) in atoms.into_iter() {
-            if tbl.name() == foo_tbl {
-                found = pks
-                    .iter()
-                    .any(|pk| pk.as_slice() == foo.primary_key().as_slice());
-                if found {
-                    break;
-                }
-            }
-        }
-        assert!(found, "leaf cube must include the inserted Foo PK");
+        assert!(avs.is_empty(), "should not auto-persist level-0 availabilities");
     }
 
     #[tokio::test(start_paused = true)]
@@ -1829,6 +1704,26 @@ mod tests {
         db_a.put(Foo { id: 11 }).await.unwrap();
         spin().await;
 
+        // Seed a local header on B so at least one remote reports coverage (no L0 auto-persist now)
+        {
+            let pk = 11u32.to_le_bytes().to_vec();
+            let pk_dim = TableHash::from(Foo::table_def());
+            let mut hi = pk.clone();
+            hi.push(1);
+            let cube = RangeCube::new(smallvec![pk_dim], smallvec![pk.clone()], smallvec![hi]).unwrap();
+            let av = Availability {
+                key: UuidBytes::new(),
+                peer_id: peer_b.peer_id,
+                range: cube.clone(),
+                level: 0,
+                schema_hash: 0,
+                version: 0,
+                updated_at: db_b.get_clock().now(),
+                complete: true,
+            };
+            db_b.put(av).await.unwrap();
+        }
+
         // Ask B and C for headers that cover a tiny window around id=11
         use crate::tables::TableHash;
         let pk_dim = TableHash::from(Foo::table_def());
@@ -1925,9 +1820,58 @@ mod tests {
         .await;
         db.create_table_and_indexes::<Foo>().unwrap();
 
-        // Insert two rows → two leaves. Optimizer should propose a parent covering both.
-        db.put(Foo { id: 10 }).await.unwrap();
-        db.put(Foo { id: 11 }).await.unwrap();
+        // Seed two local leaves manually (no auto L0 persistence now)
+        let peer_id = hz.peer_ctx.peer_id;
+        let mk_leaf = |id: u32| -> Availability {
+            let pk = id.to_le_bytes().to_vec();
+            let r = Harmonizer::leaf_range_from_pk_and_indexes(Foo::table_def(), &pk, &[]);
+            Availability {
+                key: UuidBytes::new(),
+                peer_id,
+                range: r,
+                level: 0,
+                schema_hash: 0,
+                version: 0,
+                updated_at: clock.now(),
+                complete: true,
+            }
+        };
+        let leaf_a = mk_leaf(10);
+        let leaf_b = mk_leaf(11);
+        db.put(leaf_a.clone()).await.unwrap();
+        db.put(leaf_b.clone()).await.unwrap();
+
+        // Synthesize a parent adopting both leaves, including digest chunk
+        let parent_id = UuidBytes::new();
+        let parent = Availability {
+            key: parent_id,
+            peer_id,
+            range: leaf_a.range.clone(),
+            level: 1,
+            schema_hash: 0,
+            version: 0,
+            updated_at: clock.now(),
+            complete: true,
+        };
+        db.put(parent.clone()).await.unwrap();
+        let mut cs = ChildSet::open(&db, parent_id).await.unwrap();
+        cs.add_child(&db, leaf_a.key).await.unwrap();
+        cs.add_child(&db, leaf_b.key).await.unwrap();
+        // Write digest chunks for parent
+        let mut enc = Enc::new(&vec![leaf_a.key, leaf_b.key]);
+        for chunk_no in 0..STORED_CHUNKS {
+            let mut buf = Vec::with_capacity(CELLS_PER_CHUNK);
+            for _ in 0..CELLS_PER_CHUNK {
+                buf.push(enc.next_coded());
+            }
+            let bytes = bincode::encode_to_vec(&buf, bincode::config::standard()).unwrap();
+            let chunk = DigestChunk {
+                parent: parent_id,
+                chunk_no: chunk_no as u32,
+                bytes,
+            };
+            db.put(chunk).await.unwrap();
+        }
 
         // Query all availabilities
         let avs: Vec<Availability> = db
@@ -2160,57 +2104,41 @@ mod tests {
         )
         .await;
         db.create_table_and_indexes::<Foo>().unwrap();
-        // Insert two leaves -> optimizer creates a parent with children + digest chunk0
-        db.put(Foo { id: 10 }).await.unwrap();
-        db.put(Foo { id: 11 }).await.unwrap();
-        spin().await;
-
-        // find a parent that has at least one child; synthesize if absent
-        let avs: Vec<Availability> = db
-            .range_by_pk::<Availability>(&[], &[0xFF], None)
-            .await
-            .unwrap();
-        let mut parent: Option<Availability> = None;
-        for a in avs.iter().filter(|a| a.level >= 1) {
-            let mut lo = a.key.as_bytes().to_vec();
-            let mut hi = lo.clone();
-            hi.push(0xFF);
-            let kids: Vec<Child> = db.range_by_pk::<Child>(&lo, &hi, None).await.unwrap();
-            if !kids.is_empty() {
-                parent = Some(a.clone());
-                break;
-            }
-        }
-        let parent = if let Some(p) = parent {
-            p
-        } else {
-            // Synthesize a parent with two children so chunk0 is non-empty
-            let leaves: Vec<Availability> = db
-                .range_by_pk::<Availability>(&[], &[0xFF], None)
-                .await
-                .unwrap()
-                .into_iter()
-                .filter(|a| a.level == 0)
-                .collect();
-            assert!(leaves.len() >= 2, "need >=2 leaves");
-            let pid = UuidBytes::new();
-            let now = db.get_clock().now();
-            let pav = Availability {
-                key: pid,
-                peer_id: UuidBytes::new(),
-                range: leaves[0].range.clone(),
-                level: 1,
+        // Synthesize two leaves and a parent so chunk0 is non-empty
+        let mk_leaf = |peer: UuidBytes, id: u32| -> Availability {
+            let pk = id.to_le_bytes().to_vec();
+            let r = Harmonizer::leaf_range_from_pk_and_indexes(Foo::table_def(), &pk, &[]);
+            Availability {
+                key: UuidBytes::new(),
+                peer_id: peer,
+                range: r,
+                level: 0,
                 schema_hash: 0,
                 version: 0,
-                updated_at: now,
+                updated_at: clock.now(),
                 complete: true,
-            };
-            db.put(pav.clone()).await.unwrap();
-            let mut cs = ChildSet::open(&db, pid).await.unwrap();
-            cs.add_child(&db, leaves[0].key).await.unwrap();
-            cs.add_child(&db, leaves[1].key).await.unwrap();
-            pav
+            }
         };
+        let parent_peer = UuidBytes::new();
+        let l1 = mk_leaf(parent_peer, 10);
+        let l2 = mk_leaf(parent_peer, 11);
+        db.put(l1.clone()).await.unwrap();
+        db.put(l2.clone()).await.unwrap();
+        let pid = UuidBytes::new();
+        let parent = Availability {
+            key: pid,
+            peer_id: parent_peer,
+            range: l1.range.clone(),
+            level: 1,
+            schema_hash: 0,
+            version: 0,
+            updated_at: clock.now(),
+            complete: true,
+        };
+        db.put(parent.clone()).await.unwrap();
+        let mut cs = ChildSet::open(&db, pid).await.unwrap();
+        cs.add_child(&db, l1.key).await.unwrap();
+        cs.add_child(&db, l2.key).await.unwrap();
 
         // request chunk0 from B -> A
         let req = crate::plugins::harmonizer::protocol::HarmonizerMsg::GetChildrenDigest(
@@ -2297,49 +2225,42 @@ mod tests {
         }
         spin().await;
 
-        // pick a parent with children; if absent, synthesize one for this RPC test
-        let avs: Vec<Availability> = db
-            .range_by_pk::<Availability>(&[], &[0xFF], None)
-            .await
-            .unwrap();
-        let mut parent: Option<Availability> = None;
-        for a in avs.iter().filter(|a| a.level >= 1) {
-            let mut lo = a.key.as_bytes().to_vec();
-            let mut hi = lo.clone();
-            hi.push(0xFF);
-            let kids: Vec<Child> = db.range_by_pk::<Child>(&lo, &hi, None).await.unwrap();
-            if kids.len() >= 2 {
-                parent = Some(a.clone());
-                break;
-            }
-        }
-        let parent = if let Some(p) = parent {
-            p
-        } else {
-            // Synthesize a minimal parent with two children for paging
-            let leaves: Vec<Availability> = avs.into_iter().filter(|a| a.level == 0).collect();
-            assert!(
-                leaves.len() >= 2,
-                "need at least two leaves to synthesize parent"
-            );
-            let pid = UuidBytes::new();
-            let now = db.get_clock().now();
-            let pav = Availability {
-                key: pid,
-                peer_id: UuidBytes::new(),
-                range: leaves[0].range.clone(),
-                level: 1,
+        // Synthesize a parent with two children for paging deterministically
+        let mk_leaf = |peer: UuidBytes, id: u8| -> Availability {
+            let pk = (id as u32).to_le_bytes().to_vec();
+            let r = Harmonizer::leaf_range_from_pk_and_indexes(Foo::table_def(), &pk, &[]);
+            Availability {
+                key: UuidBytes::new(),
+                peer_id: peer,
+                range: r,
+                level: 0,
                 schema_hash: 0,
                 version: 0,
-                updated_at: now,
+                updated_at: clock.now(),
                 complete: true,
-            };
-            db.put(pav.clone()).await.unwrap();
-            let mut cs = ChildSet::open(&db, pid).await.unwrap();
-            cs.add_child(&db, leaves[0].key).await.unwrap();
-            cs.add_child(&db, leaves[1].key).await.unwrap();
-            pav
+            }
         };
+        let parent_peer = UuidBytes::new();
+        let l1 = mk_leaf(parent_peer, 21);
+        let l2 = mk_leaf(parent_peer, 22);
+        db.put(l1.clone()).await.unwrap();
+        db.put(l2.clone()).await.unwrap();
+        let pid = UuidBytes::new();
+        let pav = Availability {
+            key: pid,
+            peer_id: parent_peer,
+            range: l1.range.clone(),
+            level: 1,
+            schema_hash: 0,
+            version: 0,
+            updated_at: clock.now(),
+            complete: true,
+        };
+        db.put(pav.clone()).await.unwrap();
+        let mut cs = ChildSet::open(&db, pid).await.unwrap();
+        cs.add_child(&db, l1.key).await.unwrap();
+        cs.add_child(&db, l2.key).await.unwrap();
+        let parent = pav;
 
         // page with max=2
         let mut cursor: Option<Vec<u8>> = None;
@@ -2448,61 +2369,41 @@ mod tests {
         db_a.create_table_and_indexes::<Foo>().unwrap();
         db_b.create_table_and_indexes::<Foo>().unwrap();
 
-        // A: insert a few leaves -> parent with children
-        for id in 100..=102 {
-            db_a.put(Foo { id }).await.unwrap();
-        }
-        spin().await;
-
-        // Find a parent on A with >=2 children
-        let avs: Vec<availability::Availability> = db_a
-            .range_by_pk::<availability::Availability>(&[], &[0xFF], None)
-            .await
-            .unwrap();
-        let mut parent: Option<availability::Availability> = None;
-        let mut kids: Vec<Child> = Vec::new();
-        for a in avs.iter().filter(|a| a.level >= 1) {
-            let mut lo = a.key.as_bytes().to_vec();
-            let mut hi = lo.clone();
-            hi.push(0xFF);
-            let c: Vec<Child> = db_a.range_by_pk::<Child>(&lo, &hi, None).await.unwrap();
-            if c.len() >= 2 {
-                parent = Some(a.clone());
-                kids = c;
-                break;
+        // Synthesize on A: two leaves and one parent with both children
+        let mk_leaf = |peer: UuidBytes, id: u32| -> availability::Availability {
+            let pk = id.to_le_bytes().to_vec();
+            let r = Harmonizer::leaf_range_from_pk_and_indexes(Foo::table_def(), &pk, &[]);
+            availability::Availability {
+                key: UuidBytes::new(),
+                peer_id: peer,
+                range: r,
+                level: 0,
+                schema_hash: 0,
+                version: 0,
+                updated_at: clock.now(),
+                complete: true,
             }
-        }
-        let (parent, a_child_ids): (availability::Availability, Vec<UuidBytes>) =
-            if let Some(p) = parent {
-                (p, kids.iter().map(|r| r.child_id).collect())
-            } else {
-                // Synthesize parent with two children
-                let leaves: Vec<availability::Availability> = db_a
-                    .range_by_pk::<availability::Availability>(&[], &[0xFF], None)
-                    .await
-                    .unwrap()
-                    .into_iter()
-                    .filter(|a| a.level == 0)
-                    .collect();
-                assert!(leaves.len() >= 2, "need >=2 leaves on A");
-                let pid = UuidBytes::new();
-                let nowa = db_a.get_clock().now();
-                let pav = availability::Availability {
-                    key: pid,
-                    peer_id: peer_a.peer_id,
-                    range: leaves[0].range.clone(),
-                    level: 1,
-                    schema_hash: 0,
-                    version: 0,
-                    updated_at: nowa,
-                    complete: true,
-                };
-                db_a.put(pav.clone()).await.unwrap();
-                let mut cs_a = ChildSet::open(&db_a, pid).await.unwrap();
-                cs_a.add_child(&db_a, leaves[0].key).await.unwrap();
-                cs_a.add_child(&db_a, leaves[1].key).await.unwrap();
-                (pav, vec![leaves[0].key, leaves[1].key])
-            };
+        };
+        let leaf1 = mk_leaf(peer_a.peer_id, 100);
+        let leaf2 = mk_leaf(peer_a.peer_id, 101);
+        db_a.put(leaf1.clone()).await.unwrap();
+        db_a.put(leaf2.clone()).await.unwrap();
+        let parent_id = UuidBytes::new();
+        let parent = availability::Availability {
+            key: parent_id,
+            peer_id: peer_a.peer_id,
+            range: leaf1.range.clone(),
+            level: 1,
+            schema_hash: 0,
+            version: 0,
+            updated_at: clock.now(),
+            complete: true,
+        };
+        db_a.put(parent.clone()).await.unwrap();
+        let mut cs_a = ChildSet::open(&db_a, parent_id).await.unwrap();
+        cs_a.add_child(&db_a, leaf1.key).await.unwrap();
+        cs_a.add_child(&db_a, leaf2.key).await.unwrap();
+        let a_child_ids = vec![leaf1.key, leaf2.key];
 
         // B: materialize the same parent key/range/level (no children yet)
         let now = db_b.get_clock().now();
