@@ -2,6 +2,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use tempfile::tempdir;
+use std::path::{Path, PathBuf};
+use std::fs;
 
 use crate::{
     KuramotoDb,
@@ -34,6 +36,8 @@ pub struct SyncTester {
     clock: Arc<MockClock>,
     peers: Vec<Node>,
     watched: HashSet<&'static str>,
+    record_replay: bool,
+    export_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -52,6 +56,15 @@ const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
 impl SyncTester {
     pub async fn new(peers: &[UuidBytes], watched_tables: &[&'static str], params: ServerScorerParams) -> Self {
+        Self::new_with_options(peers, watched_tables, params, SyncTesterOptions::default()).await
+    }
+
+    pub async fn new_with_options(
+        peers: &[UuidBytes],
+        watched_tables: &[&'static str],
+        params: ServerScorerParams,
+        opts: SyncTesterOptions,
+    ) -> Self {
         let clock = Arc::new(MockClock::new(0));
         let mut nodes = Vec::with_capacity(peers.len());
         let watched: HashSet<&'static str> = watched_tables.iter().copied().collect();
@@ -68,13 +81,18 @@ impl SyncTester {
             );
 
             let dir = tempdir().unwrap();
+            let mut plugins: Vec<Arc<dyn crate::plugins::Plugin>> = vec![hz.clone()];
+            if opts.record_replay {
+                plugins.push(Arc::new(crate::plugins::replay::ReplayPlugin::new()));
+            }
+
             let db = KuramotoDb::new(
                 dir.path()
                     .join(format!("peer_{}.redb", pid))
                     .to_str()
                     .unwrap(),
                 clock.clone(),
-                vec![hz.clone()],
+                plugins,
             )
             .await;
 
@@ -111,6 +129,8 @@ impl SyncTester {
             clock,
             peers: nodes,
             watched,
+            record_replay: opts.record_replay,
+            export_dir: opts.export_dir,
         }
     }
 
@@ -216,6 +236,38 @@ impl SyncTester {
             per_peer,
         }
     }
+
+    /// Export replay logs for each peer (if recording enabled) into `out_dir`.
+    pub async fn export_replay_files<P: AsRef<Path>>(&self, out_dir: P) -> std::io::Result<()> {
+        if !self.record_replay {
+            return Ok(());
+        }
+        let dir = out_dir.as_ref();
+        fs::create_dir_all(dir)?;
+        for n in &self.peers {
+            let events: Vec<crate::plugins::replay::ReplayEvent> = n
+                .db
+                .range_by_pk::<crate::plugins::replay::ReplayEvent>(&0u64.to_be_bytes(), &u64::MAX.to_be_bytes(), None)
+                .await
+                .unwrap_or_default();
+
+            // Serialize all events to a single file per DB
+            let bytes = bincode::encode_to_vec(&events, bincode::config::standard())
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+
+            let uuid: uuid::Uuid = n.peer_id.into();
+            let fname = format!("replay_{}.bin", uuid.as_hyphenated());
+            let path = dir.join(fname);
+            fs::write(path, bytes)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SyncTesterOptions {
+    pub record_replay: bool,
+    pub export_dir: Option<PathBuf>,
 }
 
 #[cfg(test)]

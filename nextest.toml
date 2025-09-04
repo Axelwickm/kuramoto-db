@@ -1,0 +1,16 @@
+[profile.default]
+# Fail any individual test that runs longer than this duration.
+test-timeout = "10s"
+
+# Optional: fail fast per-test, no retries.
+retries = 0
+
+# Optional: surface status as soon as tests finish.
+status-level = "pass"
+
+# You can define other profiles (e.g., ci) and override timeouts if needed.
+[profile.ci]
+inherits = "default"
+test-timeout = "15s"
+retries = 0
+status-level = "fail"

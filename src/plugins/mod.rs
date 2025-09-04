@@ -4,9 +4,23 @@ use async_trait::async_trait;
 use redb::ReadTransaction;
 
 pub mod communication;
+
+// Harmonizer is optional; gate entire module behind feature.
+#[cfg(feature = "harmonizer")]
 pub mod harmonizer;
 
+// Web admin plugin (optional)
+#[cfg(feature = "web_admin")]
+pub mod web_admin;
+
+// Replay plugin: persists write batches for later inspection/replay.
+pub mod replay;
+
+// Self-identity plugin: manages local persistent peer id (unsyncable)
+pub mod self_identity;
+
 use crate::{KuramotoDb, WriteBatch, storage_error::StorageError, WriteOrigin};
+use crate::database::WriteRequest;
 
 // Just to hash the name into something nice and stable.
 pub const fn fnv1a_16(s: &str) -> u16 {
@@ -42,6 +56,18 @@ pub trait Plugin: Send + Sync + 'static {
     ) -> Result<(), StorageError> {
         let _ = origin; // default impl ignores origin
         self.before_update(db, txn, batch).await
+    }
+
+    /// Called after a write batch has been committed successfully.
+    /// Implementations should be lightweight; if they enqueue new writes,
+    /// they should avoid synchronous deadlocks with the write loop.
+    async fn after_write(
+        &self,
+        _db: &KuramotoDb,
+        _applied: &Vec<WriteRequest>,
+        _origin: WriteOrigin,
+    ) -> Result<(), StorageError> {
+        Ok(())
     }
 }
 
@@ -166,5 +192,54 @@ mod tests {
 
         // Hook must have run exactly once
         assert_eq!(counter.load(Ordering::Relaxed), 1);
+    }
+
+    /* ───── Test after_write hook ───── */
+    struct AfterWriteCounter {
+        count: Arc<AtomicU32>,
+    }
+
+    #[async_trait]
+    impl Plugin for AfterWriteCounter {
+        async fn before_update(
+            &self,
+            _db: &KuramotoDb,
+            _txn: &ReadTransaction,
+            _batch: &mut WriteBatch,
+        ) -> Result<(), StorageError> {
+            Ok(())
+        }
+
+        async fn after_write(
+            &self,
+            _db: &KuramotoDb,
+            applied: &Vec<crate::database::WriteRequest>,
+            _origin: crate::WriteOrigin,
+        ) -> Result<(), StorageError> {
+            // Increment by number of items to ensure we saw the batch
+            self.count.fetch_add(applied.len() as u32, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn attach_db(&self, _db: Arc<KuramotoDb>) {}
+    }
+
+    #[tokio::test]
+    async fn plugin_after_write_runs() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("plugins_after.redb");
+
+        let counter = Arc::new(AtomicU32::new(0));
+        let plugin = Arc::new(AfterWriteCounter { count: counter.clone() });
+
+        let clock = Arc::new(MockClock::new(0));
+        let db = KuramotoDb::new(db_path.to_str().unwrap(), clock, vec![plugin]).await;
+
+        db.create_table_and_indexes::<Foo>().unwrap();
+        db.put(Foo { id: 1 }).await.unwrap();
+
+        // Allow async after_write to run
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(counter.load(Ordering::Relaxed) >= 1);
     }
 }

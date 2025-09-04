@@ -25,15 +25,17 @@ pub type StaticTableDef = &'static TableDefinition<'static, &'static [u8], Vec<u
 
 pub trait PluginMarker: Send + Sync {}
 
+#[derive(Clone)]
 pub struct IndexPutRequest {
     pub table: StaticTableDef,
     pub key: Vec<u8>,   // index key (e.g., email as bytes)
     pub value: Vec<u8>, // usually the main key (e.g., user_id)
     pub unique: bool,
 }
+#[derive(Clone)]
 pub struct IndexRemoveRequest {
-    table: StaticTableDef,
-    key: Vec<u8>,
+    pub table: StaticTableDef,
+    pub key: Vec<u8>,
 }
 
 pub type WriteBatch = Vec<WriteRequest>;
@@ -43,6 +45,8 @@ pub enum WriteOrigin {
     LocalCommit,
     Completer,
     RemoteIngest,
+    /// Writes originated from a plugin (identified by a 16-bit hash of its name)
+    Plugin(u16),
 }
 
 type WriteMsg = (
@@ -51,6 +55,7 @@ type WriteMsg = (
     WriteOrigin,
 );
 
+#[derive(Clone)]
 pub enum WriteRequest {
     Put {
         data_table: StaticTableDef,
@@ -159,7 +164,7 @@ impl KuramotoDb {
         let sys2 = sys.clone();
         tokio::spawn(async move {
             while let Some((batch, reply, origin)) = write_rx.recv().await {
-                let _ = sys2.handle_write(batch, reply, origin).await;
+                let _ = sys2.clone().handle_write(batch, reply, origin).await;
             }
         });
         sys
@@ -288,6 +293,41 @@ impl KuramotoDb {
     // Getters/setters
     pub fn get_clock(&self) -> Arc<dyn Clock> {
         self.clock.clone()
+    }
+
+    /// List registered data and index tables known to this DB instance.
+    /// Returns (data_tables, index_tables).
+    pub fn list_registered_tables(&self) -> (Vec<StaticTableDef>, Vec<StaticTableDef>) {
+        let data: Vec<StaticTableDef> = self
+            .data_table_by_hash
+            .read()
+            .unwrap()
+            .values()
+            .copied()
+            .collect();
+        let index: Vec<StaticTableDef> = self
+            .index_table_by_hash
+            .read()
+            .unwrap()
+            .values()
+            .map(|(idx, _data)| *idx)
+            .collect();
+        (data, index)
+    }
+
+    /// Count rows in a given table definition.
+    pub fn count_rows_in_table(&self, table: StaticTableDef) -> Result<u64, StorageError> {
+        self.with_read(None, |rt| {
+            let t = rt
+                .open_table(table.clone())
+                .map_err(|e| StorageError::Other(e.to_string()))?;
+            let mut cnt: u64 = 0;
+            for r in t.iter().map_err(|e| StorageError::Other(e.to_string()))? {
+                let _ = r.map_err(|e| StorageError::Other(e.to_string()))?;
+                cnt += 1;
+            }
+            Ok(cnt)
+        })
     }
 
     pub fn resolve_data_table_by_hash(&self, h: u64) -> Option<StaticTableDef> {
@@ -1132,7 +1172,7 @@ impl KuramotoDb {
 
     // ----------- Internal handler --------------
     async fn handle_write(
-        &self,
+        self: Arc<Self>,
         mut batch: WriteBatch,
         reply: tokio::sync::oneshot::Sender<Result<(), StorageError>>,
         origin: WriteOrigin,
@@ -1150,9 +1190,12 @@ impl KuramotoDb {
         for plugin in self.plugins.iter() {
             // Prefer origin-aware hook if implemented (default falls back to before_update)
             plugin
-                .before_update_with_origin(self, &rtxn, &mut batch, origin)
+                .before_update_with_origin(&*self, &rtxn, &mut batch, origin)
                 .await?;
         }
+
+        // Keep a snapshot for after-write hooks
+        let applied_snapshot = batch.clone();
 
         // Apply all requests
         for req in batch.into_iter() {
@@ -1289,6 +1332,17 @@ impl KuramotoDb {
         // Commit once
         wtxn.commit()
             .map_err(|e| StorageError::Other(e.to_string()))?;
+
+        // Trigger after-write hooks asynchronously to avoid deadlocks.
+        let db_for_hooks = self.clone();
+        let plugins = self.plugins.clone();
+        tokio::spawn(async move {
+            for plugin in plugins.iter() {
+                if let Err(e) = plugin.after_write(&db_for_hooks, &applied_snapshot, origin).await {
+                    tracing::error!("after_write error: {}", e);
+                }
+            }
+        });
 
         // Reply once for the whole batch
         let _ = reply.send(Ok(()));

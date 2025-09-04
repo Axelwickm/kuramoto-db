@@ -800,13 +800,17 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn three_peers_replicate_k2_spread_many_rows() {
         use crate::plugins::harmonizer::SyncTester;
+        use crate::plugins::harmonizer::sync_tester::SyncTesterOptions;
+        use std::fs;
+        use std::path::Path;
         let peers = vec![UuidBytes::new(), UuidBytes::new(), UuidBytes::new()];
         let params = ServerScorerParams {
             replication_target: 2,
             replication_weight: 5.0,
             ..Default::default()
         };
-        let mut t = SyncTester::new(&peers, &[TestEnt::table_def().name()], params).await;
+        let opts = SyncTesterOptions { record_replay: true, export_dir: Some(std::path::PathBuf::from("exports")) };
+        let mut t = SyncTester::new_with_options(&peers, &[TestEnt::table_def().name()], params, opts.clone()).await;
         for n in t.peers_mut() {
             n.db.create_table_and_indexes::<TestEnt>().unwrap();
         }
@@ -898,5 +902,21 @@ mod tests {
             diff as f32 <= (total as f32 * 0.2),
             "replicas should be roughly balanced across remotes: {a} vs {b}"
         );
+
+        // Export replay logs under ./exports (one file per DB)
+        if let Some(dir) = opts.export_dir {
+            let _ = t.export_replay_files(&dir).await;
+            // Basic assertion: directory exists and contains at least one replay file per peer
+            let entries = fs::read_dir(&dir).unwrap();
+            let mut count = 0usize;
+            for e in entries {
+                let p = e.unwrap().path();
+                if p.is_file() && p.file_name().unwrap().to_string_lossy().starts_with("replay_") {
+                    count += 1;
+                }
+            }
+            assert!(count >= peers.len(), "expected at least {} replay files in {:?}", peers.len(), dir);
+            // Leave exports in place for inspection
+        }
     }
 }
