@@ -24,6 +24,10 @@ pub static AVAILABILITY_BY_PEER: StaticTableDef = &TableDefinition::new("availab
 pub static AVAILABILITY_INCOMPLETE_BY_PEER: StaticTableDef =
     &TableDefinition::new("availability_incomplete_by_peer");
 
+/// Secondary index for range lookups: key = axis_hash_be • min
+pub static AVAILABILITY_BY_RANGE_MIN: StaticTableDef =
+    &TableDefinition::new("availability_by_range_min");
+
 /*──────────────────────── Model ───────────────────────*/
 
 /// V0 Availability: relationships are not embedded; parent/children live in `availability_children`.
@@ -69,6 +73,14 @@ pub static AVAILABILITY_INDEXES: &[IndexSpec<AvailabilityV0>] = &[
         table_def: &AVAILABILITY_INCOMPLETE_BY_PEER,
         cardinality: IndexCardinality::NonUnique,
     },
+    // Multi-entry index: one row per axis (axis_hash_be • min)
+    IndexSpec::<AvailabilityV0> {
+        name: "by_range_axis_min",
+        // Placeholder: real keys are provided via `StorageEntity::index_keys` override.
+        key_fn: |_a| Vec::new(),
+        table_def: &AVAILABILITY_BY_RANGE_MIN,
+        cardinality: IndexCardinality::NonUnique,
+    },
 ];
 
 /*──────────────────────── StorageEntity ───────────────*/
@@ -105,6 +117,24 @@ impl StorageEntity for AvailabilityV0 {
 
     fn indexes() -> &'static [IndexSpec<Self>] {
         AVAILABILITY_INDEXES
+    }
+
+    fn index_keys(&self, idx: &IndexSpec<Self>) -> Vec<Vec<u8>> {
+        // For the range index, emit one key per axis: axis_hash_be • min
+        if std::ptr::eq(idx.table_def, AVAILABILITY_BY_RANGE_MIN) {
+            let mut out = Vec::with_capacity(self.range.len());
+            for (i, dim) in self.range.dims().iter().enumerate() {
+                let mut k = dim.hash.to_be_bytes().to_vec();
+                k.extend_from_slice(&self.range.mins()[i]);
+                out.push(k);
+            }
+            // dedup if any duplicates (shouldn't happen under normal construction)
+            out.sort();
+            out.dedup();
+            return out;
+        }
+        // Default: single key
+        vec![(idx.key_fn)(self)]
     }
 }
 

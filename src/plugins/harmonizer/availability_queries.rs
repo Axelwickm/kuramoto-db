@@ -8,7 +8,7 @@ use crate::tables::TableHash;
 use crate::{
     KuramotoDb, StaticTableDef,
     plugins::harmonizer::{
-        availability::{Availability, roots_for_peer},
+        availability::{Availability, roots_for_peer, AVAILABILITY_BY_RANGE_MIN},
         child_set::{Child, ChildSet, DigestChunk},
         optimizer::{Action, ActionSet, AvailabilityDraft},
         range_cube::RangeCube,
@@ -305,6 +305,50 @@ pub(crate) async fn storage_atom_count_in_cube_tx(
     }
 
     Ok(Some(total))
+}
+
+/// Fast lookup of availabilities fully contained in `cube` using the axis-min index.
+/// Picks the narrowest axis in `cube` and range-scans by `(axis_hash_be • min)`.
+pub async fn availabilities_contained_in_cube_tx(
+    db: &KuramotoDb,
+    txn: Option<&ReadTransaction>,
+    cube: &RangeCube,
+    limit: Option<usize>,
+) -> Result<Vec<Availability>, StorageError> {
+    // Choose the narrowest axis by (len(max) - len(min)) as a cheap heuristic.
+    if cube.dims().is_empty() {
+        // No constraints → nothing is "contained" in a strict sense; return empty.
+        return Ok(Vec::new());
+    }
+    let mut best_i = 0usize;
+    let mut best_span = usize::MAX;
+    for i in 0..cube.dims().len() {
+        let span = cube.maxs()[i].len().saturating_sub(cube.mins()[i].len());
+        if span < best_span {
+            best_span = span;
+            best_i = i;
+        }
+    }
+
+    let axis = cube.dims()[best_i];
+    let mut lo = axis.hash.to_be_bytes().to_vec();
+    lo.extend_from_slice(&cube.mins()[best_i]);
+    let mut hi = axis.hash.to_be_bytes().to_vec();
+    hi.extend_from_slice(&cube.maxs()[best_i]);
+    hi.push(0x01); // half-open upper bound
+
+    // Range-scan candidates via the index and filter by full containment.
+    let candidates: Vec<Availability> = db
+        .range_by_index_tx::<Availability>(txn, AVAILABILITY_BY_RANGE_MIN, &lo, &hi, limit)
+        .await?;
+
+    let mut out = Vec::with_capacity(candidates.len());
+    for a in candidates.into_iter() {
+        if cube.contains(&a.range) {
+            out.push(a);
+        }
+    }
+    Ok(out)
 }
 
 /// Collect storage PKs grouped by parent data table whose rows fall inside `cube`.
@@ -777,6 +821,67 @@ mod tests {
         db.create_table_and_indexes::<Child>().unwrap();
         db.create_table_and_indexes::<DigestChunk>().unwrap();
         db
+    }
+
+    #[tokio::test]
+    async fn contained_lookup_by_narrow_axis() {
+        let db = fresh_db().await;
+        let d1 = TableHash { hash: 10 };
+        let d2 = TableHash { hash: 20 };
+
+        // Peer
+        let p = UuidBytes::new();
+
+        // A: inside small box on both axes
+        let a = Availability {
+            key: UuidBytes::new(),
+            peer_id: p,
+            range: RangeCube::new(
+                smallvec![d1, d2],
+                smallvec![b"b".to_vec(), b"m".to_vec()],
+                smallvec![b"c".to_vec(), b"n".to_vec()],
+            )
+            .unwrap(),
+            level: 0,
+            schema_hash: 0,
+            version: 0,
+            updated_at: 0,
+            complete: true,
+        };
+        db.put(a.clone()).await.unwrap();
+
+        // B: overlaps but NOT contained on d2 (max extends beyond query)
+        let b = Availability {
+            key: UuidBytes::new(),
+            peer_id: p,
+            range: RangeCube::new(
+                smallvec![d1, d2],
+                smallvec![b"b".to_vec(), b"k".to_vec()],
+                smallvec![b"c".to_vec(), b"z\xFF".to_vec()],
+            )
+            .unwrap(),
+            level: 0,
+            schema_hash: 0,
+            version: 0,
+            updated_at: 0,
+            complete: true,
+        };
+        db.put(b.clone()).await.unwrap();
+
+        // Query cube: narrow on d1, wide on d2 → should choose d1
+        let q = RangeCube::new(
+            smallvec![d1, d2],
+            smallvec![b"b".to_vec(), b"a".to_vec()],
+            smallvec![b"c".to_vec(), b"z".to_vec()],
+        )
+        .unwrap();
+
+        let got = availabilities_contained_in_cube_tx(&db, None, &q, None)
+            .await
+            .unwrap();
+        let ids: std::collections::HashSet<_> = got.into_iter().map(|x| x.key).collect();
+        assert!(ids.contains(&a.key));
+        assert!(!ids.contains(&b.key));
     }
 
     // ---------- range_cover core behavior ----------
