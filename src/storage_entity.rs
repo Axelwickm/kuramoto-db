@@ -36,4 +36,14 @@ pub trait StorageEntity: Encode + Decode<()> + Sized + Send + Sync + 'static {
     fn load_and_migrate(data: &[u8]) -> Result<Self, StorageError>;
 
     fn indexes() -> &'static [IndexSpec<Self>];
+
+    /// Return all logical index keys for the given index spec on this entity.
+    ///
+    /// Default behavior produces a single key using `IndexSpec::key_fn`.
+    /// Entities may override to return multiple keys per index spec.
+    /// The database layer will insert/remove each returned key independently,
+    /// enforcing uniqueness per-key when the index is `Unique`.
+    fn index_keys(&self, idx: &IndexSpec<Self>) -> Vec<Vec<u8>> {
+        vec![(idx.key_fn)(self)]
+    }
 }

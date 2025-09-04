@@ -210,23 +210,25 @@ impl KuramotoDb {
 
                         let index_removes: Vec<IndexRemoveRequest> = E::indexes()
                             .iter()
-                            .map(|idx| {
-                                let raw = (idx.key_fn)(&old_entity);
-                                let stored = match idx.cardinality {
-                                    IndexCardinality::Unique => raw,
-                                    IndexCardinality::NonUnique => {
-                                        // replicate encode_nonunique_key()
-                                        let mut out = Vec::with_capacity(raw.len() + 1 + pk.len());
-                                        out.extend_from_slice(&raw);
-                                        out.push(0);
-                                        out.extend_from_slice(pk);
-                                        out
-                                    }
-                                };
-                                IndexRemoveRequest {
-                                    table: idx.table_def,
-                                    key: stored,
-                                }
+                            .flat_map(|idx| {
+                                let mut keys = old_entity.index_keys(idx);
+                                keys.sort();
+                                keys.dedup();
+                                keys.into_iter().map(|raw| {
+                                    let stored = match idx.cardinality {
+                                        IndexCardinality::Unique => raw,
+                                        IndexCardinality::NonUnique => {
+                                            // replicate encode_nonunique_key()
+                                            let mut out =
+                                                Vec::with_capacity(raw.len() + 1 + pk.len());
+                                            out.extend_from_slice(&raw);
+                                            out.push(0);
+                                            out.extend_from_slice(pk);
+                                            out
+                                        }
+                                    };
+                                    IndexRemoveRequest { table: idx.table_def, key: stored }
+                                })
                             })
                             .collect();
 
@@ -957,54 +959,66 @@ impl KuramotoDb {
         };
 
         let (index_puts, index_removes) = if let Some(old) = old_entity {
+            // For updates: diff old vs new key sets per index.
             E::indexes()
                 .iter()
                 .fold((Vec::new(), Vec::new()), |(mut puts, mut removes), idx| {
-                    let old_key = (idx.key_fn)(&old);
-                    let new_key = (idx.key_fn)(&entity);
-
-                    // stored keys depend on cardinality
                     let pk = entity.primary_key();
-                    let old_stored = match idx.cardinality {
-                        IndexCardinality::Unique => old_key.clone(),
-                        IndexCardinality::NonUnique => encode_nonunique_key(&old_key, &pk),
-                    };
-                    let new_stored = match idx.cardinality {
-                        IndexCardinality::Unique => new_key.clone(),
-                        IndexCardinality::NonUnique => encode_nonunique_key(&new_key, &pk),
-                    };
 
-                    if old_key != new_key {
-                        removes.push(IndexRemoveRequest {
-                            table: idx.table_def,
-                            key: old_stored,
-                        });
+                    let mut old_keys = old.index_keys(idx);
+                    let mut new_keys = entity.index_keys(idx);
+                    // Dedup keys to avoid duplicate work
+                    old_keys.sort();
+                    old_keys.dedup();
+                    new_keys.sort();
+                    new_keys.dedup();
+
+                    // Remove old-only keys
+                    for k in old_keys.iter().filter(|k| !new_keys.contains(k)) {
+                        let stored = match idx.cardinality {
+                            IndexCardinality::Unique => k.clone(),
+                            IndexCardinality::NonUnique => encode_nonunique_key(k, &pk),
+                        };
+                        removes.push(IndexRemoveRequest { table: idx.table_def, key: stored });
+                    }
+                    // Insert new-only keys
+                    for k in new_keys.iter().filter(|k| !old_keys.contains(k)) {
+                        let stored = match idx.cardinality {
+                            IndexCardinality::Unique => k.clone(),
+                            IndexCardinality::NonUnique => encode_nonunique_key(k, &pk),
+                        };
                         puts.push(IndexPutRequest {
                             table: idx.table_def,
-                            key: new_stored,
-                            value: pk,
+                            key: stored,
+                            value: pk.clone(),
                             unique: matches!(idx.cardinality, IndexCardinality::Unique),
                         });
                     }
                     (puts, removes)
                 })
         } else {
+            // For inserts: add all keys for each index.
             let pk = entity.primary_key();
             (
                 E::indexes()
                     .iter()
-                    .map(|idx| {
-                        let idx_key = (idx.key_fn)(&entity);
-                        let stored = match idx.cardinality {
-                            IndexCardinality::Unique => idx_key,
-                            IndexCardinality::NonUnique => encode_nonunique_key(&idx_key, &pk),
-                        };
-                        IndexPutRequest {
-                            table: idx.table_def,
-                            key: stored,
-                            value: pk.clone(),
-                            unique: matches!(idx.cardinality, IndexCardinality::Unique),
-                        }
+                    .flat_map(|idx| {
+                        let mut keys = entity.index_keys(idx);
+                        keys.sort();
+                        keys.dedup();
+                        let pk_clone = pk.clone();
+                        keys.into_iter().map(move |idx_key| {
+                            let stored = match idx.cardinality {
+                                IndexCardinality::Unique => idx_key,
+                                IndexCardinality::NonUnique => encode_nonunique_key(&idx_key, &pk_clone),
+                            };
+                            IndexPutRequest {
+                                table: idx.table_def,
+                                key: stored,
+                                value: pk_clone.clone(),
+                                unique: matches!(idx.cardinality, IndexCardinality::Unique),
+                            }
+                        })
                     })
                     .collect(),
                 Vec::new(),
@@ -1056,16 +1070,17 @@ impl KuramotoDb {
         let pk = key.to_vec();
         let index_removes: Vec<IndexRemoveRequest> = E::indexes()
             .iter()
-            .map(|idx| {
-                let raw = (idx.key_fn)(&old_entity);
-                let stored = match idx.cardinality {
-                    IndexCardinality::Unique => raw,
-                    IndexCardinality::NonUnique => encode_nonunique_key(&raw, &pk),
-                };
-                IndexRemoveRequest {
-                    table: idx.table_def,
-                    key: stored,
-                }
+            .flat_map(|idx| {
+                let mut keys = old_entity.index_keys(idx);
+                keys.sort();
+                keys.dedup();
+                keys.into_iter().map(|raw| {
+                    let stored = match idx.cardinality {
+                        IndexCardinality::Unique => raw,
+                        IndexCardinality::NonUnique => encode_nonunique_key(&raw, &pk),
+                    };
+                    IndexRemoveRequest { table: idx.table_def, key: stored }
+                })
             })
             .collect();
 
@@ -1673,6 +1688,146 @@ mod tests {
             .unwrap();
         assert_eq!(rest.len(), 1);
         assert_eq!(rest[0], b);
+    }
+
+    // ============== Multi-key index tests ==============
+    #[derive(Clone, Debug, PartialEq, Encode, Decode)]
+    struct MultiIdxEntity {
+        id: u64,
+        tags: Vec<String>,
+    }
+
+    static MULTI_TBL: TableDefinition<'static, &'static [u8], Vec<u8>> =
+        TableDefinition::new("multi_idx_entity");
+    static MULTI_META: TableDefinition<'static, &'static [u8], Vec<u8>> =
+        TableDefinition::new("multi_idx_entity_meta");
+    static TAG_INDEX: TableDefinition<'static, &'static [u8], Vec<u8>> =
+        TableDefinition::new("multi_by_tag");
+
+    static MULTI_INDEXES: &[IndexSpec<MultiIdxEntity>] = &[IndexSpec::<MultiIdxEntity> {
+        name: "by_tag",
+        // legacy single-key fn is ignored by our override; keep minimal
+        key_fn: |e: &MultiIdxEntity| e.tags.get(0).cloned().unwrap_or_default().into_bytes(),
+        table_def: &TAG_INDEX,
+        cardinality: IndexCardinality::NonUnique,
+    }];
+
+    impl StorageEntity for MultiIdxEntity {
+        const STRUCT_VERSION: u8 = 0;
+
+        fn primary_key(&self) -> Vec<u8> { self.id.to_be_bytes().to_vec() }
+        fn table_def() -> StaticTableDef { &MULTI_TBL }
+        fn meta_table_def() -> StaticTableDef { &MULTI_META }
+        fn load_and_migrate(data: &[u8]) -> Result<Self, StorageError> {
+            bincode::decode_from_slice(data.get(1..).unwrap_or_default(), bincode::config::standard())
+                .map(|(v, _)| v)
+                .map_err(|e| StorageError::Bincode(e.to_string()))
+        }
+        fn indexes() -> &'static [IndexSpec<Self>] { MULTI_INDEXES }
+
+        fn index_keys(&self, idx: &IndexSpec<Self>) -> Vec<Vec<u8>> {
+            // produce one key per tag for the by_tag index
+            let _ = idx; // only one index here
+            let mut out: Vec<Vec<u8>> = self.tags.iter().map(|s| s.as_bytes().to_vec()).collect();
+            out.sort();
+            out.dedup();
+            out
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn multi_key_nonunique_insert_update_delete() {
+        let dir = tempdir().unwrap();
+        let clock = Arc::new(MockClock::new(0));
+        let sys = KuramotoDb::new(
+            dir.path().join("multi_idx.redb").to_str().unwrap(),
+            clock.clone(),
+            vec![],
+        )
+        .await;
+        sys.create_table_and_indexes::<MultiIdxEntity>().unwrap();
+
+        // insert with two tags → two index entries
+        let mut e = MultiIdxEntity { id: 1, tags: vec!["a".into(), "b".into()] };
+        sys.put(e.clone()).await.unwrap();
+        let pks_a = sys.get_index_all(&TAG_INDEX, b"a").await.unwrap();
+        let pks_b = sys.get_index_all(&TAG_INDEX, b"b").await.unwrap();
+        assert_eq!(pks_a, vec![1u64.to_be_bytes().to_vec()]);
+        assert_eq!(pks_b, vec![1u64.to_be_bytes().to_vec()]);
+
+        // update tags: drop 'a', keep 'b', add 'c' → index reflects diff
+        e.tags = vec!["b".into(), "c".into()];
+        clock.advance(1).await;
+        sys.put(e.clone()).await.unwrap();
+        let pks_a2 = sys.get_index_all(&TAG_INDEX, b"a").await.unwrap();
+        let pks_b2 = sys.get_index_all(&TAG_INDEX, b"b").await.unwrap();
+        let pks_c2 = sys.get_index_all(&TAG_INDEX, b"c").await.unwrap();
+        assert!(pks_a2.is_empty());
+        assert_eq!(pks_b2, vec![1u64.to_be_bytes().to_vec()]);
+        assert_eq!(pks_c2, vec![1u64.to_be_bytes().to_vec()]);
+
+        // delete entity → all index rows removed
+        clock.advance(1).await;
+        sys.delete::<MultiIdxEntity>(&1u64.to_be_bytes()).await.unwrap();
+        let pks_b3 = sys.get_index_all(&TAG_INDEX, b"b").await.unwrap();
+        let pks_c3 = sys.get_index_all(&TAG_INDEX, b"c").await.unwrap();
+        assert!(pks_b3.is_empty() && pks_c3.is_empty());
+    }
+
+    #[derive(Clone, Debug, PartialEq, Encode, Decode)]
+    struct MultiUniqueEntity { id: u64, codes: Vec<String> }
+
+    static MU_TBL: TableDefinition<'static, &'static [u8], Vec<u8>> =
+        TableDefinition::new("multi_unique");
+    static MU_META: TableDefinition<'static, &'static [u8], Vec<u8>> =
+        TableDefinition::new("multi_unique_meta");
+    static CODE_INDEX: TableDefinition<'static, &'static [u8], Vec<u8>> =
+        TableDefinition::new("by_code_unique");
+
+    static MU_INDEXES: &[IndexSpec<MultiUniqueEntity>] = &[IndexSpec::<MultiUniqueEntity> {
+        name: "by_code_unique",
+        key_fn: |e: &MultiUniqueEntity| e.codes.get(0).cloned().unwrap_or_default().into_bytes(),
+        table_def: &CODE_INDEX,
+        cardinality: IndexCardinality::Unique,
+    }];
+
+    impl StorageEntity for MultiUniqueEntity {
+        const STRUCT_VERSION: u8 = 0;
+        fn primary_key(&self) -> Vec<u8> { self.id.to_be_bytes().to_vec() }
+        fn table_def() -> StaticTableDef { &MU_TBL }
+        fn meta_table_def() -> StaticTableDef { &MU_META }
+        fn load_and_migrate(data: &[u8]) -> Result<Self, StorageError> {
+            bincode::decode_from_slice(data.get(1..).unwrap_or_default(), bincode::config::standard())
+                .map(|(v, _)| v)
+                .map_err(|e| StorageError::Bincode(e.to_string()))
+        }
+        fn indexes() -> &'static [IndexSpec<Self>] { MU_INDEXES }
+        fn index_keys(&self, _idx: &IndexSpec<Self>) -> Vec<Vec<u8>> {
+            let mut out: Vec<Vec<u8>> = self.codes.iter().map(|s| s.as_bytes().to_vec()).collect();
+            out.sort();
+            out.dedup();
+            out
+        }
+    }
+
+    #[tokio::test]
+    async fn multi_key_unique_enforces_per_key() {
+        let dir = tempdir().unwrap();
+        let clock = Arc::new(MockClock::new(0));
+        let sys = KuramotoDb::new(
+            dir.path().join("multi_unique.redb").to_str().unwrap(),
+            clock.clone(),
+            vec![],
+        )
+        .await;
+        sys.create_table_and_indexes::<MultiUniqueEntity>().unwrap();
+
+        let a = MultiUniqueEntity { id: 1, codes: vec!["x".into(), "y".into()] };
+        sys.put(a).await.unwrap();
+        // Second entity collides on "y"
+        let b = MultiUniqueEntity { id: 2, codes: vec!["y".into()] };
+        let err = sys.put(b).await.err().expect("should reject duplicate key");
+        assert!(matches!(err, StorageError::DuplicateIndexKey { .. }));
     }
 
     // ===== Plugins: order-dependent meta mutation =====
