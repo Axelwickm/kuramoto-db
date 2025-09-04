@@ -1,20 +1,21 @@
 use redb::ReadTransaction;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::time::Instant;
 
+use crate::plugins::harmonizer::optimizer::Action::Delete;
+use crate::plugins::harmonizer::optimizer::Action::Insert;
 use crate::tables::TableHash;
 use crate::{
     KuramotoDb, StaticTableDef,
     plugins::harmonizer::{
         availability::{Availability, roots_for_peer},
         child_set::{Child, ChildSet, DigestChunk},
-        range_cube::RangeCube,
         optimizer::{Action, ActionSet, AvailabilityDraft},
+        range_cube::RangeCube,
     },
     storage_error::StorageError,
     uuid_bytes::UuidBytes,
 };
-use crate::plugins::harmonizer::optimizer::Action::Delete;
-use crate::plugins::harmonizer::optimizer::Action::Insert;
 
 /*──────────────────────── Query cache (snapshot-aware) ─────────────────────*/
 
@@ -182,7 +183,10 @@ async fn resolve_child_avail_cached(
             }
         }
     }
-    match db.get_data_tx::<Availability>(txn, child_id.as_bytes()).await {
+    match db
+        .get_data_tx::<Availability>(txn, child_id.as_bytes())
+        .await
+    {
         Ok(av) => {
             if let Some(ref mut c) = cache.as_deref_mut() {
                 if c.compatible_txn(txn) {
@@ -218,7 +222,11 @@ pub(crate) async fn storage_atom_count_in_cube_tx(
     }
     let mut by_parent: BTreeMap<u64, Group> = BTreeMap::new();
 
-    let n = cube.dims().len().min(cube.mins().len()).min(cube.maxs().len());
+    let n = cube
+        .dims()
+        .len()
+        .min(cube.mins().len())
+        .min(cube.maxs().len());
     for i in 0..n {
         let h = cube.dims()[i].hash;
         let lo = cube.mins()[i].clone();
@@ -315,7 +323,11 @@ pub async fn storage_atom_pks_in_cube_tx(
     }
     let mut by_parent: BTreeMap<u64, Group> = BTreeMap::new();
 
-    let n = cube.dims().len().min(cube.mins().len()).min(cube.maxs().len());
+    let n = cube
+        .dims()
+        .len()
+        .min(cube.mins().len())
+        .min(cube.maxs().len());
     for i in 0..n {
         let h = cube.dims()[i].hash;
         let lo = cube.mins()[i].clone();
@@ -417,15 +429,36 @@ pub async fn child_count(
     if level == 0 {
         // Storage atoms only. Cache by cube geometry per-txn.
         // Level 0: count storage atoms in the cube (direct, no extra memoization here)
-        return Ok(storage_atom_count_in_cube_tx(db, txn, cube).await?.unwrap_or(0));
+        let t0 = Instant::now();
+        let out = storage_atom_count_in_cube_tx(db, txn, cube)
+            .await?
+            .unwrap_or(0);
+        // println!(
+        //     "aq.child_count: level=0 atoms={} took={}ms",
+        //     out,
+        //     t0.elapsed().as_millis()
+        //);
+        return Ok(out);
     }
 
     // Availability frontier counting (local, complete, contained) with overlay
+    let t_roots = Instant::now();
     let roots: Vec<Availability> = roots_for_peer_cached(db, txn, peer, cache).await?;
+    let dt_roots = t_roots.elapsed();
     let root_ids: Vec<UuidBytes> = roots.iter().map(|r| r.key).collect();
 
-    let (frontier, no_overlap) = range_cover(db, txn, cube, &root_ids, None, overlay, cache).await?;
+    let t_cover = Instant::now();
+    let (frontier, no_overlap) =
+        range_cover(db, txn, cube, &root_ids, None, overlay, cache).await?;
+    let dt_cover = t_cover.elapsed();
     if no_overlap {
+        // println!(
+        //     "aq.child_count: level={} roots={} frontier=0 took roots={}ms cover={}ms",
+        //     level,
+        //     root_ids.len(),
+        //     dt_roots.as_millis(),
+        //     dt_cover.as_millis()
+        //);
         return Ok(0);
     }
     let mut seen = HashSet::<UuidBytes>::new();
@@ -435,6 +468,15 @@ pub async fn child_count(
             count += 1;
         }
     }
+    //println!(
+    //     "aq.child_count: level={} roots={} frontier={} out={} took roots={}ms cover={}ms",
+    //     level,
+    //     root_ids.len(),
+    //     frontier.len(),
+    //     count,
+    //     dt_roots.as_millis(),
+    //     dt_cover.as_millis()
+    // );
     Ok(count)
 }
 
@@ -501,7 +543,8 @@ async fn roots_for_peer_cached(
     let roots = roots_for_peer(db, txn, peer).await?;
     if let Some(ref mut c) = cache.as_deref_mut() {
         if c.compatible_txn(txn) {
-            c.roots_by_peer.insert(*peer, roots.iter().map(|r| r.key).collect());
+            c.roots_by_peer
+                .insert(*peer, roots.iter().map(|r| r.key).collect());
             for r in &roots {
                 c.avail_by_id.insert(r.key, r.clone());
             }
@@ -525,9 +568,11 @@ where
     F: Fn(&Availability) -> bool + Sync,
 {
     let mut peers = HashSet::<UuidBytes>::new();
+    let t0 = Instant::now();
     let all: Vec<Availability> = db
         .range_by_pk_tx::<Availability>(txn, &[], &[0xFF], None)
         .await?;
+    let all_len = all.len();
 
     for a in all {
         if !a.complete {
@@ -546,7 +591,14 @@ where
         }
     }
 
-    Ok(peers.len())
+    let out = peers.len();
+    // println!(
+    //     "aq.count_replications: scanned={} peers={} took={}ms",
+    //     all_len,
+    //     out,
+    //     t0.elapsed().as_millis()
+    // );
+    Ok(out)
 }
 
 /// Transaction-aware child count for a single availability (just the embedded list length).
@@ -570,7 +622,11 @@ pub async fn child_count_by_availability(
     if deleted.is_empty() {
         return Ok(cs.count());
     }
-    let c = cs.children.iter().filter(|id| !deleted.contains(id)).count();
+    let c = cs
+        .children
+        .iter()
+        .filter(|id| !deleted.contains(id))
+        .count();
     Ok(c)
 }
 
@@ -595,7 +651,11 @@ pub async fn children_by_availability(
     if deleted.is_empty() {
         return Ok(cs.children.clone());
     }
-    let v: Vec<_> = cs.children.into_iter().filter(|id| !deleted.contains(id)).collect();
+    let v: Vec<_> = cs
+        .children
+        .into_iter()
+        .filter(|id| !deleted.contains(id))
+        .collect();
     Ok(v)
 }
 
@@ -766,9 +826,10 @@ mod tests {
         cs.add_child(&db, leaf_miss.key).await.unwrap();
 
         let target = cube(dim, b"h", b"m");
-        let (nodes, no_overlap) = range_cover(&db, None, &target, &[root.key], None, &vec![], &mut None)
-            .await
-            .unwrap();
+        let (nodes, no_overlap) =
+            range_cover(&db, None, &target, &[root.key], None, &vec![], &mut None)
+                .await
+                .unwrap();
 
         assert!(!no_overlap);
         assert_eq!(nodes.len(), 1);
@@ -810,9 +871,10 @@ mod tests {
         cs.add_child(&db, present.key).await.unwrap();
 
         let target = cube(dim, b"m", b"n");
-        let (nodes, no_overlap) = range_cover(&db, None, &target, &[parent.key], None, &vec![], &mut None)
-            .await
-            .unwrap();
+        let (nodes, no_overlap) =
+            range_cover(&db, None, &target, &[parent.key], None, &vec![], &mut None)
+                .await
+                .unwrap();
 
         assert!(!no_overlap);
         assert_eq!(nodes.len(), 1);
@@ -915,9 +977,10 @@ mod tests {
         let target = cube(dim, b"m", b"n");
 
         // Sanity: without overlay, leaf is returned
-        let (nodes, no_overlap) = range_cover(&db, None, &target, &[root.key], None, &vec![], &mut None)
-            .await
-            .unwrap();
+        let (nodes, no_overlap) =
+            range_cover(&db, None, &target, &[root.key], None, &vec![], &mut None)
+                .await
+                .unwrap();
         assert!(!no_overlap);
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].key, leaf.key);
@@ -925,9 +988,10 @@ mod tests {
         // With overlay delete, node should be masked out
         use crate::plugins::harmonizer::optimizer::Action;
         let overlay = vec![Action::Delete(leaf.key)];
-        let (nodes2, no_overlap2) = range_cover(&db, None, &target, &[root.key], None, &overlay, &mut None)
-            .await
-            .unwrap();
+        let (nodes2, no_overlap2) =
+            range_cover(&db, None, &target, &[root.key], None, &overlay, &mut None)
+                .await
+                .unwrap();
         assert!(!no_overlap2);
         assert!(nodes2.is_empty(), "deleted leaf should be masked");
     }
@@ -997,10 +1061,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(cnt_snap, 0);
-        let cnt_live = child_count_by_availability(&db, None, &id, &vec![], &mut None).await.unwrap();
+        let cnt_live = child_count_by_availability(&db, None, &id, &vec![], &mut None)
+            .await
+            .unwrap();
         assert_eq!(cnt_live, 1);
 
-        let kids_live = children_by_availability(&db, None, &id, &vec![], &mut None).await.unwrap();
+        let kids_live = children_by_availability(&db, None, &id, &vec![], &mut None)
+            .await
+            .unwrap();
         assert_eq!(kids_live.len(), 1);
     }
 
@@ -1077,9 +1145,10 @@ mod tests {
 
         // With the same snapshot + cache, count is still 0
         let mut cache_ref2 = cache_owner.as_mut().map(|c| c as _);
-        let n1 = child_count_by_availability(&db, Some(&txn), &parent.key, &vec![], &mut cache_ref2)
-            .await
-            .unwrap();
+        let n1 =
+            child_count_by_availability(&db, Some(&txn), &parent.key, &vec![], &mut cache_ref2)
+                .await
+                .unwrap();
         assert_eq!(n1, 0);
     }
 
@@ -1120,20 +1189,33 @@ mod tests {
 
         // Build overlay: delete DB leaf and insert a new overlay leaf
         use crate::plugins::harmonizer::optimizer::{Action, AvailabilityDraft};
-        let overlay_leaf = AvailabilityDraft { level: 0, range: cube(dim, b"l", b"o"), complete: true };
+        let overlay_leaf = AvailabilityDraft {
+            level: 0,
+            range: cube(dim, b"l", b"o"),
+            complete: true,
+        };
         let overlay = vec![Action::Delete(leaf_db.key), Action::Insert(overlay_leaf)];
 
         let target = cube(dim, b"m", b"n");
         let mut cache_ref = cache_owner.as_mut().map(|c| c as _);
-        let (_nodes, _no_overlap) = range_cover(&db, Some(&txn), &target, &[root.key], None, &overlay, &mut cache_ref)
-            .await
-            .unwrap();
+        let (_nodes, _no_overlap) = range_cover(
+            &db,
+            Some(&txn),
+            &target,
+            &[root.key],
+            None,
+            &overlay,
+            &mut cache_ref,
+        )
+        .await
+        .unwrap();
 
         // The DB leaf is deleted, but overlay insert intersects the target → helpers see it
         let peer = leaf_db.peer_id;
-        let ok = super::peer_contains_range_local(&db, Some(&txn), &peer, &target, &overlay, &mut None)
-            .await
-            .unwrap();
+        let ok =
+            super::peer_contains_range_local(&db, Some(&txn), &peer, &target, &overlay, &mut None)
+                .await
+                .unwrap();
         assert!(ok);
         // Level-0 child_count still counts storage atoms only → 0 here (overlay only)
         let cnt0 = super::child_count(&db, Some(&txn), &peer, &target, 0, &overlay, &mut None)
@@ -1179,15 +1261,31 @@ mod tests {
         let target = cube(dim, b"c", b"d");
 
         let mut cache_ref = cache_owner.as_mut().map(|c| c as _);
-        let (first, no1) = range_cover(&db, Some(&txn), &target, &[root.key], None, &vec![], &mut cache_ref)
-            .await
-            .unwrap();
+        let (first, no1) = range_cover(
+            &db,
+            Some(&txn),
+            &target,
+            &[root.key],
+            None,
+            &vec![],
+            &mut cache_ref,
+        )
+        .await
+        .unwrap();
         assert!(!no1 && first.len() == 1);
 
         let mut cache_ref2 = cache_owner.as_mut().map(|c| c as _);
-        let (second, no2) = range_cover(&db, Some(&txn), &target, &[root.key], None, &vec![], &mut cache_ref2)
-            .await
-            .unwrap();
+        let (second, no2) = range_cover(
+            &db,
+            Some(&txn),
+            &target,
+            &[root.key],
+            None,
+            &vec![],
+            &mut cache_ref2,
+        )
+        .await
+        .unwrap();
         assert!(!no2 && second.len() == 1);
         assert_eq!(first[0].key, second[0].key);
     }
@@ -1201,7 +1299,11 @@ mod tests {
 
         // No DB rows, but an overlay insert that fully contains target
         use crate::plugins::harmonizer::optimizer::{Action, AvailabilityDraft};
-        let draft = AvailabilityDraft { level: 0, range: cube(dim, b"a", b"z"), complete: true };
+        let draft = AvailabilityDraft {
+            level: 0,
+            range: cube(dim, b"a", b"z"),
+            complete: true,
+        };
         let overlay = vec![Action::Insert(draft)];
 
         let ok = super::peer_contains_range_local(&db, None, &peer, &target, &overlay, &mut None)
@@ -1220,8 +1322,16 @@ mod tests {
         use crate::plugins::harmonizer::optimizer::{Action, AvailabilityDraft};
         // Two overlay inserts inside cube; count should be 2
         let overlay = vec![
-            Action::Insert(AvailabilityDraft { level: 0, range: cube(dim, b"b", b"c"), complete: true }),
-            Action::Insert(AvailabilityDraft { level: 1, range: cube(dim, b"d", b"e"), complete: true }),
+            Action::Insert(AvailabilityDraft {
+                level: 0,
+                range: cube(dim, b"b", b"c"),
+                complete: true,
+            }),
+            Action::Insert(AvailabilityDraft {
+                level: 1,
+                range: cube(dim, b"d", b"e"),
+                complete: true,
+            }),
         ];
 
         let n = super::local_child_count_under_peer(&db, None, &peer, &rng, &overlay, &mut None)
@@ -1337,8 +1447,10 @@ mod tests {
         )
         .await;
         db.create_table_and_indexes::<Availability>().unwrap();
-        db.create_table_and_indexes::<crate::plugins::harmonizer::child_set::Child>().unwrap();
-        db.create_table_and_indexes::<crate::plugins::harmonizer::child_set::DigestChunk>().unwrap();
+        db.create_table_and_indexes::<crate::plugins::harmonizer::child_set::Child>()
+            .unwrap();
+        db.create_table_and_indexes::<crate::plugins::harmonizer::child_set::DigestChunk>()
+            .unwrap();
 
         let dim = TableHash { hash: 42 };
         let peer = UuidBytes::new();

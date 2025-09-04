@@ -19,13 +19,15 @@ use async_trait::async_trait;
 use redb::ReadTransaction;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
 use crate::{
     KuramotoDb,
     plugins::harmonizer::{
         availability::{Availability, AVAILABILITY_BY_PEER},
         availability::roots_for_peer,
-        availability_queries::{range_cover, resolve_child_avail},
+        availability_queries::{range_cover, resolve_child_avail, child_count},
         harmonizer::PeerContext,
         range_cube::RangeCube,
         scorers::Scorer,
@@ -218,9 +220,23 @@ impl Optimizer for BasicOptimizer {
             let g = PlannerGen { caps: self.caps, deletes: dels };
             let eval = PlannerEval::new(db, txn, &self.ctx, &*self.scorer);
 
+            let t_search = Instant::now();
             let Some(path) = search.propose_step(&start, &g, &eval).await else {
+                let (calls, ns) = eval.timing_summary();
+                if calls > 0 { println!("opt.propose_step: scorer_time_ms={} calls={} avg_us={}", ns as f64 / 1e6, calls, (ns / calls as u128) / 1000); }
                 continue;
             };
+            let dt_search = t_search.elapsed().as_millis();
+            let (calls, ns) = eval.timing_summary();
+            if calls > 0 {
+                println!(
+                    "opt.propose_step: took={}ms scorer_time_ms={} calls={} avg_us={}",
+                    dt_search,
+                    ns as f64 / 1e6,
+                    calls,
+                    (ns / calls as u128) / 1000
+                );
+            }
 
             // Build final state's overlay and merge deterministically.
             let mut st = start.clone();
@@ -228,6 +244,7 @@ impl Optimizer for BasicOptimizer {
                 st = st.apply(a);
             }
 
+            // Unconditionally stage the focus insert; adoption is handled by effective_overlay and scoring.
             push_insert(&mut merged, st.focus.clone());
             for a in st.overlay {
                 if let Action::Delete(id) = a {
@@ -346,6 +363,9 @@ struct PlannerEval<'a> {
     // Caches
     roots_ids: Mutex<Option<Vec<UuidBytes>>>,
     frontier_cache: Mutex<HashMap<Vec<u8>, Vec<UuidBytes>>>,
+    // Timing accumulators
+    score_calls: AtomicUsize,
+    score_time_ns: Mutex<u128>,
 }
 impl<'a> PlannerEval<'a> {
     fn new(
@@ -361,7 +381,21 @@ impl<'a> PlannerEval<'a> {
             scorer,
             roots_ids: Mutex::new(None),
             frontier_cache: Mutex::new(HashMap::new()),
+            score_calls: AtomicUsize::new(0),
+            score_time_ns: Mutex::new(0),
         }
+    }
+
+    fn note_score_time(&self, dt: std::time::Duration) {
+        self.score_calls.fetch_add(1, Ordering::Relaxed);
+        let mut acc = self.score_time_ns.lock().unwrap();
+        *acc += dt.as_nanos() as u128;
+    }
+
+    pub fn timing_summary(&self) -> (usize, u128) {
+        let calls = self.score_calls.load(Ordering::Relaxed);
+        let ns = *self.score_time_ns.lock().unwrap();
+        (calls, ns)
     }
 
     fn range_key(r: &RangeCube) -> Vec<u8> {
@@ -460,9 +494,13 @@ impl Evaluator<PlanState> for PlannerEval<'_> {
             Ok(v) => v,
             Err(_) => s.overlay.clone(),
         };
-        self.scorer
+        let t0 = Instant::now();
+        let out = self
+            .scorer
             .score(self.db, self.txn, self.ctx, &s.focus, &overlay)
-            .await
+            .await;
+        self.note_score_time(t0.elapsed());
+        out
     }
 
     fn feasible(&self, s: &PlanState) -> bool {

@@ -3,8 +3,7 @@ use bincode::{Decode, Encode};
 use redb::{ReadTransaction, TableHandle};
 use smallvec::smallvec;
 use std::collections::BTreeMap;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering, AtomicUsize};
 use std::sync::{OnceLock, Weak};
 use std::{collections::HashSet, sync::Arc};
 use tokio::sync::mpsc;
@@ -69,6 +68,10 @@ pub struct Harmonizer {
     in_flight_repairs: Arc<tokio::sync::RwLock<std::collections::HashSet<UuidBytes>>>,
     // Round-robin index for bootstrap fallback selection of a single peer.
     rr_idx: Arc<AtomicUsize>,
+    // Set of availability UUIDs changed after local optimization (for batching/observability).
+    changed_after_opt: Arc<tokio::sync::RwLock<std::collections::HashSet<UuidBytes>>>,
+    // Flush cadence for UpdateHint batching (ticks at 1ms). If 0, disabled.
+    flush_every_ticks: u64,
 }
 
 impl Harmonizer {
@@ -95,12 +98,16 @@ impl Harmonizer {
             suppress_outbox_once: Arc::new(AtomicBool::new(false)),
             in_flight_repairs: Arc::new(tokio::sync::RwLock::new(std::collections::HashSet::new())),
             rr_idx: Arc::new(AtomicUsize::new(0)),
+            changed_after_opt: Arc::new(tokio::sync::RwLock::new(std::collections::HashSet::new())),
+            flush_every_ticks: 8,
         });
 
         hz.start_inbox_worker(inbox_rx);
         hz.start_outbox_worker(outbox_rx);
         // Start the completer loop: only repair incomplete nodes via existing transport
         hz.start_completer(std::time::Duration::from_millis(500), 32);
+        // Start batched UpdateHint flusher (tick-based)
+        hz.start_hint_flusher();
 
         hz
     }
@@ -365,10 +372,18 @@ impl Harmonizer {
                                     };
                                     let mut adopted = false;
                                     if let Ok(txn) = db.begin_read_txn() {
-                                        if let Ok(Some(_plan)) =
-                                            this.optimizer.propose(&db, &txn, &[seed]).await
-                                        {
+                                        let t_adopt = std::time::Instant::now();
+                                        if let Ok(Some(_plan)) = this.optimizer.propose(&db, &txn, &[seed]).await {
                                             adopted = true;
+                                            println!(
+                                                "attest.receive: optimizer proposed adoption ({}ms)",
+                                                t_adopt.elapsed().as_millis()
+                                            );
+                                        } else {
+                                            println!(
+                                                "attest.receive: optimizer did not propose ({}ms)",
+                                                t_adopt.elapsed().as_millis()
+                                            );
                                         }
                                     }
                                     // Ensure the new data gets covered locally only if the optimizer suggests adoption.
@@ -439,6 +454,80 @@ impl Harmonizer {
             while let Some(item) = outbox_rx.recv().await {
                 let OutboxItem::Notify { peer, msg } = item;
                 let _ = router.notify_on(PROTO_HARMONIZER, peer, &msg).await;
+            }
+        });
+    }
+
+    /// Periodically flush `changed_after_opt` as an UpdateHint to peers, batching recent changes.
+    fn start_hint_flusher(self: &Arc<Self>) {
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_millis(1));
+            let mut since = 0u64;
+            loop {
+                ticker.tick().await;
+                if this.flush_every_ticks == 0 { continue; }
+                since += 1;
+                if since < this.flush_every_ticks { continue; }
+                since = 0;
+
+                // Snapshot and clear changed set
+                let uuids: Vec<UuidBytes> = {
+                    let mut guard = this.changed_after_opt.write().await;
+                    if guard.is_empty() { continue; }
+                    let v: Vec<_> = guard.iter().copied().collect();
+                    guard.clear();
+                    v
+                };
+
+                // Build touched list from current DB state
+                let Some(db) = this.db.get().and_then(|w| w.upgrade()) else { continue; };
+                let now = db.get_clock().now();
+                let mut touched: Vec<crate::plugins::harmonizer::protocol::UpdateHintTouched> = Vec::new();
+                let mut hint_range: Option<RangeCube> = None;
+                for id in uuids {
+                    if let Ok(av) = db.get_data::<Availability>(id.as_bytes()).await {
+                        // Count children
+                        let child_count = crate::plugins::harmonizer::child_set::ChildSet::open(&db, av.key)
+                            .await
+                            .map(|cs| cs.count() as u32)
+                            .unwrap_or(0);
+                        touched.push(crate::plugins::harmonizer::protocol::UpdateHintTouched {
+                            uuid: av.key,
+                            level: av.level,
+                            complete: av.complete,
+                            child_count,
+                            cell0: 0,
+                        });
+                        if hint_range.is_none() { hint_range = Some(av.range.clone()); }
+                    } else {
+                        // Deleted or not found; send a minimal tombstone touch
+                        touched.push(crate::plugins::harmonizer::protocol::UpdateHintTouched {
+                            uuid: id,
+                            level: 0,
+                            complete: false,
+                            child_count: 0,
+                            cell0: 0,
+                        });
+                    }
+                }
+                if touched.is_empty() { continue; }
+
+                let range = hint_range.unwrap_or_else(|| RangeCube::new(smallvec![], smallvec![], smallvec![]).unwrap());
+                let hint = crate::plugins::harmonizer::protocol::UpdateHint {
+                    peer_uuid: this.peer_ctx.peer_id,
+                    range,
+                    epoch: now,
+                    touched,
+                };
+                let msg = HarmonizerMsg::UpdateHint(hint);
+                let peers = { this.peers.read().await.clone() };
+                for &peer in &peers {
+                    let _ = this
+                        .outbox_tx
+                        .send(OutboxItem::Notify { peer, msg: msg.clone() })
+                        .await;
+                }
             }
         });
     }
@@ -806,7 +895,7 @@ impl Plugin for Harmonizer {
             return Ok(());
         };
 
-        println!("harm.before_update: incoming batch_len={}", batch.len());
+        // println!("harm.before_update: incoming batch_len={}", batch.len());
 
         // Only act on writes to watched data tables
         let (data_table, key_owned, entity_bytes, index_puts) = match first {
@@ -818,9 +907,9 @@ impl Plugin for Harmonizer {
                 ..
             } if self.is_watched(*data_table) => {
                 println!(
-                    "before_update: first table={} watched={}",
-                    data_table.name(),
-                    self.is_watched(*data_table)
+                    "harm.before_update: incoming batch_len={} | first table={} watched=true",
+                    batch.len(),
+                    data_table.name()
                 );
                 (*data_table, key.clone(), value.clone(), index_puts)
             }
@@ -988,13 +1077,19 @@ impl Plugin for Harmonizer {
         };
         let inserts = vec![seed];
 
-        println!("before_update: running optimizer.propose()");
+            println!("before_update: running optimizer.propose()");
+            let _t_propose = std::time::Instant::now();
 
         // Collect touched parent nodes for hinting
         let mut touched: Vec<crate::plugins::harmonizer::protocol::UpdateHintTouched> = Vec::new();
 
+        if matches!(origin, WriteOrigin::LocalCommit) {
         if let Some(plan) = self.optimizer.propose(db, txn, &inserts).await? {
-            println!("before_update: optimizer returned {} actions", plan.len());
+            println!(
+                "before_update: optimizer returned {} actions (took {}ms)",
+                plan.len(),
+                _t_propose.elapsed().as_millis()
+            );
 
             for act in plan {
                 match act {
@@ -1136,6 +1231,12 @@ impl Plugin for Harmonizer {
                                 }],
                                 index_removes: Vec::new(),
                             });
+                        }
+
+                        // Track changed availability after optimization
+                        {
+                            let mut set = self.changed_after_opt.write().await;
+                            set.insert(id);
                         }
 
                         // Enqueue digest chunks for the parent (first STORED_CHUNKS)
@@ -1309,10 +1410,23 @@ impl Plugin for Harmonizer {
                                     ),
                                 ],
                             });
+
+                            // Track deletion in changed set
+                            {
+                                let mut set = self.changed_after_opt.write().await;
+                                set.insert(id);
+                            }
                         }
                     }
                 }
             }
+
+            // Debug: print size of changed-after-opt set for observability
+            {
+                let set = self.changed_after_opt.read().await;
+                println!("after_opt: changed set size={}", set.len());
+            }
+        }
         }
 
         // Emit UpdateHint for parents when origin is LocalCommit (and not suppressed)
