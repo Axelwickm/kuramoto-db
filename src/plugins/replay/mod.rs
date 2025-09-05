@@ -2,7 +2,7 @@ use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 
 use async_trait::async_trait;
 use bincode::{Encode, Decode};
-use redb::ReadTransaction;
+use redb::{ReadTransaction, TableHandle};
 
 use crate::{
     KuramotoDb, WriteBatch, WriteOrigin, WriteRequest,
@@ -49,6 +49,22 @@ pub enum LogWriteRequest {
         meta: Vec<u8>,
         index_removes: Vec<LogIndexRemove>,
     },
+    // Periodic database stats snapshot for replay browsing
+    StatsSnapshot {
+        stats: DatabaseStats,
+    },
+    // Mapping of table hash -> human-readable name
+    TableNames {
+        mappings: Vec<(u64, String)>,
+    },
+}
+
+#[derive(Clone, Debug, Encode, Decode)]
+pub struct DatabaseStats {
+    pub data_table_count: usize,
+    pub index_table_count: usize,
+    pub total_rows_data: u64,
+    pub total_rows_index: u64,
 }
 
 #[derive(Clone, Debug, Encode, Decode)]
@@ -129,6 +145,36 @@ impl ReplayPlugin {
             })
             .collect()
     }
+
+    fn compute_db_stats(db: &KuramotoDb) -> DatabaseStats {
+        let (data_tables, index_tables) = db.list_registered_tables();
+        let mut total_rows_data: u64 = 0;
+        let mut total_rows_index: u64 = 0;
+        for t in &data_tables {
+            if let Ok(c) = db.count_rows_in_table(*t) { total_rows_data += c; }
+        }
+        for t in &index_tables {
+            if let Ok(c) = db.count_rows_in_table(*t) { total_rows_index += c; }
+        }
+        DatabaseStats {
+            data_table_count: data_tables.len(),
+            index_table_count: index_tables.len(),
+            total_rows_data,
+            total_rows_index,
+        }
+    }
+
+    fn compute_table_names(db: &KuramotoDb) -> Vec<(u64, String)> {
+        let (data_tables, _index_tables) = db.list_registered_tables();
+        let mut out = Vec::new();
+        for t in &data_tables {
+            let h = crate::tables::TableHash::from(*t).hash();
+            if let Some(def) = db.resolve_data_table_by_hash(h) {
+                out.push((h, def.name().to_string()));
+            }
+        }
+        out
+    }
 }
 
 impl ReplayEvent {
@@ -167,12 +213,24 @@ impl Plugin for ReplayPlugin {
         let id_bytes = crate::plugins::self_identity::SelfIdentity::get_peer_id(db).await?;
         let mut peer_id = [0u8; 16];
         peer_id.copy_from_slice(id_bytes.as_bytes());
+        // Map batch and maybe append periodic snapshots/metadata
+        let mut batch = Self::map_batch_to_log(applied);
+        const SNAPSHOT_EVERY: u64 = 100;
+        if id % SNAPSHOT_EVERY == 0 {
+            let stats = Self::compute_db_stats(db);
+            batch.push(LogWriteRequest::StatsSnapshot { stats });
+            let mappings = Self::compute_table_names(db);
+            if !mappings.is_empty() {
+                batch.push(LogWriteRequest::TableNames { mappings });
+            }
+        }
+
         let event = ReplayEvent {
             id,
             ts: now,
             origin: match origin { WriteOrigin::Plugin(id) => id, WriteOrigin::LocalCommit => 1, WriteOrigin::Completer => 2, WriteOrigin::RemoteIngest => 3 },
             peer_id,
-            batch: Self::map_batch_to_log(applied),
+            batch,
         };
 
         // Persist the event using the write queue, tagging origin as this plugin

@@ -19,7 +19,7 @@ use axum::{
     response::{Html, IntoResponse},
     routing::get,
 };
-use redb::ReadTransaction;
+use redb::{ReadTransaction, TableHandle};
 use tokio::net::TcpListener;
 
 use crate::{KuramotoDb, WriteBatch, WriteOrigin, plugins::Plugin, storage_error::StorageError};
@@ -49,7 +49,13 @@ pub struct WebAdminPlugin {
 
 struct InnerState {
     db: RwLock<Option<Arc<KuramotoDb>>>,
+    // Decoded datasets (e.g., attached/live)
     datasets: RwLock<HashMap<String, Vec<crate::plugins::replay::ReplayEvent>>>,
+    // File-backed datasets: raw bytes + index of per-event start offsets
+    file_bytes: RwLock<HashMap<String, Arc<Vec<u8>>>>,
+    file_index: RwLock<HashMap<String, Vec<usize>>>,
+    // Per-dataset table name mappings (hash -> name)
+    table_names: RwLock<HashMap<String, HashMap<u64, String>>>,
     seq: AtomicU64,
     server_started: RwLock<bool>,
 }
@@ -62,6 +68,9 @@ impl WebAdminPlugin {
             state: Arc::new(InnerState {
                 db: RwLock::new(None),
                 datasets: RwLock::new(HashMap::new()),
+                file_bytes: RwLock::new(HashMap::new()),
+                file_index: RwLock::new(HashMap::new()),
+                table_names: RwLock::new(HashMap::new()),
                 seq: AtomicU64::new(0),
                 server_started: RwLock::new(false),
             }),
@@ -95,6 +104,7 @@ impl Plugin for WebAdminPlugin {
                         .route("/api/health", get(handler_health))
                         .route("/api/mode", get(handler_mode))
                         .route("/api/stats", get(handler_stats))
+                        .route("/api/replay_stats", get(handler_replay_stats))
                         .route("/api/replay", get(handler_replay))
                         .route("/api/replay/files", get(handler_replay_files))
                         .route("/api/replay/load", get(handler_replay_load))
@@ -238,9 +248,10 @@ async fn handler_replay(
     State(state): State<Arc<InnerState>>,
     RawQuery(q): RawQuery,
 ) -> impl IntoResponse {
-    // parse ?source= and ?limit=
+    // parse ?source=, ?limit=, ?offset=
     let mut source = None;
     let mut limit: usize = 1000;
+    let mut offset: usize = 0;
     if let Some(qs) = q {
         for pair in qs.split('&') {
             let mut it = pair.splitn(2, '=');
@@ -251,7 +262,13 @@ async fn handler_replay(
                 if k == "source" {
                     source = Some(v);
                 } else if k == "limit" {
-                    if let Ok(n) = v.parse() { limit = n; }
+                    if let Ok(n) = v.parse() {
+                        limit = n;
+                    }
+                } else if k == "offset" {
+                    if let Ok(n) = v.parse() {
+                        offset = n;
+                    }
                 }
             }
         }
@@ -264,33 +281,115 @@ async fn handler_replay(
         String::new()
     };
     if src.is_empty() {
-        return ([ ("Content-Type", "application/json") ], String::from("[]")).into_response();
+        return ([("Content-Type", "application/json")], String::from("[]")).into_response();
+    }
+    // lazily load from disk if a replay file with this name exists
+    let need_load = {
+        let d = state.datasets.read().unwrap();
+        !d.contains_key(&src)
+    };
+    if need_load && src != "attached" {
+        let path = std::path::Path::new("exports").join(&src);
+        if let Ok(bytes) = std::fs::read(path) {
+            if let Ok((events, _)) = bincode::decode_from_slice::<Vec<crate::plugins::replay::ReplayEvent>, _>(&bytes, bincode::config::standard()) {
+                {
+                    let mut ds = state.datasets.write().unwrap();
+                    ds.insert(src.clone(), events.clone());
+                }
+                // build table name cache
+                let mut m = HashMap::new();
+                for e in events.iter() {
+                    for it in e.batch.iter() {
+                        if let crate::plugins::replay::LogWriteRequest::TableNames { mappings } = it {
+                            for (h, name) in mappings.iter() { m.insert(*h, name.clone()); }
+                        }
+                    }
+                }
+                if !m.is_empty() {
+                    state.table_names.write().unwrap().insert(src.clone(), m);
+                }
+            }
+        }
     }
     let d = state.datasets.read().unwrap();
     let mut events = d.get(&src).cloned().unwrap_or_default();
     let n = events.len();
-    let start = n.saturating_sub(limit);
-    let part = events.split_off(start);
-    // Build simple JSON with summaries only: id,ts,origin,peer_id_hex,items_count
+    let end = n.saturating_sub(offset);
+    let start = end.saturating_sub(limit);
+    let part: Vec<_> = if start < end { events[start..end].to_vec() } else { Vec::new() };
     let mut first = true;
-    let mut body = String::from("[");
+    let mut body = String::new();
+    body.push_str(&format!("{{\"total\":{},\"offset\":{},\"limit\":{},\"events\":[", n, offset, limit));
     for e in part.iter() {
         if !first {
             body.push(',');
         }
         first = false;
         let peer_hex = hex::encode(e.peer_id);
+        // derive simple summary: puts, deletes, tables
+        let mut puts = 0usize;
+        let mut dels = 0usize;
+        let mut tables: Vec<String> = Vec::new();
+        for it in e.batch.iter() {
+            match it {
+                crate::plugins::replay::LogWriteRequest::Put { data_table_hash, .. } => {
+                    puts += 1;
+                    tables.push(table_label(&state, Some(&src), *data_table_hash));
+                }
+                crate::plugins::replay::LogWriteRequest::Delete { data_table_hash, .. } => {
+                    dels += 1;
+                    tables.push(table_label(&state, Some(&src), *data_table_hash));
+                }
+                crate::plugins::replay::LogWriteRequest::StatsSnapshot { .. } => {}
+                crate::plugins::replay::LogWriteRequest::TableNames { .. } => {}
+            }
+        }
+        tables.sort();
+        tables.dedup();
+        let origin_lbl = origin_label(e.origin);
         body.push_str(&format!(
-            "{{\"id\":{},\"ts\":{},\"origin\":{},\"peer_id\":\"{}\",\"items_count\":{}}}",
-            e.id,
-            e.ts,
-            e.origin,
-            peer_hex,
-            e.batch.len()
+            "{{\"id\":{},\"ts\":{},\"origin_code\":{},\"origin\":\"{}\",\"peer_id\":\"{}\",\"puts\":{},\"deletes\":{},\"tables\":[{}]}}",
+            e.id, e.ts, e.origin, origin_lbl, peer_hex, puts, dels,
+            tables.iter().map(|s| format!("\"{}\"", s)).collect::<Vec<_>>().join(",")
         ));
     }
-    body.push(']');
+    body.push_str("]}");
     ([("Content-Type", "application/json")], body).into_response()
+}
+
+fn origin_label(code: u16) -> &'static str {
+    if code == 1 {
+        return "LocalCommit";
+    }
+    if code == 2 {
+        return "Completer";
+    }
+    if code == 3 {
+        return "RemoteIngest";
+    }
+    if code == crate::plugins::fnv1a_16("replay") {
+        return "Plugin:replay";
+    }
+    if code == crate::plugins::fnv1a_16("self_identity") {
+        return "Plugin:self_identity";
+    }
+    "Plugin"
+}
+
+fn table_label(state: &InnerState, dataset: Option<&str>, hash: u64) -> String {
+    if let Some(db) = state.db.read().unwrap().as_ref() {
+        if let Some(def) = db.resolve_data_table_by_hash(hash) {
+            return def.name().to_string();
+        }
+    }
+    if let Some(ds) = dataset {
+        if let Some(map) = state.table_names.read().unwrap().get(ds) {
+            if let Some(name) = map.get(&hash) {
+                return name.clone();
+            }
+        }
+    }
+    format!("0x{:016x}", hash)
 }
 
 async fn handler_mode(State(state): State<Arc<InnerState>>) -> impl IntoResponse {
@@ -301,6 +400,71 @@ async fn handler_mode(State(state): State<Arc<InnerState>>) -> impl IntoResponse
     };
     let s = format!("{{\"mode\":\"{}\"}}", m);
     ([("Content-Type", "application/json")], s)
+}
+
+// Return database stats either from attached DB (if source=attached)
+// or from the latest StatsSnapshot in the given replay dataset.
+async fn handler_replay_stats(
+    State(state): State<Arc<InnerState>>,
+    RawQuery(q): RawQuery,
+) -> impl IntoResponse {
+    let mut source = String::new();
+    if let Some(qs) = q {
+        for pair in qs.split('&') {
+            let mut it = pair.splitn(2, '=');
+            if let (Some(k), Some(v)) = (it.next(), it.next()) {
+                if k == "source" {
+                    source = urlencoding::decode(v).unwrap_or_else(|_| v.into()).into_owned();
+                }
+            }
+        }
+    }
+    if source.is_empty() {
+        return ([("Content-Type", "application/json")], String::from("{}")).into_response();
+    }
+    if source == "attached" {
+        if let Some(db) = state.db.read().unwrap().as_ref() {
+            let (data_tables, index_tables) = db.list_registered_tables();
+            let mut total_rows_data: u64 = 0;
+            let mut total_rows_index: u64 = 0;
+            for t in &data_tables { if let Ok(c) = db.count_rows_in_table(*t) { total_rows_data += c; } }
+            for t in &index_tables { if let Ok(c) = db.count_rows_in_table(*t) { total_rows_index += c; } }
+            let body = format!(
+                "{{\"data_table_count\":{},\"index_table_count\":{},\"total_rows_data\":{},\"total_rows_index\":{}}}",
+                data_tables.len(), index_tables.len(), total_rows_data, total_rows_index
+            );
+            return ([("Content-Type", "application/json")], body).into_response();
+        } else {
+            return ([("Content-Type", "application/json")], String::from("{}")).into_response();
+        }
+    }
+
+    // ensure dataset is loaded
+    let need_load = { let d = state.datasets.read().unwrap(); !d.contains_key(&source) };
+    if need_load {
+        let path = std::path::Path::new("exports").join(&source);
+        if let Ok(bytes) = std::fs::read(path) {
+            if let Ok((events, _)) = bincode::decode_from_slice::<Vec<crate::plugins::replay::ReplayEvent>, _>(&bytes, bincode::config::standard()) {
+                let mut ds = state.datasets.write().unwrap();
+                ds.insert(source.clone(), events);
+            }
+        }
+    }
+    let d = state.datasets.read().unwrap();
+    if let Some(ev) = d.get(&source) {
+        for e in ev.iter().rev() {
+            for it in e.batch.iter().rev() {
+                if let crate::plugins::replay::LogWriteRequest::StatsSnapshot { stats } = it {
+                    let body = format!(
+                        "{{\"data_table_count\":{},\"index_table_count\":{},\"total_rows_data\":{},\"total_rows_index\":{}}}",
+                        stats.data_table_count, stats.index_table_count, stats.total_rows_data, stats.total_rows_index
+                    );
+                    return ([("Content-Type", "application/json")], body).into_response();
+                }
+            }
+        }
+    }
+    ([("Content-Type", "application/json")], String::from("{}")).into_response()
 }
 
 async fn handler_replay_files() -> impl IntoResponse {
@@ -359,8 +523,22 @@ async fn handler_replay_load(
                 bincode::config::standard(),
             ) {
                 Ok((events, _)) => {
-                    let mut ds = state.datasets.write().unwrap();
-                    ds.insert(file.clone(), events);
+                    // update dataset and table name cache
+                    {
+                        let mut ds = state.datasets.write().unwrap();
+                        ds.insert(file.clone(), events.clone());
+                    }
+                    let mut m = HashMap::new();
+                    for e in events.iter() {
+                        for it in e.batch.iter() {
+                            if let crate::plugins::replay::LogWriteRequest::TableNames { mappings } = it {
+                                for (h, name) in mappings.iter() { m.insert(*h, name.clone()); }
+                            }
+                        }
+                    }
+                    if !m.is_empty() {
+                        state.table_names.write().unwrap().insert(file.clone(), m);
+                    }
                     (StatusCode::OK, "loaded").into_response()
                 }
                 Err(e) => (StatusCode::BAD_REQUEST, format!("decode error: {}", e)).into_response(),
@@ -413,6 +591,9 @@ pub async fn run_standalone(
     let state = Arc::new(InnerState {
         db: RwLock::new(None),
         datasets: RwLock::new(HashMap::new()),
+        file_bytes: RwLock::new(HashMap::new()),
+        file_index: RwLock::new(HashMap::new()),
+        table_names: RwLock::new(HashMap::new()),
         seq: AtomicU64::new(0),
         server_started: RwLock::new(true),
     });
@@ -423,6 +604,7 @@ pub async fn run_standalone(
         .route("/api/health", get(handler_health))
         .route("/api/mode", get(handler_mode))
         .route("/api/stats", get(handler_stats))
+        .route("/api/replay_stats", get(handler_replay_stats))
         .route("/api/replay", get(handler_replay))
         .route("/api/replay/files", get(handler_replay_files))
         .route("/api/replay/load", get(handler_replay_load))

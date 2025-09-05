@@ -4,16 +4,19 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>KuramotoDB Admin</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/gridstack@12.3.3/dist/gridstack.min.css" />
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
     <header>
       <h1>KuramotoDB Admin <small id="mode">…</small></h1>
       <div class="actions">
-        <button id="add-card">Add Card</button>
+        <button id="add-card">Add Card ▾</button>
       </div>
     </header>
-    <main id="board" class="board"></main>
+    <main id="board" class="board grid-stack"></main>
+    <script src="https://cdn.jsdelivr.net/npm/gridstack@12.3.3/dist/gridstack-all.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
     <script src="/static/app.js"></script>
   </body>
   </html>
