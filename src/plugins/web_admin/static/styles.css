@@ -34,6 +34,7 @@ select,input[type=text]{ padding:6px; border:1px solid #ccc; border-radius:6px; 
 table.events{ width:100%; border-collapse:collapse; table-layout:auto }
 table.events th, table.events td{ border-bottom:1px solid #eee; padding:6px 8px; text-align:left; vertical-align:top }
 table.events thead th{ position:sticky; top:0; background:#f9f9f9; z-index:1 }
+.cursor-line td{ border-top:2px solid rgba(220,80,80,0.9) }
 .uploader input[type=file]{ display:none }
 .uploader label.btn{ padding:6px 10px; border:1px solid #ccc; background:#fff; border-radius:6px; cursor:pointer; display:inline-block }
 .uploader label.btn:hover{ background:#f4f4f4 }

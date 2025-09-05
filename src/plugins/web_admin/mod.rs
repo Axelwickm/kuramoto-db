@@ -409,12 +409,17 @@ async fn handler_replay_stats(
     RawQuery(q): RawQuery,
 ) -> impl IntoResponse {
     let mut source = String::new();
+    let mut at: Option<u64> = None;
     if let Some(qs) = q {
         for pair in qs.split('&') {
             let mut it = pair.splitn(2, '=');
             if let (Some(k), Some(v)) = (it.next(), it.next()) {
                 if k == "source" {
                     source = urlencoding::decode(v).unwrap_or_else(|_| v.into()).into_owned();
+                } else if k == "at" {
+                    if let Ok(n) = urlencoding::decode(v).unwrap_or_else(|_| v.into()).into_owned().parse::<u64>() {
+                        at = Some(n);
+                    }
                 }
             }
         }
@@ -452,16 +457,34 @@ async fn handler_replay_stats(
     }
     let d = state.datasets.read().unwrap();
     if let Some(ev) = d.get(&source) {
+        let mut best: Option<(&crate::plugins::replay::DatabaseStats, u64)> = None;
         for e in ev.iter().rev() {
             for it in e.batch.iter().rev() {
                 if let crate::plugins::replay::LogWriteRequest::StatsSnapshot { stats } = it {
-                    let body = format!(
-                        "{{\"data_table_count\":{},\"index_table_count\":{},\"total_rows_data\":{},\"total_rows_index\":{}}}",
-                        stats.data_table_count, stats.index_table_count, stats.total_rows_data, stats.total_rows_index
-                    );
-                    return ([("Content-Type", "application/json")], body).into_response();
+                    let ets = e.ts;
+                    match at {
+                        Some(target) => {
+                            if ets <= target {
+                                best = Some((stats, ets));
+                                // Found the closest at or before target
+                                break;
+                            }
+                        }
+                        None => {
+                            best = Some((stats, ets));
+                            break;
+                        }
+                    }
                 }
             }
+            if best.is_some() { break; }
+        }
+        if let Some((stats, ts)) = best {
+            let body = format!(
+                "{{\"at\":{},\"data_table_count\":{},\"index_table_count\":{},\"total_rows_data\":{},\"total_rows_index\":{}}}",
+                ts, stats.data_table_count, stats.index_table_count, stats.total_rows_data, stats.total_rows_index
+            );
+            return ([("Content-Type", "application/json")], body).into_response();
         }
     }
     ([("Content-Type", "application/json")], String::from("{}")).into_response()
