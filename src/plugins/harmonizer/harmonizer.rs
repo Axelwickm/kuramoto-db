@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use bincode::{Decode, Encode};
+use bincode; 
 use redb::{ReadTransaction, TableHandle};
 use smallvec::smallvec;
 use std::collections::BTreeMap;
@@ -9,16 +9,19 @@ use std::{collections::HashSet, sync::Arc};
 use tokio::sync::mpsc;
 
 use crate::plugins::harmonizer::availability::AVAILABILITY_INCOMPLETE_BY_PEER;
-use crate::plugins::harmonizer::availability::{AVAILABILITY_BY_PEER, roots_for_peer};
+use crate::plugins::harmonizer::availability::{
+    AVAILABILITY_BY_PEER_AND_ENTITY,
+    AVAILABILITY_BY_RANGE_MIN,
+    roots_for_peer,
+    roots_for_peer_and_entity,
+};
 use crate::plugins::harmonizer::availability_queries::{peer_contains_range_local, range_cover};
 use crate::plugins::harmonizer::child_set::{
     CELLS_PER_CHUNK, Child, DigestChunk, Enc, STORED_CHUNKS,
 };
 use crate::plugins::harmonizer::optimizer::{Action as OptAction, AvailabilityDraft};
 use crate::plugins::harmonizer::optimizer::{BasicOptimizer, Optimizer};
-use crate::plugins::harmonizer::protocol::GetChildrenByRange;
 use crate::plugins::harmonizer::range_cube::RangeCube;
-use crate::plugins::harmonizer::riblt::Decoder as RibltDecoder;
 use crate::plugins::harmonizer::{
     child_set::ChildSet,
     protocol::{
@@ -144,11 +147,22 @@ impl Harmonizer {
                                     }
                                 };
                                 let peer = this.peer_ctx.peer_id;
-                                let roots = match roots_for_peer(&db, Some(&txn), &peer).await {
-                                    Ok(v) => v,
-                                    Err(e) => {
-                                        let _ = respond.send(Err(e.to_string()));
-                                        continue;
+                                // Scope roots per storage entity (first dimension) when available
+                                let roots = if let Some(fd) = req.range.dims().first() {
+                                    match roots_for_peer_and_entity(&db, Some(&txn), &peer, fd.hash()).await {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            let _ = respond.send(Err(e.to_string()));
+                                            continue;
+                                        }
+                                    }
+                                } else {
+                                    match roots_for_peer(&db, Some(&txn), &peer).await {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            let _ = respond.send(Err(e.to_string()));
+                                            continue;
+                                        }
                                     }
                                 };
                                 let root_ids: Vec<_> = roots.into_iter().map(|r| r.key).collect();
@@ -1092,9 +1106,6 @@ impl Plugin for Harmonizer {
                         .map_err(|e| StorageError::Bincode(e.to_string()))?;
 
                         let parent_pk = parent.primary_key();
-                        let mut by_peer_key = peer_id.as_bytes().to_vec();
-                        by_peer_key.push(0);
-                        by_peer_key.extend_from_slice(&parent_pk);
                         batch.push(WriteRequest::Put {
                             data_table: AVAILABILITIES_TABLE,
                             meta_table: AVAILABILITIES_META_TABLE,
@@ -1103,22 +1114,41 @@ impl Plugin for Harmonizer {
                             meta: meta2,
                             index_removes: Vec::new(),
                             index_puts: {
-                                let mut v = vec![crate::database::IndexPutRequest {
-                                    table: AVAILABILITY_BY_PEER,
-                                    key: by_peer_key,
-                                    value: parent_pk.clone(),
-                                    unique: false,
-                                }];
-                                let mut by_peer_comp = peer_id.as_bytes().to_vec();
-                                by_peer_comp.push(1);
-                                by_peer_comp.push(0);
-                                by_peer_comp.extend_from_slice(&parent_pk);
+                                // (peer, complete_flag)
+                                let mut v = Vec::new();
+                                let mut raw = peer_id.as_bytes().to_vec();
+                                raw.push(1);
+                                let by_peer_comp = crate::database::encode_nonunique_index_key(&raw, &parent_pk);
                                 v.push(crate::database::IndexPutRequest {
                                     table: AVAILABILITY_INCOMPLETE_BY_PEER,
                                     key: by_peer_comp,
                                     value: parent_pk.clone(),
                                     unique: false,
                                 });
+                                // (peer, first_dim_hash)
+                                if let Some(fd) = parent.range.dims().first() {
+                                    let mut raw = peer_id.as_bytes().to_vec();
+                                    raw.extend_from_slice(&fd.hash().to_be_bytes());
+                                    let k = crate::database::encode_nonunique_index_key(&raw, &parent_pk);
+                                    v.push(crate::database::IndexPutRequest {
+                                        table: AVAILABILITY_BY_PEER_AND_ENTITY,
+                                        key: k,
+                                        value: parent_pk.clone(),
+                                        unique: false,
+                                    });
+                                }
+                                // by_range_min: one per axis (axis_hash_be • min • 0x00 • pk)
+                                for (i, dim) in parent.range.dims().iter().enumerate() {
+                                    let mut raw = dim.hash().to_be_bytes().to_vec();
+                                    raw.extend_from_slice(&parent.range.mins()[i]);
+                                    let k = crate::database::encode_nonunique_index_key(&raw, &parent_pk);
+                                    v.push(crate::database::IndexPutRequest {
+                                        table: AVAILABILITY_BY_RANGE_MIN,
+                                        key: k,
+                                        value: parent_pk.clone(),
+                                        unique: false,
+                                    });
+                                }
                                 v
                             },
                         });
@@ -1144,9 +1174,10 @@ impl Plugin for Harmonizer {
                             };
                             let pk = child.primary_key();
                             // non-unique stored index key = child_id • 0x00 • pk
-                            let mut idx_key = cid.as_bytes().to_vec();
-                            idx_key.push(0);
-                            idx_key.extend_from_slice(&pk);
+                            let idx_key = crate::database::encode_nonunique_index_key(
+                                cid.as_bytes(),
+                                &pk,
+                            );
 
                             batch.push(WriteRequest::Put {
                                 data_table: crate::plugins::harmonizer::child_set::AVAIL_CHILDREN_TBL,
@@ -1320,29 +1351,57 @@ impl Plugin for Harmonizer {
                             )
                             .map_err(|e| StorageError::Bincode(e.to_string()))?;
                             // Non-unique index remove for by_peer
-                            let mut idx_key = existing.peer_id.as_bytes().to_vec();
-                            idx_key.push(0);
-                            idx_key.extend_from_slice(id.as_bytes());
+                            let idx_key = crate::database::encode_nonunique_index_key(
+                                existing.peer_id.as_bytes(),
+                                id.as_bytes(),
+                            );
                             // Non-unique index remove for by_peer_complete flag
-                            let mut idx_key2 = existing.peer_id.as_bytes().to_vec();
-                            idx_key2.push(if existing.complete { 1 } else { 0 });
-                            idx_key2.push(0);
-                            idx_key2.extend_from_slice(id.as_bytes());
+                            let mut raw2 = existing.peer_id.as_bytes().to_vec();
+                            raw2.push(if existing.complete { 1 } else { 0 });
+                            let idx_key2 = crate::database::encode_nonunique_index_key(&raw2, id.as_bytes());
+                            // Non-unique index remove for (peer, first_dim_hash)
+                            let mut idx_peer_ent = None;
+                            if let Some(fd) = existing.range.dims().first() {
+                                let mut raw = existing.peer_id.as_bytes().to_vec();
+                                raw.extend_from_slice(&fd.hash().to_be_bytes());
+                                idx_peer_ent = Some(crate::database::encode_nonunique_index_key(&raw, id.as_bytes()));
+                            }
+                            // Index removes for by_range_min (one per axis)
+                            let mut range_min_removes: Vec<(crate::StaticTableDef, Vec<u8>)> = Vec::new();
+                            for (i, dim) in existing.range.dims().iter().enumerate() {
+                                let mut raw = dim.hash().to_be_bytes().to_vec();
+                                raw.extend_from_slice(&existing.range.mins()[i]);
+                                let k = crate::database::encode_nonunique_index_key(&raw, id.as_bytes());
+                                range_min_removes.push((AVAILABILITY_BY_RANGE_MIN, k));
+                            }
                             batch.push(WriteRequest::Delete {
                                 data_table: AVAILABILITIES_TABLE,
                                 meta_table: AVAILABILITIES_META_TABLE,
                                 key: id.as_bytes().to_vec(),
                                 meta: meta2,
-                                index_removes: vec![
-                                    crate::database::make_index_remove(
-                                        AVAILABILITY_BY_PEER,
-                                        idx_key,
-                                    ),
-                                    crate::database::make_index_remove(
-                                        AVAILABILITY_INCOMPLETE_BY_PEER,
-                                        idx_key2,
-                                    ),
-                                ],
+                                index_removes: {
+                                    let mut v = vec![
+                                        crate::database::make_index_remove(
+                                            AVAILABILITY_INCOMPLETE_BY_PEER,
+                                            idx_key2,
+                                        ),
+                                    ];
+                                    if !existing.range.dims().is_empty() {
+                                        if let Some(k) = idx_peer_ent {
+                                            v.push(crate::database::make_index_remove(
+                                                AVAILABILITY_BY_PEER_AND_ENTITY,
+                                                k,
+                                            ));
+                                        }
+                                        for (_tbl, key) in range_min_removes.into_iter() {
+                                            v.push(crate::database::make_index_remove(
+                                                AVAILABILITY_BY_RANGE_MIN,
+                                                key,
+                                            ));
+                                        }
+                                    }
+                                    v
+                                },
                             });
 
                             // Track deletion in changed set
@@ -1401,22 +1460,7 @@ impl Plugin for Harmonizer {
         self.db.set(Arc::downgrade(&db)).unwrap();
     }
 
-    // async fn try_complete_incomplete_nodes(&self, db: &KuramotoDb) -> Result<(), StorageError> {
-    //     let self_peer = /* TODO: real peer id */;
-    //     let locals: Vec<Availability> = db.range_by_pk::<Availability>(&[], &[0xFF], None).await?;
-    //     for a in locals.into_iter().filter(|x| x.peer_id == self_peer && !x.complete) {
-    //         let peer_filter = |av: &Availability| av.peer_id != self_peer;
-    //         let (helpers, _no_overlap) = self.range_cover(db, &a.range, &[], peer_filter, None).await?;
-    //         if helpers.is_empty() {
-    //             // nobody to ask; keep incomplete for now
-    //             continue;
-    //         }
-    //         // TODO: issue RPCs to helpers to fetch children/symbols/data and reconcile.
-    //         // Once local fill is done:
-    //         // mark_complete(db, &a.key).await?;
-    //     }
-    //     Ok(())
-    // }
+    // (Removed unused try_complete_incomplete_nodes prototype)
 }
 
 /*───────────────────────────────────────────────────────────────*/
@@ -1425,6 +1469,7 @@ impl Plugin for Harmonizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugins::harmonizer::protocol::GetChildrenByRange;
     use crate::clock::{Clock, MockClock};
     use crate::plugins::communication::router::{Handler, Router, RouterConfig};
     use crate::plugins::communication::transports::{
@@ -1467,6 +1512,41 @@ mod tests {
         fn meta_table_def() -> StaticTableDef {
             static TBL: TableDefinition<'static, &'static [u8], Vec<u8>> =
                 TableDefinition::new("foo_meta");
+            &TBL
+        }
+        fn load_and_migrate(data: &[u8]) -> Result<Self, StorageError> {
+            if data.is_empty() {
+                return Err(StorageError::Bincode("empty input".into()));
+            }
+            match data[0] {
+                0 => bincode::decode_from_slice::<Self, _>(&data[1..], bincode::config::standard())
+                    .map(|(v, _)| v)
+                    .map_err(|e| StorageError::Bincode(e.to_string())),
+                n => Err(StorageError::Bincode(format!("unknown version {n}"))),
+            }
+        }
+        fn indexes() -> &'static [IndexSpec<Self>] {
+            &[]
+        }
+    }
+
+    #[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
+    struct Bar {
+        id: u32,
+    }
+    impl StorageEntity for Bar {
+        const STRUCT_VERSION: u8 = 0;
+        fn primary_key(&self) -> Vec<u8> {
+            self.id.to_le_bytes().to_vec()
+        }
+        fn table_def() -> StaticTableDef {
+            static TBL: TableDefinition<'static, &'static [u8], Vec<u8>> =
+                TableDefinition::new("bar");
+            &TBL
+        }
+        fn meta_table_def() -> StaticTableDef {
+            static TBL: TableDefinition<'static, &'static [u8], Vec<u8>> =
+                TableDefinition::new("bar_meta");
             &TBL
         }
         fn load_and_migrate(data: &[u8]) -> Result<Self, StorageError> {
@@ -2437,6 +2517,79 @@ mod tests {
         let got: std::collections::HashSet<_> = cs_b3.children.iter().copied().collect();
         let want: std::collections::HashSet<_> = a_child_ids.iter().copied().collect();
         assert_eq!(got, want, "B child set should match A after repair");
+    }
+
+    /// Ensure GetChildrenByRange scopes roots per storage entity (first dimension),
+    /// i.e., trees are independent across entities.
+    #[tokio::test(start_paused = true)]
+    async fn get_children_scopes_per_entity() {
+        let clock = Arc::new(MockClock::new(0));
+        let router = Router::new(RouterConfig::default(), clock.clone());
+
+        let local_peer = PeerContext { peer_id: UuidBytes::new() };
+        use crate::plugins::harmonizer::scorers::server_scorer::{
+            ServerScorer, ServerScorerParams,
+        };
+        let optimizer = Arc::new(BasicOptimizer::new(
+            Box::new(ServerScorer::new(ServerScorerParams::default())),
+            local_peer.clone(),
+        ));
+        let hz = Harmonizer::new(
+            router.clone(),
+            optimizer,
+            HashSet::from([Foo::table_def().name(), Bar::table_def().name()]),
+            local_peer,
+        );
+
+        // DB
+        let dir = tempdir().unwrap();
+        let db = KuramotoDb::new(
+            dir.path().join("scope_per_entity.redb").to_str().unwrap(),
+            clock.clone(),
+            vec![hz.clone()],
+        )
+        .await;
+        db.create_table_and_indexes::<Foo>().unwrap();
+        db.create_table_and_indexes::<Bar>().unwrap();
+
+        // Build two separate trees for Foo and Bar (manually via Availability rows)
+        let pid = hz.peer_ctx.peer_id;
+        let pk_dim_foo = TableHash::from(Foo::table_def());
+        let pk_dim_bar = TableHash::from(Bar::table_def());
+
+        // Foo tree: root -> leaf
+        let foo_leaf_pk = 7u32.to_le_bytes().to_vec();
+        let mut hi = foo_leaf_pk.clone();
+        hi.push(1);
+        let foo_leaf_rng = RangeCube::new(smallvec![pk_dim_foo], smallvec![foo_leaf_pk.clone()], smallvec![hi]).unwrap();
+        let foo_root = Availability { key: UuidBytes::new(), peer_id: pid, range: RangeCube::new(smallvec![pk_dim_foo], smallvec![vec![0u8,0,0,0]], smallvec![vec![255u8,255,255,255,1]]).unwrap(), level: 1, schema_hash: 0, version: 0, updated_at: clock.now(), complete: true };
+        let foo_leaf = Availability { key: UuidBytes::new(), peer_id: pid, range: foo_leaf_rng.clone(), level: 0, schema_hash: 0, version: 0, updated_at: clock.now(), complete: true };
+        db.put(foo_root.clone()).await.unwrap();
+        db.put(foo_leaf.clone()).await.unwrap();
+        let mut cs_f = ChildSet::open(&db, foo_root.key).await.unwrap();
+        cs_f.add_child(&db, foo_leaf.key).await.unwrap();
+
+        // Bar tree: root -> leaf
+        let bar_leaf_pk = 9u32.to_le_bytes().to_vec();
+        let mut bhi = bar_leaf_pk.clone();
+        bhi.push(1);
+        let bar_leaf_rng = RangeCube::new(smallvec![pk_dim_bar], smallvec![bar_leaf_pk.clone()], smallvec![bhi]).unwrap();
+        let bar_root = Availability { key: UuidBytes::new(), peer_id: pid, range: RangeCube::new(smallvec![pk_dim_bar], smallvec![vec![0u8,0,0,0]], smallvec![vec![255u8,255,255,255,1]]).unwrap(), level: 1, schema_hash: 0, version: 0, updated_at: clock.now(), complete: true };
+        let bar_leaf = Availability { key: UuidBytes::new(), peer_id: pid, range: bar_leaf_rng.clone(), level: 0, schema_hash: 0, version: 0, updated_at: clock.now(), complete: true };
+        db.put(bar_root.clone()).await.unwrap();
+        db.put(bar_leaf.clone()).await.unwrap();
+        let mut cs_b = ChildSet::open(&db, bar_root.key).await.unwrap();
+        cs_b.add_child(&db, bar_leaf.key).await.unwrap();
+
+        // Fetch roots scoped by entity: only the Foo root should appear for Foo dim
+        let txn = db.begin_read_txn().unwrap();
+        let roots_foo = availability::roots_for_peer_and_entity(&db, Some(&txn), &pid, pk_dim_foo.hash()).await.unwrap();
+        let roots_bar = availability::roots_for_peer_and_entity(&db, Some(&txn), &pid, pk_dim_bar.hash()).await.unwrap();
+        assert!(roots_foo.iter().any(|a| a.key == foo_root.key));
+        assert!(roots_bar.iter().any(|a| a.key == bar_root.key));
+        // Cross-check: Foo scoped roots should not include Bar root
+        assert!(!roots_foo.iter().any(|a| a.key == bar_root.key));
+        assert!(!roots_bar.iter().any(|a| a.key == foo_root.key));
     }
 
     /// End-to-end: A inserts, Harmonizer sends UpdateWithAttestation,

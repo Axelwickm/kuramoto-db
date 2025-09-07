@@ -5,7 +5,7 @@
 use async_trait::async_trait;
 use redb::ReadTransaction;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use tokio::sync::Mutex;
 use std::time::Instant;
 
 use crate::{
@@ -94,8 +94,8 @@ impl ServerScorer {
         }
     }
 
-    fn ensure_cache_for_txn(&self, txn: &ReadTransaction) {
-        let mut guard = self.query_cache.lock().unwrap();
+    async fn ensure_cache_for_txn(&self, txn: &ReadTransaction) {
+        let mut guard = self.query_cache.lock().await;
         let needs = match guard.as_ref() {
             Some(c) => !c.compatible_txn(Some(txn)),
             None => true,
@@ -113,11 +113,11 @@ impl ServerScorer {
         cand: &AvailabilityDraft,
         overlay: &ActionSet,
     ) -> Result<usize, StorageError> {
-        self.ensure_cache_for_txn(txn);
+        self.ensure_cache_for_txn(txn).await;
         let tk = txntag(txn);
         let rk = range_key(&cand.range);
         {
-            let repl = self.caches.repl.lock().unwrap();
+            let repl = self.caches.repl.lock().await;
             if let Some(v) = repl.get(&(tk, rk.clone())) {
                 return Ok(*v);
             }
@@ -143,7 +143,7 @@ impl ServerScorer {
         //     dt.as_millis()
         // );
         //
-        let mut repl = self.caches.repl.lock().unwrap();
+        let mut repl = self.caches.repl.lock().await;
         if repl.len() > 4096 {
             repl.clear();
         }
@@ -165,28 +165,23 @@ impl ServerScorer {
         cand: &AvailabilityDraft,
         overlay: &ActionSet,
     ) -> Result<usize, StorageError> {
-        self.ensure_cache_for_txn(txn);
+        self.ensure_cache_for_txn(txn).await;
         let tk = txntag(txn);
         let pk = peer_key_bytes(&ctx.peer_id);
         let rk = range_key(&cand.range);
 
         if overlay.is_empty() {
-            if let Some(cached) = self
-                .caches
-                .child_counts
-                .lock()
-                .unwrap()
-                .get(&(tk, pk.clone(), rk.clone()))
-                .copied()
-            {
+            let cc_guard = self.caches.child_counts.lock().await;
+            if let Some(cached) = cc_guard.get(&(tk, pk.clone(), rk.clone())).copied() {
                 return Ok(cached);
             }
         }
 
         // Use level-aware child counting with cache shared via AvailabilityQueryCache
         let count = {
+            // take the cache out to avoid holding lock across await
             let mut local_cache = {
-                let mut guard = self.query_cache.lock().unwrap();
+                let mut guard = self.query_cache.lock().await;
                 guard.take()
             };
             let mut opt_ref: Option<&mut AvailabilityQueryCache> =
@@ -212,14 +207,14 @@ impl ServerScorer {
             // );
             // restore cache
             {
-                let mut guard = self.query_cache.lock().unwrap();
+                let mut guard = self.query_cache.lock().await;
                 *guard = local_cache;
             }
             res
         };
 
         if overlay.is_empty() {
-            let mut cc = self.caches.child_counts.lock().unwrap();
+            let mut cc = self.caches.child_counts.lock().await;
             if cc.len() > 4 * 4096 {
                 cc.clear();
             }

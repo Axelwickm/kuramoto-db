@@ -25,7 +25,7 @@ use std::time::Instant;
 use crate::{
     KuramotoDb,
     plugins::harmonizer::{
-        availability::{Availability, AVAILABILITY_BY_PEER},
+        availability::Availability,
         availability::roots_for_peer,
         availability_queries::{range_cover, resolve_child_avail, child_count},
         harmonizer::PeerContext,
@@ -185,7 +185,17 @@ impl Optimizer for BasicOptimizer {
             // For every touched availability, propose deleting it and its parent(s).
             let mut dels_set: std::collections::HashSet<UuidBytes> = std::collections::HashSet::new();
 
-            let roots = roots_for_peer(db, Some(txn), &self.ctx.peer_id).await?;
+            let roots = if let Some(fd) = seed.range.dims().first() {
+                crate::plugins::harmonizer::availability::roots_for_peer_and_entity(
+                    db,
+                    Some(txn),
+                    &self.ctx.peer_id,
+                    fd.hash(),
+                )
+                .await?
+            } else {
+                roots_for_peer(db, Some(txn), &self.ctx.peer_id).await?
+            };
             let root_ids: Vec<_> = roots.into_iter().map(|r| r.key).collect();
             let mut qcache = None;
             let (frontier, no_overlap) =

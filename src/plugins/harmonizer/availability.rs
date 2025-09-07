@@ -4,7 +4,7 @@ use redb::TableDefinition;
 use crate::{
     KuramotoDb, StaticTableDef,
     plugins::harmonizer::{
-        child_set::{AVAIL_CHILDREN_BY_CHILD_TBL, Child, ChildSet},
+        child_set::{AVAIL_CHILDREN_BY_CHILD_TBL, Child},
         range_cube::RangeCube,
     },
     storage_entity::{IndexCardinality, IndexSpec, StorageEntity},
@@ -19,10 +19,14 @@ pub static AVAILABILITIES_TABLE: StaticTableDef = &TableDefinition::new("availab
 pub static AVAILABILITIES_META_TABLE: StaticTableDef = &TableDefinition::new("availabilities_meta");
 
 /// Secondary index: `peer_id` → availability rows
-pub static AVAILABILITY_BY_PEER: StaticTableDef = &TableDefinition::new("availability_by_peer");
 /// Secondary index: `(peer_id, complete_flag)` → availability rows (complete_flag: 0=incomplete,1=complete)
 pub static AVAILABILITY_INCOMPLETE_BY_PEER: StaticTableDef =
     &TableDefinition::new("availability_incomplete_by_peer");
+
+/// Secondary index: `(peer_id, first_dim_hash_be)` → availability rows.
+/// This allows building independent availability trees per storage entity (per first-dimension hash).
+pub static AVAILABILITY_BY_PEER_AND_ENTITY: StaticTableDef =
+    &TableDefinition::new("availability_by_peer_and_entity");
 
 /// Secondary index for range lookups: key = axis_hash_be • min
 pub static AVAILABILITY_BY_RANGE_MIN: StaticTableDef =
@@ -55,11 +59,22 @@ pub type Availability = AvailabilityV0;
 /*──────────────────────── Indexes ─────────────────────*/
 
 pub static AVAILABILITY_INDEXES: &[IndexSpec<AvailabilityV0>] = &[
-    // Fast lookup of rows by peer
+    // Fast lookup of rows by (peer, entity) where entity is the first-dimension TableHash.
     IndexSpec::<AvailabilityV0> {
-        name: "by_peer",
-        key_fn: |a| a.peer_id.as_bytes().to_vec(),
-        table_def: &AVAILABILITY_BY_PEER,
+        name: "by_peer_entity",
+        key_fn: |a| {
+            let mut k = a.peer_id.as_bytes().to_vec();
+            let first_dim = a
+                .range
+                .dims()
+                .first()
+                .map(|d| d.hash())
+                .unwrap_or(0u64)
+                .to_be_bytes();
+            k.extend_from_slice(&first_dim);
+            k
+        },
+        table_def: &AVAILABILITY_BY_PEER_AND_ENTITY,
         cardinality: IndexCardinality::NonUnique,
     },
     // Lookup of incomplete nodes per peer: key = peer_id • complete_flag
@@ -151,10 +166,60 @@ pub async fn roots_for_peer(
     txn: Option<&ReadTransaction>,
     peer_id: &UuidBytes,
 ) -> Result<Vec<Availability>, StorageError> {
-    // 1) Fetch all availabilities for the peer via index
-    let peer_key = peer_id.as_bytes().to_vec();
+    // 1) Fetch all availabilities for the peer via (peer, complete_flag) index for both flags
+    let mut key_incomplete = peer_id.as_bytes().to_vec();
+    key_incomplete.push(0);
+    let mut key_complete = peer_id.as_bytes().to_vec();
+    key_complete.push(1);
+    let mut all: Vec<Availability> = db
+        .get_by_index_all_tx::<Availability>(
+            txn,
+            AVAILABILITY_INCOMPLETE_BY_PEER,
+            &key_incomplete,
+        )
+        .await?;
+    let mut completes: Vec<Availability> = db
+        .get_by_index_all_tx::<Availability>(
+            txn,
+            AVAILABILITY_INCOMPLETE_BY_PEER,
+            &key_complete,
+        )
+        .await?;
+    all.append(&mut completes);
+
+    // 2) Filter roots = nodes with zero incoming edges in Child rows (by_child index)
+    let mut roots = Vec::new();
+    for a in all {
+        let child_key = a.key.as_bytes().to_vec();
+        let parents: Vec<Child> = db
+            .get_by_index_all_tx::<Child>(txn, AVAIL_CHILDREN_BY_CHILD_TBL, &child_key)
+            .await?;
+        // Ignore self-edges when determining roots
+        let has_external_parent = parents.iter().any(|p| p.parent != a.key);
+        if !has_external_parent {
+            roots.push(a);
+        }
+    }
+    Ok(roots)
+}
+
+/// Fetch all root availabilities for a given `(peer_id, first_dim_hash)` using the `(peer, entity)` index.
+/// This provides independence across storage entities while keeping lookups efficient.
+pub async fn roots_for_peer_and_entity(
+    db: &KuramotoDb,
+    txn: Option<&ReadTransaction>,
+    peer_id: &UuidBytes,
+    first_dim_hash: u64,
+) -> Result<Vec<Availability>, StorageError> {
+    // 1) Fetch all availabilities for the (peer, entity) via index
+    let mut key = peer_id.as_bytes().to_vec();
+    key.extend_from_slice(&first_dim_hash.to_be_bytes());
     let all: Vec<Availability> = db
-        .get_by_index_all_tx::<Availability>(txn, AVAILABILITY_BY_PEER, &peer_key)
+        .get_by_index_all_tx::<Availability>(
+            txn,
+            AVAILABILITY_BY_PEER_AND_ENTITY,
+            &key,
+        )
         .await?;
 
     // 2) Filter roots = nodes with zero incoming edges in Child rows (by_child index)

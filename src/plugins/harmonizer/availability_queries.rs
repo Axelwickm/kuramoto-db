@@ -9,8 +9,8 @@ use crate::{
     KuramotoDb, StaticTableDef,
     plugins::harmonizer::{
         availability::{Availability, roots_for_peer, AVAILABILITY_BY_RANGE_MIN},
-        child_set::{Child, ChildSet, DigestChunk},
-        optimizer::{Action, ActionSet, AvailabilityDraft},
+        child_set::ChildSet,
+        optimizer::ActionSet,
         range_cube::RangeCube,
     },
     storage_error::StorageError,
@@ -23,7 +23,8 @@ use crate::{
 pub struct AvailabilityQueryCache {
     txn_tag: usize,
     // DB snapshot memoization (overlay applied on top per call)
-    roots_by_peer: HashMap<UuidBytes, Vec<UuidBytes>>, // peer -> root ids
+    roots_by_peer: HashMap<UuidBytes, Vec<UuidBytes>>, // peer -> root ids (global)
+    roots_by_peer_entity: HashMap<(UuidBytes, u64), Vec<UuidBytes>>, // (peer, first-dim hash) -> root ids
     childset_by_parent: HashMap<UuidBytes, ChildSet>,  // parent id -> child set
     avail_by_id: HashMap<UuidBytes, Availability>,     // availability rows by id
 }
@@ -544,7 +545,12 @@ pub async fn peer_contains_range_local(
         }
     }
 
-    let roots = roots_for_peer_cached(db, txn, peer, cache).await?;
+    // Prefer entity-scoped roots when target carries dimensions
+    let roots = if let Some(fd) = target.dims().first() {
+        roots_for_peer_cached_scoped(db, txn, peer, fd.hash(), cache).await?
+    } else {
+        roots_for_peer_cached(db, txn, peer, cache).await?
+    };
     let root_ids: Vec<UuidBytes> = roots.into_iter().map(|r| r.key).collect();
     let (frontier, no_overlap) =
         range_cover(db, txn, target, &root_ids, None, overlay, cache).await?;
@@ -598,6 +604,55 @@ async fn roots_for_peer_cached(
     Ok(roots)
 }
 
+async fn roots_for_peer_cached_scoped(
+    db: &KuramotoDb,
+    txn: Option<&ReadTransaction>,
+    peer: &UuidBytes,
+    first_dim_hash: u64,
+    cache: &mut Option<&mut AvailabilityQueryCache>,
+) -> Result<Vec<Availability>, StorageError> {
+    // Try cache first
+    if let Some(ref mut c) = cache.as_deref_mut() {
+        if c.compatible_txn(txn) {
+            if let Some(ids_ref) = c.roots_by_peer_entity.get(&(*peer, first_dim_hash)) {
+                let ids = ids_ref.clone();
+                drop(c);
+                let mut out = Vec::with_capacity(ids.len());
+                for id in ids {
+                    if let Some(c2) = cache.as_deref_mut() {
+                        if let Some(av) = c2.avail_by_id.get(&id) {
+                            out.push(av.clone());
+                            continue;
+                        }
+                    }
+                    if let Some(av) = resolve_child_avail_cached(db, txn, &id, cache).await? {
+                        out.push(av);
+                    }
+                }
+                return Ok(out);
+            }
+        }
+    }
+    // DB fetch scoped by (peer, first_dim_hash)
+    let roots = crate::plugins::harmonizer::availability::roots_for_peer_and_entity(
+        db,
+        txn,
+        peer,
+        first_dim_hash,
+    )
+    .await?;
+    if let Some(ref mut c) = cache.as_deref_mut() {
+        if c.compatible_txn(txn) {
+            c.roots_by_peer_entity
+                .insert((*peer, first_dim_hash), roots.iter().map(|r| r.key).collect());
+            for r in &roots {
+                c.avail_by_id.insert(r.key, r.clone());
+            }
+        }
+    }
+    Ok(roots)
+}
+
 /// Count distinct peers that **fully contain** `target` with at least one **complete** availability.
 ///
 /// This is intentionally global/scan-based because replication is a cross-peer property.
@@ -612,14 +667,71 @@ pub async fn count_replications<F>(
 where
     F: Fn(&Availability) -> bool + Sync,
 {
-    let mut peers = HashSet::<UuidBytes>::new();
-    let t0 = Instant::now();
-    let all: Vec<Availability> = db
-        .range_by_pk_tx::<Availability>(txn, &[], &[0xFF], None)
-        .await?;
-    let all_len = all.len();
+    // Fast path when target has no dims: fall back to scan (matches prior semantics)
+    if target.dims().is_empty() {
+        let mut peers = HashSet::<UuidBytes>::new();
+        let all: Vec<Availability> = db
+            .range_by_pk_tx::<Availability>(txn, &[], &[0xFF], None)
+            .await?;
+        for a in all {
+            if !a.complete {
+                continue;
+            }
+            if let Some(max_lvl) = level_limit {
+                if a.level as usize > max_lvl {
+                    continue;
+                }
+            }
+            if !peer_filter(&a) {
+                continue;
+            }
+            peers.insert(a.peer_id);
+        }
+        return Ok(peers.len());
+    }
 
-    for a in all {
+    // Use the per-axis min index to prefilter candidates: for each axis in `target`,
+    // collect PKs whose stored min <= target.min on that axis, then intersect across axes.
+    let n = target
+        .dims()
+        .len()
+        .min(target.mins().len());
+
+    let mut acc: Option<HashSet<Vec<u8>>> = None;
+    for i in 0..n {
+        let axis = target.dims()[i];
+        let mut lo = axis.hash.to_be_bytes().to_vec();
+        // start from the axis prefix (all mins)
+        let mut hi = axis.hash.to_be_bytes().to_vec();
+        hi.extend_from_slice(&target.mins()[i]);
+        hi.push(0x01); // half-open upper bound: include <= target.min
+
+        let pks = db
+            .collect_pks_in_index_range_tx(txn, AVAILABILITY_BY_RANGE_MIN, &lo, &hi, None)
+            .await?;
+        let set: HashSet<Vec<u8>> = pks.into_iter().collect();
+        acc = match acc.take() {
+            Some(cur) => {
+                let inter: HashSet<_> = cur.intersection(&set).cloned().collect();
+                Some(inter)
+            }
+            None => Some(set),
+        };
+        if let Some(ref s) = acc {
+            if s.is_empty() {
+                return Ok(0);
+            }
+        }
+    }
+
+    let Some(candidates) = acc else { return Ok(0) };
+    let mut peers = HashSet::<UuidBytes>::new();
+    for pk in candidates {
+        let a = match db.get_data_tx::<Availability>(txn, &pk).await {
+            Ok(v) => v,
+            Err(StorageError::NotFound) => continue,
+            Err(e) => return Err(e),
+        };
         if !a.complete {
             continue;
         }
@@ -635,15 +747,7 @@ where
             peers.insert(a.peer_id);
         }
     }
-
-    let out = peers.len();
-    // println!(
-    //     "aq.count_replications: scanned={} peers={} took={}ms",
-    //     all_len,
-    //     out,
-    //     t0.elapsed().as_millis()
-    // );
-    Ok(out)
+    Ok(peers.len())
 }
 
 /// Transaction-aware child count for a single availability (just the embedded list length).
@@ -745,7 +849,11 @@ pub async fn local_child_count_under_peer(
     }
 
     // ---- fallback: walk local availability trees (frontier only) ----
-    let roots: Vec<Availability> = roots_for_peer_cached(db, txn, peer, cache).await?;
+    let roots: Vec<Availability> = if let Some(fd) = cube.dims().first() {
+        roots_for_peer_cached_scoped(db, txn, peer, fd.hash(), cache).await?
+    } else {
+        roots_for_peer_cached(db, txn, peer, cache).await?
+    };
     let root_ids: Vec<UuidBytes> = roots.iter().map(|r| r.key).collect();
 
     let (frontier, _no_overlap) =
@@ -786,7 +894,7 @@ mod tests {
     use crate::{
         clock::MockClock,
         plugins::harmonizer::{
-            availability::Availability, child_set::ChildSet, range_cube::RangeCube,
+            availability::Availability, child_set::{Child, DigestChunk, ChildSet}, range_cube::RangeCube,
         },
         storage_entity::{IndexCardinality, IndexSpec, StorageEntity},
     };
@@ -1444,6 +1552,105 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(n, 2);
+    }
+
+    #[tokio::test]
+    async fn trees_are_independent_per_entity_first_dim() {
+        let db = fresh_db().await;
+        let dim_a = TableHash { hash: 101 };
+        let dim_b = TableHash { hash: 202 };
+
+        let peer = UuidBytes::new();
+
+        // Build entity A tree: root -> l1, l2
+        let a_root = Availability {
+            key: UuidBytes::new(),
+            peer_id: peer,
+            range: cube(dim_a, b"a", b"z"),
+            level: 1,
+            schema_hash: 0,
+            version: 0,
+            updated_at: 0,
+            complete: true,
+        };
+        let a_l1 = Availability {
+            key: UuidBytes::new(),
+            peer_id: peer,
+            range: cube(dim_a, b"b", b"c"),
+            level: 0,
+            schema_hash: 0,
+            version: 0,
+            updated_at: 0,
+            complete: true,
+        };
+        let a_l2 = Availability {
+            key: UuidBytes::new(),
+            peer_id: peer,
+            range: cube(dim_a, b"x", b"y"),
+            level: 0,
+            schema_hash: 0,
+            version: 0,
+            updated_at: 0,
+            complete: true,
+        };
+        db.put(a_root.clone()).await.unwrap();
+        db.put(a_l1.clone()).await.unwrap();
+        db.put(a_l2.clone()).await.unwrap();
+        let mut cs_a = ChildSet::open(&db, a_root.key).await.unwrap();
+        cs_a.add_child(&db, a_l1.key).await.unwrap();
+        cs_a.add_child(&db, a_l2.key).await.unwrap();
+
+        // Build entity B tree: root -> l1
+        let b_root = Availability {
+            key: UuidBytes::new(),
+            peer_id: peer,
+            range: cube(dim_b, b"a", b"z"),
+            level: 1,
+            schema_hash: 0,
+            version: 0,
+            updated_at: 0,
+            complete: true,
+        };
+        let b_l1 = Availability {
+            key: UuidBytes::new(),
+            peer_id: peer,
+            range: cube(dim_b, b"m", b"n"),
+            level: 0,
+            schema_hash: 0,
+            version: 0,
+            updated_at: 0,
+            complete: true,
+        };
+        db.put(b_root.clone()).await.unwrap();
+        db.put(b_l1.clone()).await.unwrap();
+        let mut cs_b = ChildSet::open(&db, b_root.key).await.unwrap();
+        cs_b.add_child(&db, b_l1.key).await.unwrap();
+
+        // Query under A should count only A leaves
+        let cube_a = cube(dim_a, b"a", b"z");
+        let n_a = super::local_child_count_under_peer(&db, None, &peer, &cube_a, &vec![], &mut None)
+            .await
+            .unwrap();
+        assert_eq!(n_a, 2, "entity A count should ignore entity B leaves");
+
+        // Query under B should count only B leaves
+        let cube_b = cube(dim_b, b"a", b"z");
+        let n_b = super::local_child_count_under_peer(&db, None, &peer, &cube_b, &vec![], &mut None)
+            .await
+            .unwrap();
+        assert_eq!(n_b, 1, "entity B count should ignore entity A leaves");
+
+        // Containment checks also scoped
+        let target_a = cube(dim_a, b"b", b"c");
+        let ok_a = super::peer_contains_range_local(&db, None, &peer, &target_a, &vec![], &mut None)
+            .await
+            .unwrap();
+        assert!(ok_a);
+        let target_b = cube(dim_b, b"m", b"n");
+        let ok_b = super::peer_contains_range_local(&db, None, &peer, &target_b, &vec![], &mut None)
+            .await
+            .unwrap();
+        assert!(ok_b);
     }
 
     // ---------- Storage-atom counting (no deserialization) ----------

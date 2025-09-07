@@ -103,7 +103,7 @@ type TableDeletePlanFn = dyn for<'a> Fn(
     + Send
     + Sync;
 
-fn encode_nonunique_key(idx_key: &[u8], pk: &[u8]) -> Vec<u8> {
+pub fn encode_nonunique_index_key(idx_key: &[u8], pk: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(idx_key.len() + 1 + pk.len());
     out.extend_from_slice(idx_key);
     out.push(0); // separator
@@ -111,7 +111,7 @@ fn encode_nonunique_key(idx_key: &[u8], pk: &[u8]) -> Vec<u8> {
     out
 }
 
-fn nonunique_bounds(idx_key: &[u8]) -> (Vec<u8>, Vec<u8>) {
+pub fn nonunique_index_bounds(idx_key: &[u8]) -> (Vec<u8>, Vec<u8>) {
     // [idx_key • 0x00, idx_key • 0x01) – half-open range
     let mut lo = Vec::with_capacity(idx_key.len() + 1);
     lo.extend_from_slice(idx_key);
@@ -483,7 +483,7 @@ impl KuramotoDb {
             let t = rt
                 .open_table(table.clone())
                 .map_err(|e| StorageError::Other(e.to_string()))?;
-            let (lo, hi) = nonunique_bounds(idx_key);
+            let (lo, hi) = nonunique_index_bounds(idx_key);
             let mut out = Vec::new();
             for item in t
                 .range(lo.as_slice()..hi.as_slice())
@@ -695,7 +695,7 @@ impl KuramotoDb {
         idx_key: &[u8],
     ) -> Result<Vec<E>, StorageError> {
         self.with_read(txn, |rt| {
-            let (lo, hi) = nonunique_bounds(idx_key);
+            let (lo, hi) = nonunique_index_bounds(idx_key);
             let idx_t = rt
                 .open_table(index_table.clone())
                 .map_err(|e| StorageError::Other(e.to_string()))?;
@@ -1017,7 +1017,7 @@ impl KuramotoDb {
                     for k in old_keys.iter().filter(|k| !new_keys.contains(k)) {
                         let stored = match idx.cardinality {
                             IndexCardinality::Unique => k.clone(),
-                            IndexCardinality::NonUnique => encode_nonunique_key(k, &pk),
+                            IndexCardinality::NonUnique => encode_nonunique_index_key(k, &pk),
                         };
                         removes.push(IndexRemoveRequest { table: idx.table_def, key: stored });
                     }
@@ -1025,7 +1025,7 @@ impl KuramotoDb {
                     for k in new_keys.iter().filter(|k| !old_keys.contains(k)) {
                         let stored = match idx.cardinality {
                             IndexCardinality::Unique => k.clone(),
-                            IndexCardinality::NonUnique => encode_nonunique_key(k, &pk),
+                            IndexCardinality::NonUnique => encode_nonunique_index_key(k, &pk),
                         };
                         puts.push(IndexPutRequest {
                             table: idx.table_def,
@@ -1050,7 +1050,7 @@ impl KuramotoDb {
                         keys.into_iter().map(move |idx_key| {
                             let stored = match idx.cardinality {
                                 IndexCardinality::Unique => idx_key,
-                                IndexCardinality::NonUnique => encode_nonunique_key(&idx_key, &pk_clone),
+                                IndexCardinality::NonUnique => encode_nonunique_index_key(&idx_key, &pk_clone),
                             };
                             IndexPutRequest {
                                 table: idx.table_def,
@@ -1117,7 +1117,7 @@ impl KuramotoDb {
                 keys.into_iter().map(|raw| {
                     let stored = match idx.cardinality {
                         IndexCardinality::Unique => raw,
-                        IndexCardinality::NonUnique => encode_nonunique_key(&raw, &pk),
+                        IndexCardinality::NonUnique => encode_nonunique_index_key(&raw, &pk),
                     };
                     IndexRemoveRequest { table: idx.table_def, key: stored }
                 })
