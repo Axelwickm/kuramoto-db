@@ -252,12 +252,6 @@ impl Scorer for ServerScorer {
         };
         s += self.child_count_score(child_count);
         s += (cand.level as f32) * self.params.level_weight;
-        // Nudge toward parents to encourage grouping over flat leaves
-        if cand.level == 0 {
-            s -= 1.0;
-        } else {
-            s += 1.0;
-        }
         s
     }
 }
@@ -318,7 +312,10 @@ mod tests {
         let clock = Arc::new(MockClock::new(0));
         let plugin = std::sync::Arc::new(ReplayPlugin::new());
         let db = KuramotoDb::new(
-            dir.path().join(format!("{}_server_scorer.redb", db_name)).to_str().unwrap(),
+            dir.path()
+                .join(format!("{}_server_scorer.redb", db_name))
+                .to_str()
+                .unwrap(),
             clock,
             vec![plugin],
         )

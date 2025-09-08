@@ -579,8 +579,10 @@ async fn handler_harmonizer_tree(
                 ..
             } = it
             {
+                // If no entity specified (entity_hash==0), accept any entity for this peer.
+                // Otherwise, require an exact match of the first-dimension hash.
                 if (peer_hex == "self" || *peer_id == peer_id_bytes)
-                    && *first_dim_hash == entity_hash
+                    && (entity_hash == 0 || *first_dim_hash == entity_hash)
                 {
                     snap_ts = Some(e.ts);
                     println!("[tree] found snapshot at ts={} matching peer/entity", e.ts);
@@ -663,7 +665,8 @@ async fn handler_harmonizer_tree(
                             } else {
                                 *a.peer_id.as_bytes() == peer_id_bytes
                             };
-                            let match_ent = first == entity_hash;
+                            // Wildcard entity when not specified
+                            let match_ent = entity_hash == 0 || first == entity_hash;
                             if !match_ent || !peer_ok {
                                 println!(
                                     "[tree] skip avail id={} lvl={} peer={} dims={:?} first=0x{:016x} match_ent={} peer_ok={}",
