@@ -34,7 +34,8 @@ tracing = "0.1.41"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # Web admin (optional) — compile only when feature enabled
-axum = { version = "0.7", features = ["http1"], optional = true }
+# Enable `macros` for #[axum::debug_handler] diagnostics
+axum = { version = "0.7", features = ["http1", "macros"], optional = true }
 urlencoding = { version = "2.1", optional = true }
 hex = { version = "0.4", optional = true }
 

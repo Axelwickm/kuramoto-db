@@ -36,7 +36,8 @@ impl Default for ServerScorerParams {
     fn default() -> Self {
         Self {
             rent: 1.0,
-            child_target: 6,
+            // Lower default child_target to promote multi-level grouping
+            child_target: 3,
             child_weight: 0.5,
             replication_target: 3,
             replication_weight: 1.0,
@@ -310,6 +311,37 @@ mod tests {
         db
     }
 
+    // Helper: DB with ReplayPlugin attached so tests can export replay logs
+    async fn fresh_db_with_replay(db_name: &str) -> Arc<KuramotoDb> {
+        use crate::plugins::replay::ReplayPlugin;
+        let dir = tempdir().unwrap();
+        let clock = Arc::new(MockClock::new(0));
+        let plugin = std::sync::Arc::new(ReplayPlugin::new());
+        let db = KuramotoDb::new(
+            dir.path().join(format!("{}_server_scorer.redb", db_name)).to_str().unwrap(),
+            clock,
+            vec![plugin],
+        )
+        .await;
+        db.create_table_and_indexes::<Availability>().unwrap();
+        db.create_table_and_indexes::<Child>().unwrap();
+        db.create_table_and_indexes::<DigestChunk>().unwrap();
+        db
+    }
+
+    async fn export_replay<P: AsRef<std::path::Path>>(db: &KuramotoDb, out_dir: P, basename: &str) {
+        use crate::plugins::replay::ReplayEvent;
+        use std::fs;
+        let _ = fs::create_dir_all(out_dir.as_ref());
+        let events: Vec<ReplayEvent> = db
+            .range_by_pk::<ReplayEvent>(&0u64.to_be_bytes(), &u64::MAX.to_be_bytes(), None)
+            .await
+            .unwrap_or_default();
+        let bytes = bincode::encode_to_vec(&events, bincode::config::standard()).unwrap();
+        let path = out_dir.as_ref().join(format!("{}.bin", basename));
+        let _ = fs::write(path, bytes);
+    }
+
     /// Make N contiguous leaf availabilities [base+i, base+i+1) on one axis.
     /// Returns (root_id, leaf_ids).
     async fn build_linear_leaves_with_root(
@@ -532,7 +564,7 @@ mod tests {
 
     #[tokio::test]
     async fn optimizer_proposes_parents_that_group_exactly_k_leaves() {
-        let db = fresh_db().await;
+        let db = fresh_db_with_replay("opt_k3").await;
         let dim = TableHash { hash: 15 };
         let ctx = PeerContext {
             peer_id: UuidBytes::new(),
@@ -591,11 +623,14 @@ mod tests {
             }
         }
         assert!(found_k, "at least one parent must group exactly 3 leaves");
+
+        // Export replay for inspection in Web GUI
+        export_replay(&db, "exports", "optimizer_proposes_parents_k3").await;
     }
 
     #[tokio::test]
     async fn iterative_planning_covers_all_leaves_in_k_sized_parents() {
-        let db = fresh_db().await;
+        let db = fresh_db_with_replay("iter_k3").await;
         // Use a real data-table-backed dim so level-0 growth can be scored via storage atoms.
         // Register a simple entity table and populate atoms spanning the test window.
         db.create_table_and_indexes::<TestEnt>().unwrap();
@@ -682,6 +717,9 @@ mod tests {
             exact_k >= 3,
             "expected at least 3 parents to capture exactly k=3 leaves; got {exact_k}"
         );
+
+        // Export replay for inspection in Web GUI
+        export_replay(&db, "exports", "iterative_planning_parents_k3").await;
     }
 
     // ───── Entities + replication tests (3 peers, k=2) ─────
@@ -804,7 +842,11 @@ mod tests {
             replication_weight: 5.0,
             ..Default::default()
         };
-        let opts = SyncTesterOptions { record_replay: true, export_dir: Some(std::path::PathBuf::from("exports")) };
+        let opts = SyncTesterOptions {
+            record_replay: true,
+            export_dir: Some(std::path::PathBuf::from("exports")),
+            export_basename: Some("three_peers_replicate_k2_spread_many_rows".to_string()),
+        };
         let mut t = SyncTester::new_with_options(&peers, &[TestEnt::table_def().name()], params, opts.clone()).await;
         for n in t.peers_mut() {
             n.db.create_table_and_indexes::<TestEnt>().unwrap();
@@ -906,8 +948,12 @@ mod tests {
             let mut count = 0usize;
             for e in entries {
                 let p = e.unwrap().path();
-                if p.is_file() && p.file_name().unwrap().to_string_lossy().starts_with("replay_") {
-                    count += 1;
+                if p.is_file() {
+                    let name = p.file_name().unwrap().to_string_lossy();
+                    // Accept legacy replay_*.bin and deterministic *_peer_*.bin
+                    if (name.starts_with("replay_") && name.ends_with(".bin")) || name.contains("_peer_") {
+                        count += 1;
+                    }
                 }
             }
             assert!(count >= peers.len(), "expected at least {} replay files in {:?}", peers.len(), dir);

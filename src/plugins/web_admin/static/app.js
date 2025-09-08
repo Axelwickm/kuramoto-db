@@ -1,7 +1,12 @@
+const SVG_NS = 'http://www.w3.org/2000/svg';
+const SVG_TAGS = new Set(['svg','g','path','circle','rect','line','polyline','polygon','ellipse','text','title','defs','clipPath']);
 const el = (tag, attrs = {}, ...kids) => {
-  const n = document.createElement(tag);
+  const isSvg = SVG_TAGS.has(tag);
+  const n = isSvg ? document.createElementNS(SVG_NS, tag) : document.createElement(tag);
   Object.entries(attrs).forEach(([k, v]) => {
-    if (k === 'class') n.className = v; else if (k === 'text') n.textContent = v; else n.setAttribute(k, v);
+    if (k === 'text') { n.textContent = v; return; }
+    if (k === 'class') { if (isSvg) n.setAttribute('class', v); else n.className = v; return; }
+    if (isSvg) n.setAttribute(k, v); else n.setAttribute(k, v);
   });
   kids.forEach(k => n.appendChild(typeof k === 'string' ? document.createTextNode(k) : k));
   return n;
@@ -55,7 +60,9 @@ function addCard(type = 'events', dataset = null) {
       type === 'stats' ? 'DB Stats' : (
         type === 'files' ? 'Replay Files' : (
           type === 'plot' ? 'Event Plot' : (
-            type === 'timeline' ? 'Timeline' : 'Events'
+            type === 'timeline' ? 'Timeline' : (
+              type === 'harm_tree' ? 'Harmonizer - Tree' : 'Events'
+            )
           )
         )
       )
@@ -81,6 +88,7 @@ function addCard(type = 'events', dataset = null) {
   else if (type === 'files') { defaultW = Math.min(4, cols); defaultH = 2; }
   else if (type === 'plot') { defaultW = cols; defaultH = 8; }
   else if (type === 'timeline') { defaultW = cols; defaultH = 1; }
+  else if (type === 'harm_tree') { defaultW = cols; defaultH = 10; }
   else { defaultW = Math.min(6, cols); defaultH = 6; }
   // attach and make into widget (v12: use makeWidget instead of addWidget(el))
   const gridEl = GRID && GRID.el ? GRID.el : document.getElementById('board');
@@ -379,7 +387,7 @@ function addCard(type = 'events', dataset = null) {
         datasetsChanged();
       };
       await refreshList();
-    } else if (type === 'stats') {
+  } else if (type === 'stats') {
       const src = sel.value || (MODE === 'attached' ? 'attached' : null);
       if (!src) { body.innerHTML = '<div class="muted">Pick a dataset</div>'; return; }
       // stats at cursor (for replay): closest snapshot before cursor; attached = live
@@ -395,6 +403,158 @@ function addCard(type = 'events', dataset = null) {
     } else if (type === 'timeline') {
       // timeline managed by its own listeners; nothing to fetch here
       return;
+  } else if (type === 'harm_tree') {
+      const src = sel.value || (MODE === 'attached' ? 'attached' : null);
+      if (!src) { body.innerHTML = '<div class="muted">Pick a dataset</div>'; return; }
+      // Controls: peer (hex or self), entity (u64), and refresh
+      const peerSel = el('select', { style: 'width:220px' });
+      const entSel = el('select', { style: 'width:220px' });
+      const goBtn = el('button', { class: 'btn' }, 'Refresh');
+      const ctlBox = el('div', { class: 'row' }, peerSel, entSel, goBtn);
+      // Text summary of the currently selected tree (levels, nodes, edges)
+      const infoBox = el('div', { class: 'muted', style: 'margin:6px 0;' }, '');
+      body.innerHTML = '';
+      body.appendChild(ctlBox);
+      body.appendChild(infoBox);
+      const svg = el('svg', { width: '100%', height: '360', style: 'display:block; border-top:1px solid #eee' });
+      body.appendChild(svg);
+
+      const colorFrom = (s) => {
+        let h = 0; for (let i = 0; i < s.length; i++) h = (h * 131 + s.charCodeAt(i)) >>> 0;
+        const hue = h % 360; return `hsl(${hue},70%,50%)`;
+      };
+      const selfColor = colorFrom('self');
+
+      const draw = (graph, peerStr) => {
+        svg.innerHTML = '';
+        // Use actual CSS box to compute layout; avoid drawing outside tiny cards
+        const W = Math.max(100, (svg.clientWidth || (svg.parentElement ? svg.parentElement.clientWidth : 400) || 400));
+        let Hcss = Math.max(28, (svg.clientHeight || (svg.parentElement ? svg.parentElement.clientHeight : 200) || 200));
+        // Decide a sensible height: fit up to 6 levels comfortably
+        const lvls = (graph.levels || []).slice().sort((a,b)=>a-b);
+        const lvlCount = Math.max(1, lvls.length);
+        const targetLevels = Math.min(6, lvlCount);
+        const perLayer = 52; // px between levels for readability
+        const basePad = 16;  // top/bottom padding
+        const Htarget = Math.max(240, Math.min(480, 2*basePad + (targetLevels + 1) * perLayer));
+        Hcss = Htarget;
+        svg.setAttribute('width', String(W));
+        svg.setAttribute('height', String(Hcss));
+        // Ensure proper scaling by declaring a viewBox matching our drawing coords
+        svg.setAttribute('viewBox', `0 0 ${W} ${Hcss}`);
+        svg.setAttribute('preserveAspectRatio', 'xMidYMin meet');
+        // Adaptive padding/gaps for small heights
+        const pad = Math.max(8, Math.min(24, Math.floor(Hcss / 16)));
+        const layerGap = Math.max(12, Math.floor((Hcss - 2*pad) / Math.max(1, (lvlCount + 1))));
+        const levelYs = new Map();
+        lvls.forEach((lvl, i) => { const idx = i+1; levelYs.set(lvl, Math.max(pad, Hcss - pad - idx * layerGap)); });
+        // Group nodes by level
+        const byLevel = new Map();
+        (graph.nodes||[]).forEach(n => { const arr = byLevel.get(n.level) || []; arr.push(n); byLevel.set(n.level, arr); });
+        // positions
+        const pos = new Map();
+        for (const [lvl, arr] of byLevel.entries()) {
+          arr.sort((a,b)=>a.id.localeCompare(b.id));
+          const y = levelYs.get(lvl) ?? (Hcss - pad);
+          for (let i=0;i<arr.length;i++) {
+            const x = pad + (i+1) * (W - 2*pad) / (arr.length+1);
+            pos.set(arr[i].id, { x, y });
+          }
+        }
+        const peerColor = colorFrom(peerStr || 'peer');
+        // draw edges first
+        (graph.edges||[]).forEach(e => {
+          const a = pos.get(e.parent), b = pos.get(e.child); if (!a || !b) return;
+          const path = el('path', { d: `M ${a.x} ${a.y} C ${a.x} ${(a.y+b.y)/2}, ${b.x} ${(a.y+b.y)/2}, ${b.x} ${b.y}`, stroke: peerColor, fill: 'none', 'stroke-width': 1.2, 'stroke-opacity': 0.7 });
+          svg.appendChild(path);
+        });
+        // draw nodes
+        const countsByLevel = new Map();
+        (graph.nodes||[]).forEach(n => { const l = n.level || 0; countsByLevel.set(l, (countsByLevel.get(l)||0)+1); });
+        (graph.nodes||[]).forEach(n => {
+          const p = pos.get(n.id); if (!p) return;
+          const g = el('g');
+          // radius scaled by per-level count: more nodes -> smaller radius, but still visible
+          const perCount = countsByLevel.get(n.level || 0) || 1;
+          const rScaled = Math.max(4, Math.min(10, Math.round(220 / Math.max(8, perCount))));
+          const r = rScaled;
+          const circ = el('circle', { cx: p.x, cy: p.y, r: r, fill: peerColor, stroke: '#333', 'stroke-width': 1.2, 'fill-opacity': n.complete ? 0.95 : 0.5 });
+          const title = el('title', { text: `${n.id}\nlevel=${n.level} complete=${n.complete}` });
+          g.appendChild(circ); g.appendChild(title); svg.appendChild(g);
+        });
+        // atoms: draw stems from each L0 node down to a baseline with up to K dots
+        const atomCounts = new Map();
+        (graph.atoms||[]).forEach(a => atomCounts.set(a.leaf, Number(a.count)||0));
+        const l0 = byLevel.get(0) || [];
+        const atomsY = Math.max(2, Hcss - pad/2);
+        const DOT_SPACING = 6; // px between atom dots per leaf
+        const DOT_R = 2.5;
+        l0.forEach(n => {
+          const p = pos.get(n.id); if (!p) return;
+          const cnt = atomCounts.get(n.id) || 0;
+          // vertical stem
+          const stem = el('line', { x1: p.x, y1: p.y, x2: p.x, y2: atomsY, stroke: '#999', 'stroke-width': 1, 'stroke-opacity': 0.8 });
+          svg.appendChild(stem);
+          // dots centered around node x
+          const drawN = Math.min(16, cnt);
+          if (drawN > 0) {
+            const totalW = (drawN - 1) * DOT_SPACING;
+            const x0 = p.x - totalW / 2;
+            for (let i=0;i<drawN;i++) {
+              const cx = x0 + i * DOT_SPACING;
+              const dot = el('circle', { cx, cy: atomsY, r: DOT_R, fill: '#000' });
+              const title = el('title', { text: `atoms: ${cnt}` });
+              dot.appendChild(title);
+              svg.appendChild(dot);
+            }
+          } else {
+            // subtle baseline marker even if zero
+            svg.appendChild(el('circle', { cx: p.x, cy: atomsY, r: 1.5, fill: '#bbb' }));
+          }
+        });
+      };
+
+      const refresh = async () => {
+        const src = sel.value || (MODE === 'attached' ? 'attached' : null);
+        if (!src) return;
+        const peer = peerSel.value || 'self';
+        const ent = entSel.value || '0';
+        const at = (Timeline.cursor != null) ? `&at=${Timeline.cursor}` : '';
+        const url = `/api/harmonizer/tree?source=${encodeURIComponent(src)}&peer=${encodeURIComponent(peer)}&entity=${encodeURIComponent(ent)}${at}`;
+        const g = await fetchJSON(url).catch(()=>({}));
+        draw(g, peer);
+        // Update info text: levels, per-level counts, totals
+        try {
+          const levels = Array.isArray(g.levels) ? g.levels.slice().sort((a,b)=>a-b) : [];
+          const nodes = Array.isArray(g.nodes) ? g.nodes : [];
+          const edges = Array.isArray(g.edges) ? g.edges : [];
+          const per = new Map();
+          nodes.forEach(n => { const l = (n && typeof n.level === 'number') ? n.level : 0; per.set(l, (per.get(l) || 0) + 1); });
+          const perStr = levels.map(l => `${l}:${per.get(l) || 0}`).join(', ');
+          infoBox.textContent = `Levels: ${levels.length} (${perStr}) • Nodes: ${nodes.length} • Edges: ${edges.length}`;
+        } catch { infoBox.textContent = ''; }
+      };
+      goBtn.onclick = refresh;
+      document.addEventListener('timeline-change', refresh);
+      // populate dropdowns
+      const populate = async () => {
+        const src = sel.value || (MODE === 'attached' ? 'attached' : null);
+        if (!src) return;
+        const data = await fetchJSON(`/api/harmonizer/list?source=${encodeURIComponent(src)}`).catch(()=>({ peers:[], entities:[] }));
+        // peers
+        peerSel.innerHTML = '';
+        const addOpt = (s,v) => { const o = el('option', { value: v, text: s }); peerSel.appendChild(o); };
+        addOpt('self','self');
+        (data.peers || []).forEach(p => addOpt(p,p));
+        // entities by name but value=hash
+        entSel.innerHTML = '';
+        (data.entities || []).forEach(e => {
+          const o = el('option', { value: String(e.hash), text: e.name }); entSel.appendChild(o);
+        });
+        refresh();
+      };
+      sel && (sel.onchange = populate);
+      populate();
     } else {
       const src = sel.value || (MODE === 'attached' ? 'attached' : null);
       if (!src) { body.innerHTML = '<div class="muted">Pick a dataset</div>'; return; }
@@ -674,6 +834,7 @@ async function init() {
     add('DB Stats', 'stats');
     add('Replay Files', 'files');
     add('Event Plot', 'plot');
+    add('Harmonizer Tree', 'harm_tree');
     actions.style.position = 'relative';
     actions.appendChild(menu);
   };

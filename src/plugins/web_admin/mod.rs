@@ -22,6 +22,7 @@ use axum::{
 use redb::{ReadTransaction, TableHandle};
 use tokio::net::TcpListener;
 
+use crate::storage_entity::StorageEntity;
 use crate::{KuramotoDb, WriteBatch, WriteOrigin, plugins::Plugin, storage_error::StorageError};
 
 const DEFAULT_REPLAY_CAP: usize = 1024;
@@ -57,12 +58,14 @@ struct InnerState {
     // Per-dataset table name mappings (hash -> name)
     table_names: RwLock<HashMap<String, HashMap<u64, String>>>,
     seq: AtomicU64,
+    // Last UTC day (ms/86400000) when we emitted TableNames mapping in attached mode
+    last_names_day: AtomicU64,
     server_started: RwLock<bool>,
 }
 
 impl WebAdminPlugin {
     pub fn new(cfg: WebAdminConfig) -> Self {
-        let cap = cfg.replay_capacity.max(16);
+        let _cap = cfg.replay_capacity.max(16);
         Self {
             cfg,
             state: Arc::new(InnerState {
@@ -72,6 +75,7 @@ impl WebAdminPlugin {
                 file_index: RwLock::new(HashMap::new()),
                 table_names: RwLock::new(HashMap::new()),
                 seq: AtomicU64::new(0),
+                last_names_day: AtomicU64::new(0),
                 server_started: RwLock::new(false),
             }),
         }
@@ -79,6 +83,24 @@ impl WebAdminPlugin {
 }
 
 // No serde: build JSON strings by hand in handlers
+
+// Helper: does `h` correspond to a known data table (vs an index-only hash)?
+#[inline]
+fn hash_is_data_table(state: &Arc<InnerState>, dataset: &str, h: u64) -> bool {
+    // Prefer dataset-provided name map
+    if let Some(map) = state.table_names.read().unwrap().get(dataset) {
+        if map.contains_key(&h) {
+            return true;
+        }
+    }
+    // Fallback to attached DB registry
+    if let Some(db) = state.db.read().unwrap().as_ref() {
+        if db.resolve_data_table_by_hash(h).is_some() {
+            return true;
+        }
+    }
+    false
+}
 
 #[async_trait]
 impl Plugin for WebAdminPlugin {
@@ -97,7 +119,7 @@ impl Plugin for WebAdminPlugin {
                 let state = self.state.clone();
                 let bind = self.cfg.bind;
                 tokio::spawn(async move {
-                    let app = Router::new()
+                    let mut app = Router::new()
                         .route("/", get(handler_index_html))
                         .route("/static/app.js", get(handler_app_js))
                         .route("/static/styles.css", get(handler_styles_css))
@@ -105,13 +127,19 @@ impl Plugin for WebAdminPlugin {
                         .route("/api/mode", get(handler_mode))
                         .route("/api/stats", get(handler_stats))
                         .route("/api/replay_stats", get(handler_replay_stats))
+                        .route("/api/harmonizer/list", get(handler_harmonizer_list))
                         .route("/api/replay", get(handler_replay))
                         .route("/api/replay/files", get(handler_replay_files))
                         .route("/api/replay/load", get(handler_replay_load))
                         .route(
                             "/api/replay/upload",
                             axum::routing::post(handler_replay_upload),
-                        )
+                        );
+                    #[cfg(feature = "harmonizer")]
+                    {
+                        app = app.route("/api/harmonizer/tree", get(handler_harmonizer_tree));
+                    }
+                    let app = app
                         .layer(DefaultBodyLimit::max(10 * 1024 * 1024))
                         .with_state(state);
                     let listener = tokio::net::TcpListener::bind(bind)
@@ -147,7 +175,31 @@ impl Plugin for WebAdminPlugin {
         // Convert batch to a ReplayEvent using the same format as the replay plugin
         let now = db.get_clock().now();
         let id = self.state.seq.fetch_add(1, Ordering::Relaxed);
-        let batch = crate::plugins::replay::ReplayPlugin::map_batch_to_log(batch);
+        let mut batch = crate::plugins::replay::ReplayPlugin::map_batch_to_log(batch);
+        // Also emit a TableNames mapping at startup and at most once per day, so the UI can
+        // resolve entity names in attached mode (parity with ReplayPlugin behavior).
+        const DAY_MS: u64 = 86_400_000;
+        let day = now / DAY_MS;
+        let mut need_names = id == 0;
+        let prev = self.state.last_names_day.load(Ordering::Relaxed);
+        if prev != day {
+            need_names = true;
+            self.state.last_names_day.store(day, Ordering::Relaxed);
+        }
+        if need_names {
+            // Compute mapping of data table hash -> human-readable table name
+            let (data_tables, _index_tables) = db.list_registered_tables();
+            let mut mappings = Vec::new();
+            for t in &data_tables {
+                let h = crate::tables::TableHash::from(*t).hash();
+                if let Some(def) = db.resolve_data_table_by_hash(h) {
+                    mappings.push((h, def.name().to_string()));
+                }
+            }
+            if !mappings.is_empty() {
+                batch.push(crate::plugins::replay::LogWriteRequest::TableNames { mappings });
+            }
+        }
         let id_bytes = crate::plugins::self_identity::SelfIdentity::get_peer_id(db).await?;
         let mut peer_id = [0u8; 16];
         peer_id.copy_from_slice(id_bytes.as_bytes());
@@ -198,6 +250,608 @@ async fn handler_styles_css() -> impl IntoResponse {
         include_str!("./static/styles.css"),
     )
         .into_response()
+}
+
+// List peers and entities (by name + hash) for a dataset
+#[axum::debug_handler]
+async fn handler_harmonizer_list(
+    State(state): State<Arc<InnerState>>,
+    RawQuery(q): RawQuery,
+) -> impl IntoResponse {
+    let mut source = String::new();
+    if let Some(qs) = q {
+        for pair in qs.split('&') {
+            let mut it = pair.splitn(2, '=');
+            if let (Some(k), Some(v)) = (it.next(), it.next()) {
+                if k == "source" {
+                    source = urlencoding::decode(v)
+                        .unwrap_or_else(|_| v.into())
+                        .into_owned();
+                }
+            }
+        }
+    }
+    if source.is_empty() {
+        println!("[list] missing source param");
+        return (
+            [("Content-Type", "application/json")],
+            String::from("{\"peers\":[],\"entities\":[]}"),
+        );
+    }
+    // Ensure dataset is loaded
+    let need_load = {
+        let d = state.datasets.read().unwrap();
+        !d.contains_key(&source)
+    };
+    if need_load {
+        let path = std::path::Path::new("exports").join(&source);
+        if let Ok(bytes) = std::fs::read(path) {
+            if let Ok((events, _)) = bincode::decode_from_slice::<
+                Vec<crate::plugins::replay::ReplayEvent>,
+                _,
+            >(&bytes, bincode::config::standard())
+            {
+                let mut ds = state.datasets.write().unwrap();
+                ds.insert(source.clone(), events);
+                println!("[list] loaded dataset '{}'", source);
+            }
+        }
+    }
+    // scoped read; the guard is dropped at block end
+    let events = {
+        let d = state.datasets.read().unwrap();
+        d.get(&source).cloned().unwrap_or_default()
+    };
+    println!("[list] events in dataset '{}': {}", source, events.len());
+    // Ensure table_names mapping is available for this dataset (prefer dataset-provided TableNames,
+    // but in attached mode fall back to attached DB registry as well).
+    if !events.is_empty() {
+        let has_map = state.table_names.read().unwrap().contains_key(&source);
+        if !has_map {
+            let mut m = HashMap::new();
+            // 1) From embedded TableNames records in the dataset
+            for e in events.iter() {
+                for it in e.batch.iter() {
+                    if let crate::plugins::replay::LogWriteRequest::TableNames { mappings } = it {
+                        for (h, name) in mappings.iter() {
+                            m.insert(*h, name.clone());
+                        }
+                    }
+                }
+            }
+            // 2) If still empty and an attached DB exists, derive from registered data tables
+            if m.is_empty() {
+                if let Some(db) = state.db.read().unwrap().as_ref() {
+                    let (data_tables, _index_tables) = db.list_registered_tables();
+                    for t in &data_tables {
+                        let h = crate::tables::TableHash::from(*t).hash();
+                        if let Some(def) = db.resolve_data_table_by_hash(h) {
+                            m.insert(h, def.name().to_string());
+                        }
+                    }
+                }
+            }
+            if !m.is_empty() {
+                state.table_names.write().unwrap().insert(source.clone(), m);
+                println!("[list] built table_names mapping for '{}'", source);
+            }
+        }
+    }
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut peers: BTreeSet<String> = BTreeSet::new();
+    // Entities present in availability rows (by first_dim hash)
+    let mut ent_hashes: BTreeSet<u64> = BTreeSet::new();
+    // Table names mapping if present
+    let name_map: BTreeMap<u64, String> = {
+        let m = state.table_names.read().unwrap();
+        m.get(&source)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect()
+    };
+    // Derive peers/entities from replay events first
+    {
+        #[cfg(feature = "harmonizer")]
+        let avail_th =
+            crate::tables::TableHash::from(crate::plugins::harmonizer::AVAILABILITIES_TABLE).hash();
+        for e in events.iter() {
+            peers.insert(hex::encode(e.peer_id));
+            for it in e.batch.iter() {
+                #[cfg(feature = "harmonizer")]
+                match it {
+                    crate::plugins::replay::LogWriteRequest::HarmonizerSnapshotChunk {
+                        availabilities,
+                        ..
+                    } => {
+                        for a in availabilities {
+                            peers.insert(hex::encode(a.peer_id));
+                            for h in &a.dims {
+                                if hash_is_data_table(&state, &source, *h) {
+                                    ent_hashes.insert(*h);
+                                }
+                            }
+                        }
+                    }
+                    crate::plugins::replay::LogWriteRequest::Put {
+                        data_table_hash,
+                        value,
+                        ..
+                    } if *data_table_hash == avail_th => {
+                        if let Ok(a) =
+                            crate::plugins::harmonizer::Availability::load_and_migrate(value)
+                        {
+                            peers.insert(hex::encode(a.peer_id.as_bytes()));
+                            for d in a.range.dims().iter() {
+                                let h = d.hash;
+                                if hash_is_data_table(&state, &source, h) {
+                                    ent_hashes.insert(h);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                // Always available, even without the `harmonizer` feature: use lightweight
+                // HarmonizerContext items to discover peers and entities present in the log.
+                if let crate::plugins::replay::LogWriteRequest::HarmonizerContext { peer_id, first_dim_hash, .. } = it {
+                    peers.insert(hex::encode(peer_id));
+                    if hash_is_data_table(&state, &source, *first_dim_hash) {
+                        ent_hashes.insert(*first_dim_hash);
+                    }
+                }
+                match it {
+                    crate::plugins::replay::LogWriteRequest::PeerAdded { peer_id } => {
+                        peers.insert(hex::encode(peer_id));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // In attached mode, also look directly at the live DB to discover peers/entities.
+    // IMPORTANT: run the non-Send async DB scan on a blocking thread and block_on there.
+    // The handler then awaits a Send JoinHandle, satisfying axum's Handler bound.
+    #[cfg(feature = "harmonizer")]
+    if source == "attached" {
+        let db_opt = { state.db.read().unwrap().clone() };
+        if let Some(db) = db_opt {
+            let handle = tokio::runtime::Handle::current();
+            let rows = tokio::task::spawn_blocking(move || {
+                handle.block_on(async move {
+                    db.range_by_pk::<crate::plugins::harmonizer::Availability>(
+                        &[0u8; 16],
+                        &[0xFFu8; 16],
+                        None,
+                    )
+                    .await
+                })
+            })
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default();
+
+            for a in rows.iter() {
+                peers.insert(hex::encode(a.peer_id.as_bytes()));
+                for d in a.range.dims().iter() {
+                    let h = d.hash;
+                    if hash_is_data_table(&state, &source, h) {
+                        ent_hashes.insert(h);
+                    }
+                }
+            }
+        }
+    }
+
+    // Materialize (hash,name) pairs, falling back to hex-hash string when name unknown
+    let mut ents: Vec<(u64, String)> = ent_hashes
+        .into_iter()
+        .map(|h| {
+            (
+                h,
+                name_map
+                    .get(&h)
+                    .cloned()
+                    .unwrap_or_else(|| format!("0x{:016x}", h)),
+            )
+        })
+        .collect();
+    ents.sort_by(|a, b| a.1.cmp(&b.1));
+    println!(
+        "[list] peers={} entities={} (resolved names may be missing if no TableNames present)",
+        peers.len(),
+        ents.len()
+    );
+    // JSON build
+    let mut body = String::from("{\"peers\":[");
+    let mut first = true;
+    for p in peers.iter() {
+        if !first {
+            body.push(',');
+        }
+        first = false;
+        body.push_str(&format!("\"{}\"", p));
+    }
+    body.push_str("],\"entities\":[");
+    first = true;
+    for (h, n) in ents.iter() {
+        if !first {
+            body.push(',');
+        }
+        first = false;
+        // Emit hash as a string to avoid JS precision loss for u64
+        body.push_str(&format!("{{\"hash\":\"{}\",\"name\":\"{}\"}}", h, n));
+    }
+    body.push_str("]}");
+    ([("Content-Type", "application/json")], body)
+}
+
+#[cfg(feature = "harmonizer")]
+#[axum::debug_handler]
+async fn handler_harmonizer_tree(
+    State(state): State<Arc<InnerState>>,
+    RawQuery(q): RawQuery,
+) -> impl IntoResponse {
+    use crate::storage_entity::StorageEntity;
+    // Parse query
+    let mut source = String::new();
+    let mut peer_hex = String::new();
+    let mut entity_hash: u64 = 0;
+    let mut at: u64 = u64::MAX;
+    if let Some(qs) = q {
+        for pair in qs.split('&') {
+            let mut it = pair.splitn(2, '=');
+            if let (Some(k), Some(v)) = (it.next(), it.next()) {
+                let v = urlencoding::decode(v)
+                    .unwrap_or_else(|_| v.into())
+                    .into_owned();
+                match k {
+                    "source" => source = v,
+                    "peer" => peer_hex = v,
+                    "entity" => {
+                        let _ = v.parse::<u64>().map(|n| entity_hash = n);
+                    }
+                    "at" => {
+                        let _ = v.parse::<u64>().map(|n| at = n);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    if source.is_empty() {
+        println!("[tree] missing source param");
+        return ([("Content-Type", "application/json")], String::from("{}"));
+    }
+    // Resolve peer bytes
+    let mut peer_id_bytes = [0u8; 16];
+    if peer_hex != "self" {
+        if let Ok(bytes) = hex::decode(peer_hex.trim_start_matches("0x")) {
+            if bytes.len() == 16 {
+                peer_id_bytes.copy_from_slice(&bytes);
+            }
+        }
+    }
+
+    // Load dataset
+    let mut events: Vec<crate::plugins::replay::ReplayEvent> = Vec::new();
+    {
+        let need = {
+            let d = state.datasets.read().unwrap();
+            !d.contains_key(&source)
+        };
+        if need {
+            let path = std::path::Path::new("exports").join(&source);
+            if let Ok(bytes) = std::fs::read(path) {
+                if let Ok((ev, _)) = bincode::decode_from_slice::<
+                    Vec<crate::plugins::replay::ReplayEvent>,
+                    _,
+                >(&bytes, bincode::config::standard())
+                {
+                    let mut ds = state.datasets.write().unwrap();
+                    ds.insert(source.clone(), ev);
+                }
+            }
+        }
+        let d = state.datasets.read().unwrap();
+        if let Some(ev) = d.get(&source) {
+            events = ev.clone();
+        }
+    }
+    println!("[tree] source='{}' peer='{}' entity={} at={} events={}", source, peer_hex, entity_hash, at, events.len());
+
+    // Table hashes
+    let avail_th =
+        crate::tables::TableHash::from(crate::plugins::harmonizer::AVAILABILITIES_TABLE).hash();
+    let child_th =
+        crate::tables::TableHash::from(crate::plugins::harmonizer::AVAIL_CHILDREN_TBL).hash();
+    println!("[tree] table hashes: avail=0x{:016x} child=0x{:016x}", avail_th, child_th);
+
+    // Find snapshot
+    let mut snap_ts: Option<u64> = None;
+    for e in events.iter().filter(|e| e.ts <= at).rev() {
+        for it in e.batch.iter() {
+            if let crate::plugins::replay::LogWriteRequest::HarmonizerSnapshotStart {
+                peer_id,
+                first_dim_hash,
+                ..
+            } = it
+            {
+                if (peer_hex == "self" || *peer_id == peer_id_bytes)
+                    && *first_dim_hash == entity_hash
+                {
+                    snap_ts = Some(e.ts);
+                    println!("[tree] found snapshot at ts={} matching peer/entity", e.ts);
+                    break;
+                }
+            }
+        }
+        if snap_ts.is_some() {
+            break;
+        }
+    }
+
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut nodes: BTreeSet<(String, u16, bool, Vec<u64>, Vec<Vec<u8>>, Vec<Vec<u8>>)> =
+        BTreeSet::new();
+    let mut edges: BTreeSet<(String, String, u32)> = BTreeSet::new();
+    // Accumulate data atoms seen in replay (by data_table_hash -> set of PKs)
+    let mut atoms: BTreeMap<u64, BTreeSet<Vec<u8>>> = BTreeMap::new();
+
+    if let Some(ts) = snap_ts {
+        for e in events.iter().filter(|e| e.ts == ts) {
+            for it in e.batch.iter() {
+                if let crate::plugins::replay::LogWriteRequest::HarmonizerSnapshotChunk {
+                    availabilities,
+                    children,
+                    ..
+                } = it
+                {
+                    println!("[tree] applying snapshot chunk: avails={} children={}", availabilities.len(), children.len());
+                    for a in availabilities.iter() {
+                        nodes.insert((
+                            hex::encode(a.availability_id),
+                            a.level,
+                            a.complete,
+                            a.dims.clone(),
+                            a.mins.clone(),
+                            a.maxs.clone(),
+                        ));
+                    }
+                    for c in children.iter() {
+                        edges.insert((hex::encode(c.parent), hex::encode(c.child), c.ordinal));
+                    }
+                }
+                // Also accumulate any non-harmonizer puts/deletes in the same batch
+                else if let crate::plugins::replay::LogWriteRequest::Put { data_table_hash, key, .. } = it {
+                    if *data_table_hash != avail_th && *data_table_hash != child_th {
+                        atoms.entry(*data_table_hash).or_default().insert(key.clone());
+                    }
+                } else if let crate::plugins::replay::LogWriteRequest::Delete { data_table_hash, key, .. } = it {
+                    if *data_table_hash != avail_th && *data_table_hash != child_th {
+                        if let Some(set) = atoms.get_mut(data_table_hash) { set.remove(key); }
+                    }
+                }
+            }
+        }
+    }
+
+    for e in events
+        .iter()
+        .filter(|e| e.ts <= at && snap_ts.map_or(true, |t| e.ts > t))
+    {
+        let mut counted_put_avail = 0usize;
+        let mut counted_put_child = 0usize;
+        let mut counted_del_avail = 0usize;
+        let mut counted_del_child = 0usize;
+        for it in e.batch.iter() {
+            match it {
+                crate::plugins::replay::LogWriteRequest::Put {
+                    data_table_hash,
+                    value,
+                    ..
+                } if *data_table_hash == avail_th => {
+                    match crate::plugins::harmonizer::Availability::load_and_migrate(value) {
+                        Ok(a) => {
+                            counted_put_avail += 1;
+                            let dims: Vec<u64> = a.range.dims().iter().map(|d| d.hash).collect();
+                            let first = dims.first().copied().unwrap_or(0);
+                            let peer_ok = if peer_hex == "self" {
+                                true
+                            } else {
+                                *a.peer_id.as_bytes() == peer_id_bytes
+                            };
+                            let match_ent = first == entity_hash;
+                            if !match_ent || !peer_ok {
+                                println!(
+                                    "[tree] skip avail id={} lvl={} peer={} dims={:?} first=0x{:016x} match_ent={} peer_ok={}",
+                                    hex::encode(a.key.as_bytes()),
+                                    a.level,
+                                    hex::encode(a.peer_id.as_bytes()),
+                                    dims,
+                                    first,
+                                    match_ent,
+                                    peer_ok
+                                );
+                            }
+                            if peer_ok && match_ent {
+                                nodes.insert((
+                                    hex::encode(a.key.as_bytes()),
+                                    a.level,
+                                    a.complete,
+                                    dims,
+                                    a.range.mins().to_vec(),
+                                    a.range.maxs().to_vec(),
+                                ));
+                            }
+                        }
+                        Err(err) => {
+                            println!("[tree] WARN: failed to decode Availability: {}", err);
+                        }
+                    }
+                }
+                crate::plugins::replay::LogWriteRequest::Delete {
+                    data_table_hash,
+                    key,
+                    ..
+                } if *data_table_hash == avail_th => {
+                    counted_del_avail += 1;
+                    if key.len() == 16 {
+                        let idh = hex::encode(key);
+                        nodes.retain(|(id, ..)| id.as_str() != idh);
+                    }
+                }
+                crate::plugins::replay::LogWriteRequest::Put {
+                    data_table_hash,
+                    value,
+                    ..
+                } if *data_table_hash == child_th => {
+                    match crate::plugins::harmonizer::Child::load_and_migrate(value) {
+                        Ok(c) => {
+                            counted_put_child += 1;
+                        edges.insert((
+                            hex::encode(c.parent.as_bytes()),
+                            hex::encode(c.child_id.as_bytes()),
+                            c.ordinal,
+                        ));
+                        }
+                        Err(err) => {
+                            println!("[tree] WARN: failed to decode Child: {}", err);
+                        }
+                    }
+                }
+                crate::plugins::replay::LogWriteRequest::Delete {
+                    data_table_hash,
+                    key,
+                    ..
+                } if *data_table_hash == child_th => {
+                    counted_del_child += 1;
+                    if key.len() >= 20 {
+                        let pid = hex::encode(&key[..16]);
+                        let ord = u32::from_le_bytes([key[16], key[17], key[18], key[19]]);
+                        edges.retain(|(p, _c, o)| !(p == &pid && *o == ord));
+                    }
+                }
+                // Non-harmonizer tables: track atoms by table hash
+                crate::plugins::replay::LogWriteRequest::Put {
+                    data_table_hash,
+                    key,
+                    ..
+                } if *data_table_hash != avail_th && *data_table_hash != child_th => {
+                    atoms.entry(*data_table_hash).or_default().insert(key.clone());
+                }
+                crate::plugins::replay::LogWriteRequest::Delete {
+                    data_table_hash,
+                    key,
+                    ..
+                } if *data_table_hash != avail_th && *data_table_hash != child_th => {
+                    if let Some(set) = atoms.get_mut(data_table_hash) { set.remove(key); }
+                }
+                _ => {}
+            }
+        }
+        if counted_put_avail + counted_put_child + counted_del_avail + counted_del_child > 0 {
+            println!(
+                "[tree] event ts={} applied: put_avail={} put_child={} del_avail={} del_child={}",
+                e.ts, counted_put_avail, counted_put_child, counted_del_avail, counted_del_child
+            );
+        }
+    }
+
+    // Levels
+    let mut levels: BTreeSet<u16> = BTreeSet::new();
+    for (_id, lvl, _c, _d, _mi, _ma) in nodes.iter() {
+        levels.insert(*lvl);
+    }
+    let mut levels_v: Vec<u16> = levels.into_iter().collect();
+    levels_v.sort_unstable();
+
+    // Compute per-leaf atom counts by matching data-table axis and PK ranges
+    let mut atoms_per_leaf: Vec<(String, u64)> = Vec::new();
+    for (id, lvl, _c, dims, mins, maxs) in nodes.iter() {
+        if *lvl != 0 { continue; }
+        let mut cnt: u64 = 0;
+        let m = std::cmp::min(dims.len(), std::cmp::min(mins.len(), maxs.len()));
+        for i in 0..m {
+            let h = dims[i];
+            if let Some(pks) = atoms.get(&h) {
+                let lo = &mins[i];
+                let hi = &maxs[i];
+                for pk in pks.iter() {
+                    if (pk.as_slice() >= lo.as_slice()) && (pk.as_slice() < hi.as_slice()) {
+                        cnt += 1;
+                    }
+                }
+            }
+        }
+        atoms_per_leaf.push((id.clone(), cnt));
+    }
+
+    // JSON
+    let mut body = String::from("{\"levels\":[");
+    for (i, l) in levels_v.iter().enumerate() {
+        if i > 0 {
+            body.push(',');
+        }
+        body.push_str(&l.to_string());
+    }
+    body.push_str("],\"nodes\":[");
+    let mut first = true;
+    for (id, lvl, complete, dims, mins, maxs) in nodes.iter() {
+        if !first {
+            body.push(',');
+        }
+        first = false;
+        let dims_s = dims
+            .iter()
+            .map(|h| h.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mins_s = mins
+            .iter()
+            .map(|v| format!("\"{}\"", hex::encode(v)))
+            .collect::<Vec<_>>()
+            .join(",");
+        let maxs_s = maxs
+            .iter()
+            .map(|v| format!("\"{}\"", hex::encode(v)))
+            .collect::<Vec<_>>()
+            .join(",");
+        body.push_str(&format!("{{\"id\":\"{}\",\"level\":{},\"complete\":{},\"dims\":[{}],\"mins\":[{}],\"maxs\":[{}]}}", id, lvl, if *complete {"true"} else {"false"}, dims_s, mins_s, maxs_s));
+    }
+    body.push_str("],\"edges\":[");
+    first = true;
+    for (p, c, o) in edges.iter() {
+        if !first {
+            body.push(',');
+        }
+        first = false;
+        body.push_str(&format!(
+            "{{\"parent\":\"{}\",\"child\":\"{}\",\"ord\":{}}}",
+            p, c, o
+        ));
+    }
+    body.push_str("]");
+    // Atoms as an array of {leaf, count}
+    body.push_str(",\"atoms\":[");
+    let mut fa = true;
+    for (leaf, cnt) in atoms_per_leaf.iter() {
+        if !fa { body.push(','); }
+        fa = false;
+        body.push_str(&format!("{{\"leaf\":\"{}\",\"count\":{}}}", leaf, cnt));
+    }
+    body.push_str("]}");
+    println!(
+        "[tree] done: levels={} nodes={} edges={} (peer='{}' entity={})",
+        levels_v.len(),
+        nodes.len(),
+        edges.len(),
+        peer_hex,
+        entity_hash
+    );
+    ([("Content-Type", "application/json")], body)
 }
 
 async fn handler_health() -> impl IntoResponse {
@@ -291,7 +945,11 @@ async fn handler_replay(
     if need_load && src != "attached" {
         let path = std::path::Path::new("exports").join(&src);
         if let Ok(bytes) = std::fs::read(path) {
-            if let Ok((events, _)) = bincode::decode_from_slice::<Vec<crate::plugins::replay::ReplayEvent>, _>(&bytes, bincode::config::standard()) {
+            if let Ok((events, _)) = bincode::decode_from_slice::<
+                Vec<crate::plugins::replay::ReplayEvent>,
+                _,
+            >(&bytes, bincode::config::standard())
+            {
                 {
                     let mut ds = state.datasets.write().unwrap();
                     ds.insert(src.clone(), events.clone());
@@ -300,8 +958,11 @@ async fn handler_replay(
                 let mut m = HashMap::new();
                 for e in events.iter() {
                     for it in e.batch.iter() {
-                        if let crate::plugins::replay::LogWriteRequest::TableNames { mappings } = it {
-                            for (h, name) in mappings.iter() { m.insert(*h, name.clone()); }
+                        if let crate::plugins::replay::LogWriteRequest::TableNames { mappings } = it
+                        {
+                            for (h, name) in mappings.iter() {
+                                m.insert(*h, name.clone());
+                            }
                         }
                     }
                 }
@@ -311,15 +972,25 @@ async fn handler_replay(
             }
         }
     }
-    let d = state.datasets.read().unwrap();
-    let mut events = d.get(&src).cloned().unwrap_or_default();
+    let events = {
+        let d = state.datasets.read().unwrap();
+        d.get(&src).cloned().unwrap_or_default()
+    };
+
     let n = events.len();
     let end = n.saturating_sub(offset);
     let start = end.saturating_sub(limit);
-    let part: Vec<_> = if start < end { events[start..end].to_vec() } else { Vec::new() };
+    let part: Vec<_> = if start < end {
+        events[start..end].to_vec()
+    } else {
+        Vec::new()
+    };
     let mut first = true;
     let mut body = String::new();
-    body.push_str(&format!("{{\"total\":{},\"offset\":{},\"limit\":{},\"events\":[", n, offset, limit));
+    body.push_str(&format!(
+        "{{\"total\":{},\"offset\":{},\"limit\":{},\"events\":[",
+        n, offset, limit
+    ));
     for e in part.iter() {
         if !first {
             body.push(',');
@@ -332,16 +1003,21 @@ async fn handler_replay(
         let mut tables: Vec<String> = Vec::new();
         for it in e.batch.iter() {
             match it {
-                crate::plugins::replay::LogWriteRequest::Put { data_table_hash, .. } => {
+                crate::plugins::replay::LogWriteRequest::Put {
+                    data_table_hash, ..
+                } => {
                     puts += 1;
                     tables.push(table_label(&state, Some(&src), *data_table_hash));
                 }
-                crate::plugins::replay::LogWriteRequest::Delete { data_table_hash, .. } => {
+                crate::plugins::replay::LogWriteRequest::Delete {
+                    data_table_hash, ..
+                } => {
                     dels += 1;
                     tables.push(table_label(&state, Some(&src), *data_table_hash));
                 }
                 crate::plugins::replay::LogWriteRequest::StatsSnapshot { .. } => {}
                 crate::plugins::replay::LogWriteRequest::TableNames { .. } => {}
+                _ => {}
             }
         }
         tables.sort();
@@ -392,6 +1068,7 @@ fn table_label(state: &InnerState, dataset: Option<&str>, hash: u64) -> String {
     format!("0x{:016x}", hash)
 }
 
+#[axum::debug_handler]
 async fn handler_mode(State(state): State<Arc<InnerState>>) -> impl IntoResponse {
     let m = if state.db.read().unwrap().is_some() {
         "attached"
@@ -404,6 +1081,7 @@ async fn handler_mode(State(state): State<Arc<InnerState>>) -> impl IntoResponse
 
 // Return database stats either from attached DB (if source=attached)
 // or from the latest StatsSnapshot in the given replay dataset.
+#[axum::debug_handler]
 async fn handler_replay_stats(
     State(state): State<Arc<InnerState>>,
     RawQuery(q): RawQuery,
@@ -415,9 +1093,15 @@ async fn handler_replay_stats(
             let mut it = pair.splitn(2, '=');
             if let (Some(k), Some(v)) = (it.next(), it.next()) {
                 if k == "source" {
-                    source = urlencoding::decode(v).unwrap_or_else(|_| v.into()).into_owned();
+                    source = urlencoding::decode(v)
+                        .unwrap_or_else(|_| v.into())
+                        .into_owned();
                 } else if k == "at" {
-                    if let Ok(n) = urlencoding::decode(v).unwrap_or_else(|_| v.into()).into_owned().parse::<u64>() {
+                    if let Ok(n) = urlencoding::decode(v)
+                        .unwrap_or_else(|_| v.into())
+                        .into_owned()
+                        .parse::<u64>()
+                    {
                         at = Some(n);
                     }
                 }
@@ -432,24 +1116,43 @@ async fn handler_replay_stats(
             let (data_tables, index_tables) = db.list_registered_tables();
             let mut total_rows_data: u64 = 0;
             let mut total_rows_index: u64 = 0;
-            for t in &data_tables { if let Ok(c) = db.count_rows_in_table(*t) { total_rows_data += c; } }
-            for t in &index_tables { if let Ok(c) = db.count_rows_in_table(*t) { total_rows_index += c; } }
+            for t in &data_tables {
+                if let Ok(c) = db.count_rows_in_table(*t) {
+                    total_rows_data += c;
+                }
+            }
+            for t in &index_tables {
+                if let Ok(c) = db.count_rows_in_table(*t) {
+                    total_rows_index += c;
+                }
+            }
             let body = format!(
                 "{{\"data_table_count\":{},\"index_table_count\":{},\"total_rows_data\":{},\"total_rows_index\":{}}}",
-                data_tables.len(), index_tables.len(), total_rows_data, total_rows_index
+                data_tables.len(),
+                index_tables.len(),
+                total_rows_data,
+                total_rows_index
             );
             return ([("Content-Type", "application/json")], body).into_response();
         } else {
-            return ([("Content-Type", "application/json")], String::from("{}")).into_response();
+            return ([("Content-Type", "application/json")], String::from("{}"))
+                .into_response();
         }
     }
 
     // ensure dataset is loaded
-    let need_load = { let d = state.datasets.read().unwrap(); !d.contains_key(&source) };
+    let need_load = {
+        let d = state.datasets.read().unwrap();
+        !d.contains_key(&source)
+    };
     if need_load {
         let path = std::path::Path::new("exports").join(&source);
         if let Ok(bytes) = std::fs::read(path) {
-            if let Ok((events, _)) = bincode::decode_from_slice::<Vec<crate::plugins::replay::ReplayEvent>, _>(&bytes, bincode::config::standard()) {
+            if let Ok((events, _)) = bincode::decode_from_slice::<
+                Vec<crate::plugins::replay::ReplayEvent>,
+                _,
+            >(&bytes, bincode::config::standard())
+            {
                 let mut ds = state.datasets.write().unwrap();
                 ds.insert(source.clone(), events);
             }
@@ -466,7 +1169,6 @@ async fn handler_replay_stats(
                         Some(target) => {
                             if ets <= target {
                                 best = Some((stats, ets));
-                                // Found the closest at or before target
                                 break;
                             }
                         }
@@ -477,12 +1179,18 @@ async fn handler_replay_stats(
                     }
                 }
             }
-            if best.is_some() { break; }
+            if best.is_some() {
+                break;
+            }
         }
         if let Some((stats, ts)) = best {
             let body = format!(
                 "{{\"at\":{},\"data_table_count\":{},\"index_table_count\":{},\"total_rows_data\":{},\"total_rows_index\":{}}}",
-                ts, stats.data_table_count, stats.index_table_count, stats.total_rows_data, stats.total_rows_index
+                ts,
+                stats.data_table_count,
+                stats.index_table_count,
+                stats.total_rows_data,
+                stats.total_rows_index
             );
             return ([("Content-Type", "application/json")], body).into_response();
         }
@@ -497,7 +1205,8 @@ async fn handler_replay_files() -> impl IntoResponse {
             if let Ok(ft) = ent.file_type() {
                 if ft.is_file() {
                     let name = ent.file_name().to_string_lossy().to_string();
-                    if name.starts_with("replay_") && name.ends_with(".bin") {
+                    // Accept both legacy replay_*.bin and deterministic *_peer_N.bin files
+                    if name.ends_with(".bin") {
                         out_v.push(name);
                     }
                 }
@@ -517,6 +1226,7 @@ async fn handler_replay_files() -> impl IntoResponse {
     ([("Content-Type", "application/json")], body)
 }
 
+#[axum::debug_handler]
 async fn handler_replay_load(
     State(state): State<Arc<InnerState>>,
     RawQuery(q): RawQuery,
@@ -554,8 +1264,13 @@ async fn handler_replay_load(
                     let mut m = HashMap::new();
                     for e in events.iter() {
                         for it in e.batch.iter() {
-                            if let crate::plugins::replay::LogWriteRequest::TableNames { mappings } = it {
-                                for (h, name) in mappings.iter() { m.insert(*h, name.clone()); }
+                            if let crate::plugins::replay::LogWriteRequest::TableNames {
+                                mappings,
+                            } = it
+                            {
+                                for (h, name) in mappings.iter() {
+                                    m.insert(*h, name.clone());
+                                }
                             }
                         }
                     }
@@ -618,15 +1333,19 @@ pub async fn run_standalone(
         file_index: RwLock::new(HashMap::new()),
         table_names: RwLock::new(HashMap::new()),
         seq: AtomicU64::new(0),
+        last_names_day: AtomicU64::new(0),
         server_started: RwLock::new(true),
     });
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/", get(handler_index_html))
         .route("/static/app.js", get(handler_app_js))
         .route("/static/styles.css", get(handler_styles_css))
         .route("/api/health", get(handler_health))
         .route("/api/mode", get(handler_mode))
         .route("/api/stats", get(handler_stats))
+        // Provide the same listing endpoint in standalone mode so replay files
+        // can populate the peer/entity dropdowns without an attached DB.
+        .route("/api/harmonizer/list", get(handler_harmonizer_list))
         .route("/api/replay_stats", get(handler_replay_stats))
         .route("/api/replay", get(handler_replay))
         .route("/api/replay/files", get(handler_replay_files))
@@ -634,8 +1353,12 @@ pub async fn run_standalone(
         .route(
             "/api/replay/upload",
             axum::routing::post(handler_replay_upload),
-        )
-        .with_state(state);
+        );
+    #[cfg(feature = "harmonizer")]
+    {
+        app = app.route("/api/harmonizer/tree", get(handler_harmonizer_tree));
+    }
+    let app = app.with_state(state);
 
     let listener = TcpListener::bind(bind).await?;
     println!("web_admin listening on http://{}", bind);

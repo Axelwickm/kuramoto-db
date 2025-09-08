@@ -57,6 +57,34 @@ pub enum LogWriteRequest {
     TableNames {
         mappings: Vec<(u64, String)>,
     },
+    // Lightweight metadata to tag a batch for easier filtering
+    HarmonizerContext {
+        // 0 = own-tree delta, 1 = mirror-tree delta, 2 = snapshot
+        kind: u8,
+        peer_id: [u8; 16],
+        first_dim_hash: u64,
+    },
+    // Snapshot envelope for harmonizer trees (chunked to handle large states)
+    HarmonizerSnapshotStart {
+        peer_id: [u8; 16],
+        first_dim_hash: u64,
+        total_avails: u64,
+        total_edges: u64,
+        version: u32,
+    },
+    HarmonizerSnapshotChunk {
+        chunk_no: u32,
+        availabilities: Vec<SnapshotAvailability>,
+        children: Vec<SnapshotChild>,
+    },
+    HarmonizerSnapshotEnd {
+        chunks: u32,
+        checksum: u64,
+    },
+    // Harmonizer topology hints: a peer was added to the local node
+    PeerAdded {
+        peer_id: [u8; 16],
+    },
 }
 
 #[derive(Clone, Debug, Encode, Decode)]
@@ -106,10 +134,12 @@ const REPLAY_PLUGIN_ID: u16 = fnv1a_16("replay");
 #[derive(Default)]
 pub struct ReplayPlugin {
     seq: AtomicU64,
+    // Last day (UTC, ms/86400000) when we emitted TableNames mapping
+    last_names_day: AtomicU64,
 }
 
 impl ReplayPlugin {
-    pub fn new() -> Self { Self { seq: AtomicU64::new(0) } }
+    pub fn new() -> Self { Self { seq: AtomicU64::new(0), last_names_day: AtomicU64::new(0) } }
 
     pub fn map_batch_to_log(batch: &WriteBatch) -> Vec<LogWriteRequest> {
         batch
@@ -181,6 +211,70 @@ impl ReplayEvent {
     pub fn items_count(&self) -> usize { self.batch.len() }
 }
 
+// ============ Snapshot row shapes (plugin-agnostic) ============
+
+#[derive(Clone, Debug, Encode, Decode)]
+pub struct SnapshotAvailability {
+    pub availability_id: [u8; 16],
+    pub peer_id: [u8; 16],
+    pub level: u16,
+    pub complete: bool,
+    pub dims: Vec<u64>,
+    pub mins: Vec<Vec<u8>>,
+    pub maxs: Vec<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, Encode, Decode)]
+pub struct SnapshotChild {
+    pub parent: [u8; 16],
+    pub ordinal: u32,
+    pub child: [u8; 16],
+}
+
+// ============ Public helper to emit custom replay events ============
+
+static CUSTOM_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Emit a custom replay event composed of the provided log items. This writes a single
+/// `ReplayEvent` row to the replay table; it does not mutate any domain tables.
+///
+/// `plugin_tag` should be a 16-bit identifier (e.g., `fnv1a_16("harmonizer")`).
+pub async fn emit_custom(
+    db: &KuramotoDb,
+    plugin_tag: u16,
+    items: Vec<LogWriteRequest>,
+) -> Result<(), StorageError> {
+    // Build a reasonably-unique id from clock + local seq (monotonic across this process).
+    let now = db.get_clock().now();
+    let seq = CUSTOM_SEQ.fetch_add(1, Ordering::Relaxed) & 0xFFFF;
+    let id = (now << 16) | seq;
+
+    // Resolve peer id once
+    let id_bytes = crate::plugins::self_identity::SelfIdentity::get_peer_id(db).await?;
+    let mut peer_id = [0u8; 16];
+    peer_id.copy_from_slice(id_bytes.as_bytes());
+
+    // Persist event under the Replay plugin origin so the normal after_write doesn’t re-log it.
+    let ev = ReplayEvent {
+        id,
+        ts: now,
+        origin: plugin_tag,
+        peer_id,
+        batch: items,
+    };
+    // Best-effort visibility for debugging: print when a custom replay event is emitted.
+    // Keep this lightweight and unconditional; users can filter logs by origin code.
+    tracing::info!(
+        target: "replay",
+        "emit_custom: origin=0x{:04x} items={}",
+        plugin_tag,
+        ev.batch.len()
+    );
+    // Ensure table exists and write directly
+    let _ = db.create_table_and_indexes::<ReplayEvent>();
+    db.put_with_origin::<ReplayEvent>(ev, WriteOrigin::Plugin(REPLAY_PLUGIN_ID)).await
+}
+
 #[async_trait]
 impl Plugin for ReplayPlugin {
     fn attach_db(&self, db: Arc<KuramotoDb>) {
@@ -213,15 +307,74 @@ impl Plugin for ReplayPlugin {
         let id_bytes = crate::plugins::self_identity::SelfIdentity::get_peer_id(db).await?;
         let mut peer_id = [0u8; 16];
         peer_id.copy_from_slice(id_bytes.as_bytes());
-        // Map batch and maybe append periodic snapshots/metadata
+        // Map batch and append periodic metadata
         let mut batch = Self::map_batch_to_log(applied);
         const SNAPSHOT_EVERY: u64 = 100;
         if id % SNAPSHOT_EVERY == 0 {
             let stats = Self::compute_db_stats(db);
             batch.push(LogWriteRequest::StatsSnapshot { stats });
-            let mappings = Self::compute_table_names(db);
-            if !mappings.is_empty() {
+        }
+        // Emit TableNames at startup (id==0) and at most once per day thereafter.
+        const DAY_MS: u64 = 86_400_000;
+        let day = now / DAY_MS;
+        let mut need_names = id == 0;
+        let prev = self.last_names_day.load(Ordering::Relaxed);
+        if prev != day {
+            need_names = true;
+            self.last_names_day.store(day, Ordering::Relaxed);
+        }
+        if need_names {
+            use std::collections::HashMap;
+            let mut map: HashMap<u64, String> = HashMap::new();
+            // 1) From DB registry (tables explicitly created)
+            for (h, name) in Self::compute_table_names(db).into_iter() {
+                map.entry(h).or_insert(name);
+            }
+            // 2) From this batch's table defs (covers lazily-created tables like self_identity)
+            for req in applied.iter() {
+                match req {
+                    WriteRequest::Put { data_table, .. } | WriteRequest::Delete { data_table, .. } => {
+                        let h = crate::tables::TableHash::from(*data_table).hash();
+                        map.entry(h).or_insert_with(|| data_table.name().to_string());
+                    }
+                }
+            }
+            if !map.is_empty() {
+                let mappings: Vec<(u64, String)> = map.into_iter().collect();
                 batch.push(LogWriteRequest::TableNames { mappings });
+            }
+        }
+
+        // Optional debug: summarize harmonizer-related writes captured in this event
+        #[cfg(feature = "harmonizer")]
+        {
+            use crate::tables::TableHash as TH;
+            let avail_h = TH::from(crate::plugins::harmonizer::AVAILABILITIES_TABLE).hash();
+            let child_h = TH::from(crate::plugins::harmonizer::AVAIL_CHILDREN_TBL).hash();
+            let mut puts_avail = 0usize;
+            let mut puts_child = 0usize;
+            let mut dels_avail = 0usize;
+            let mut dels_child = 0usize;
+            for it in applied.iter() {
+                match it {
+                    WriteRequest::Put { data_table, .. } => {
+                        let h = TH::from(*data_table).hash();
+                        if h == avail_h { puts_avail += 1; }
+                        if h == child_h { puts_child += 1; }
+                    }
+                    WriteRequest::Delete { data_table, .. } => {
+                        let h = TH::from(*data_table).hash();
+                        if h == avail_h { dels_avail += 1; }
+                        if h == child_h { dels_child += 1; }
+                    }
+                }
+            }
+            if puts_avail + puts_child + dels_avail + dels_child > 0 {
+                println!(
+                    "[replay] captured harmonizer writes: avail(+{}) child(+{}) avail(-{}) child(-{}) origin={}",
+                    puts_avail, puts_child, dels_avail, dels_child,
+                    match origin { WriteOrigin::Plugin(id) => format!("Plugin(0x{:04x})", id), WriteOrigin::LocalCommit => "LocalCommit".into(), WriteOrigin::Completer => "Completer".into(), WriteOrigin::RemoteIngest => "RemoteIngest".into() }
+                );
             }
         }
 

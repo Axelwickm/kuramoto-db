@@ -29,6 +29,7 @@ use crate::plugins::harmonizer::{
         UpdateResponse, UpdateWithAttestation, register_harmonizer_protocol,
     },
 };
+use crate::plugins::replay;
 use crate::plugins::{
     communication::router::Router,
     harmonizer::availability::{AVAILABILITIES_META_TABLE, AVAILABILITIES_TABLE, Availability},
@@ -117,6 +118,21 @@ impl Harmonizer {
 
     pub async fn add_peer(&self, p: PeerId) {
         self.peers.write().await.push(p);
+        // Log peer addition into replay (if DB is attached), so Web UI in file mode can discover peers.
+        if let Some(dbw) = self.db.get() {
+            if let Some(db) = dbw.upgrade() {
+                let mut pid = [0u8; 16];
+                pid.copy_from_slice(p.as_bytes());
+                let _ = crate::plugins::replay::emit_custom(
+                    &db,
+                    crate::plugins::fnv1a_16("harmonizer"),
+                    vec![crate::plugins::replay::LogWriteRequest::PeerAdded { peer_id: pid }],
+                )
+                .await;
+                tracing::info!(target: "harmonizer", "replay: PeerAdded peer={:02x?}", pid);
+                println!("[harmonizer] replay PeerAdded peer={:02x?}", pid);
+            }
+        }
     }
 
     pub fn peers_handle(&self) -> Arc<tokio::sync::RwLock<Vec<PeerId>>> {
@@ -1195,6 +1211,40 @@ impl Plugin for Harmonizer {
                             });
                         }
 
+                        // Emit a lightweight context tag into the replay log for easier reconstruction.
+                        // kind: 0 = own-tree delta (LocalCommit); 1 = mirror-tree delta (RemoteIngest/Completer)
+                        let kind: u8 = match origin {
+                            WriteOrigin::LocalCommit => 0,
+                            WriteOrigin::RemoteIngest | WriteOrigin::Completer => 1,
+                            WriteOrigin::Plugin(_) => 0,
+                        };
+                        let mut pidb = [0u8; 16];
+                        pidb.copy_from_slice(peer_id.as_bytes());
+                        let first_dim = parent.range.dims().first().map(|d| d.hash()).unwrap_or(0u64);
+                        let _ = replay::emit_custom(
+                            db,
+                            crate::plugins::fnv1a_16("harmonizer"),
+                            vec![crate::plugins::replay::LogWriteRequest::HarmonizerContext {
+                                kind,
+                                peer_id: pidb,
+                                first_dim_hash: first_dim,
+                            }],
+                        )
+                        .await;
+                        tracing::info!(
+                            target: "harmonizer",
+                            "replay: HarmonizerContext kind={} peer={:02x?} entity=0x{:016x}",
+                            kind,
+                            pidb,
+                            first_dim
+                        );
+                        println!(
+                            "[harmonizer] replay HarmonizerContext kind={} peer={:02x?} entity=0x{:016x}",
+                            kind,
+                            pidb,
+                            first_dim
+                        );
+
                         // Track changed availability after optimization
                         {
                             let mut set = self.changed_after_opt.write().await;
@@ -1458,6 +1508,24 @@ impl Plugin for Harmonizer {
         db.create_table_and_indexes::<Child>().unwrap();
         db.create_table_and_indexes::<DigestChunk>().unwrap();
         self.db.set(Arc::downgrade(&db)).unwrap();
+        // Emit PeerAdded for already-configured peers (added before attach_db).
+        let peers_handle = self.peers.clone();
+        let db2 = db.clone();
+        tokio::spawn(async move {
+            let peers = { peers_handle.read().await.clone() };
+            for p in peers {
+                let mut pid = [0u8; 16];
+                pid.copy_from_slice(p.as_bytes());
+                let _ = crate::plugins::replay::emit_custom(
+                    &db2,
+                    crate::plugins::fnv1a_16("harmonizer"),
+                    vec![crate::plugins::replay::LogWriteRequest::PeerAdded { peer_id: pid }],
+                )
+                .await;
+                tracing::info!(target: "harmonizer", "replay: PeerAdded (on attach) peer={:02x?}", pid);
+                println!("[harmonizer] replay PeerAdded (on attach) peer={:02x?}", pid);
+            }
+        });
     }
 
     // (Removed unused try_complete_incomplete_nodes prototype)
@@ -1596,6 +1664,243 @@ mod tests {
     }
 
     /* ---------------------- Tests ---------------------- */
+
+    #[tokio::test(start_paused = true)]
+    async fn replay_logs_context_and_snapshots_and_reconstructs() {
+        use crate::plugins::replay::{self, LogWriteRequest, SnapshotAvailability, SnapshotChild};
+        use crate::plugins::replay::ReplayPlugin;
+        use crate::tables::TableHash;
+
+        // Setup DB with ReplayPlugin only (we'll write Availability/Child rows directly)
+        let clock = Arc::new(MockClock::new(100));
+        let plugin = Arc::new(ReplayPlugin::new());
+        let dir = tempdir().unwrap();
+        let db = KuramotoDb::new(
+            dir.path().join("replay_snap.redb").to_str().unwrap(),
+            clock.clone(),
+            vec![plugin],
+        )
+        .await;
+
+        // Ensure tables
+        db.create_table_and_indexes::<availability::Availability>().unwrap();
+        db.create_table_and_indexes::<crate::plugins::harmonizer::child_set::Child>()
+            .unwrap();
+        db.create_table_and_indexes::<crate::plugins::harmonizer::child_set::DigestChunk>()
+            .unwrap();
+
+        // Build a tiny tree: parent -> leaf1, leaf2
+        let dim = TableHash { hash: 42 };
+        let peer = UuidBytes::new();
+        let leaf = |min: u8, max: u8| availability::Availability {
+            key: UuidBytes::new(),
+            peer_id: peer,
+            range: crate::plugins::harmonizer::range_cube::RangeCube::new(
+                smallvec::smallvec![dim],
+                smallvec::smallvec![vec![min]],
+                smallvec::smallvec![vec![max]],
+            )
+            .unwrap(),
+            level: 0,
+            schema_hash: 0,
+            version: 0,
+            updated_at: clock.now(),
+            complete: true,
+        };
+        let mut l1 = leaf(10, 11);
+        let mut l2 = leaf(11, 12);
+        db.put(l1.clone()).await.unwrap();
+        db.put(l2.clone()).await.unwrap();
+        let parent = availability::Availability {
+            key: UuidBytes::new(),
+            peer_id: peer,
+            range: crate::plugins::harmonizer::range_cube::RangeCube::new(
+                smallvec::smallvec![dim],
+                smallvec::smallvec![vec![10]],
+                smallvec::smallvec![vec![12]],
+            )
+            .unwrap(),
+            level: 1,
+            schema_hash: 0,
+            version: 0,
+            updated_at: clock.now(),
+            complete: true,
+        };
+        db.put(parent.clone()).await.unwrap();
+        // Link children (logs deltas)
+        let mut cs = crate::plugins::harmonizer::child_set::ChildSet::open(&db, parent.key)
+            .await
+            .unwrap();
+        cs.add_child(&db, l1.key).await.unwrap();
+        cs.add_child(&db, l2.key).await.unwrap();
+
+        // Emit snapshot of current state
+        clock.advance(1).await;
+        let pid_arr = *peer.as_bytes();
+        let avail_to_snap = |a: &availability::Availability| SnapshotAvailability {
+            availability_id: *a.key.as_bytes(),
+            peer_id: *a.peer_id.as_bytes(),
+            level: a.level,
+            complete: a.complete,
+            dims: a.range.dims().iter().map(|d| d.hash).collect(),
+            mins: a.range.mins().to_vec(),
+            maxs: a.range.maxs().to_vec(),
+        };
+        let c_to_snap = |p: UuidBytes, ord: u32, c: UuidBytes| SnapshotChild {
+            parent: *p.as_bytes(),
+            ordinal: ord,
+            child: *c.as_bytes(),
+        };
+        let items1 = vec![
+            LogWriteRequest::HarmonizerSnapshotStart {
+                peer_id: pid_arr,
+                first_dim_hash: dim.hash,
+                total_avails: 3,
+                total_edges: 2,
+                version: 1,
+            },
+            LogWriteRequest::HarmonizerSnapshotChunk {
+                chunk_no: 0,
+                availabilities: vec![
+                    avail_to_snap(&parent),
+                    avail_to_snap(&l1),
+                    avail_to_snap(&l2),
+                ],
+                children: vec![c_to_snap(parent.key, 0, l1.key), c_to_snap(parent.key, 1, l2.key)],
+            },
+            LogWriteRequest::HarmonizerSnapshotEnd {
+                chunks: 1,
+                checksum: 0,
+            },
+        ];
+        replay::emit_custom(&db, crate::plugins::fnv1a_16("harmonizer"), items1)
+            .await
+            .unwrap();
+        let t1 = clock.now();
+
+        // Apply a delta: add a third leaf and link it
+        clock.advance(1).await;
+        let l3 = leaf(12, 13);
+        db.put(l3.clone()).await.unwrap();
+        let mut cs = crate::plugins::harmonizer::child_set::ChildSet::open(&db, parent.key)
+            .await
+            .unwrap();
+        cs.add_child(&db, l3.key).await.unwrap();
+        let t2 = clock.now();
+
+        // Emit snapshot2 with the full state (parent + 3 leaves, 3 edges)
+        clock.advance(1).await;
+        let items2 = vec![
+            LogWriteRequest::HarmonizerSnapshotStart {
+                peer_id: pid_arr,
+                first_dim_hash: dim.hash,
+                total_avails: 4,
+                total_edges: 3,
+                version: 1,
+            },
+            LogWriteRequest::HarmonizerSnapshotChunk {
+                chunk_no: 0,
+                availabilities: vec![
+                    avail_to_snap(&parent),
+                    avail_to_snap(&l1),
+                    avail_to_snap(&l2),
+                    avail_to_snap(&l3),
+                ],
+                children: vec![
+                    c_to_snap(parent.key, 0, l1.key),
+                    c_to_snap(parent.key, 1, l2.key),
+                    c_to_snap(parent.key, 2, l3.key),
+                ],
+            },
+            LogWriteRequest::HarmonizerSnapshotEnd {
+                chunks: 1,
+                checksum: 0,
+            },
+        ];
+        replay::emit_custom(&db, crate::plugins::fnv1a_16("harmonizer"), items2)
+            .await
+            .unwrap();
+        let t3 = clock.now();
+
+        // Helper: fetch replay events and filter by ts window
+        let events: Vec<crate::plugins::replay::ReplayEvent> = db
+            .range_by_pk::<crate::plugins::replay::ReplayEvent>(&0u64.to_be_bytes(), &u64::MAX.to_be_bytes(), None)
+            .await
+            .unwrap();
+
+        // Reconstruct from snapshot1 then apply deltas between t1..t3
+        let mut av_set = std::collections::BTreeSet::<([u8; 16], [u8; 16], u16, bool, Vec<u64>, Vec<Vec<u8>>, Vec<Vec<u8>>)>::new();
+        let mut edges = std::collections::BTreeSet::<([u8; 16], u32, [u8; 16])>::new();
+
+        // parse snapshot1
+        for ev in events.iter().filter(|e| e.ts == t1) {
+            for it in &ev.batch {
+                match it {
+                    LogWriteRequest::HarmonizerSnapshotChunk { availabilities, children, .. } => {
+                        for a in availabilities {
+                            av_set.insert((a.availability_id, a.peer_id, a.level, a.complete, a.dims.clone(), a.mins.clone(), a.maxs.clone()));
+                        }
+                        for c in children {
+                            edges.insert((c.parent, c.ordinal, c.child));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // apply deltas: any Put/Delete on Availability or Child between t1..t3
+        let avail_th = TableHash::from(availability::AVAILABILITIES_TABLE).hash();
+        let child_th = TableHash::from(crate::plugins::harmonizer::child_set::AVAIL_CHILDREN_TBL).hash();
+        for ev in events.iter().filter(|e| e.ts > t1 && e.ts < t3) {
+            for it in &ev.batch {
+                match it {
+                    LogWriteRequest::Put { data_table_hash, value, .. } if *data_table_hash == avail_th => {
+                        let a: availability::Availability = availability::Availability::load_and_migrate(value).unwrap();
+                        av_set.insert((*a.key.as_bytes(), *a.peer_id.as_bytes(), a.level, a.complete, a.range.dims().iter().map(|d| d.hash).collect(), a.range.mins().to_vec(), a.range.maxs().to_vec()));
+                    }
+                    LogWriteRequest::Delete { data_table_hash, key, .. } if *data_table_hash == avail_th => {
+                        let mut idb = [0u8; 16];
+                        idb.copy_from_slice(key);
+                        av_set.retain(|(aid, ..)| aid != &idb);
+                    }
+                    LogWriteRequest::Put { data_table_hash, value, .. } if *data_table_hash == child_th => {
+                        let c: crate::plugins::harmonizer::child_set::Child = crate::plugins::harmonizer::child_set::Child::load_and_migrate(value).unwrap();
+                        edges.insert((*c.parent.as_bytes(), c.ordinal, *c.child_id.as_bytes()));
+                    }
+                    LogWriteRequest::Delete { data_table_hash, key, .. } if *data_table_hash == child_th => {
+                        // child pk = parent • ordinal (le)
+                        if key.len() >= 20 {
+                            let mut pb = [0u8; 16];
+                            pb.copy_from_slice(&key[..16]);
+                            let ord = u32::from_le_bytes([key[16], key[17], key[18], key[19]]);
+                            edges.retain(|(p, o, _)| !(p == &pb && *o == ord));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Extract snapshot2 content and compare
+        let mut av_set2 = std::collections::BTreeSet::new();
+        let mut edges2 = std::collections::BTreeSet::new();
+        for ev in events.iter().filter(|e| e.ts == t3) {
+            for it in &ev.batch {
+                if let LogWriteRequest::HarmonizerSnapshotChunk { availabilities, children, .. } = it {
+                    for a in availabilities {
+                        av_set2.insert((a.availability_id, a.peer_id, a.level, a.complete, a.dims.clone(), a.mins.clone(), a.maxs.clone()));
+                    }
+                    for c in children {
+                        edges2.insert((c.parent, c.ordinal, c.child));
+                    }
+                }
+            }
+        }
+
+        assert_eq!(av_set, av_set2, "availability sets should match snapshot2 after applying deltas");
+        assert_eq!(edges, edges2, "edge sets should match snapshot2 after applying deltas");
+    }
 
     /// No L0 auto-persistence: writing an entity should NOT insert level-0 availabilities.
     #[tokio::test(start_paused = true)]

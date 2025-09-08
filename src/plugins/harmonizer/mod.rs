@@ -18,3 +18,4 @@ pub use integrity::*;
 pub use protocol::*;
 pub use optimizer::{BasicOptimizer, AvailabilityDraft, Optimizer};
 pub use sync_tester::SyncTester;
+pub use child_set::{AVAIL_CHILDREN_TBL, Child};

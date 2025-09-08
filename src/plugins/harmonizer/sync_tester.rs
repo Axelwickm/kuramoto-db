@@ -38,6 +38,7 @@ pub struct SyncTester {
     watched: HashSet<&'static str>,
     record_replay: bool,
     export_dir: Option<PathBuf>,
+    export_basename: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -131,6 +132,7 @@ impl SyncTester {
             watched,
             record_replay: opts.record_replay,
             export_dir: opts.export_dir,
+            export_basename: opts.export_basename,
         }
     }
 
@@ -244,7 +246,7 @@ impl SyncTester {
         }
         let dir = out_dir.as_ref();
         fs::create_dir_all(dir)?;
-        for n in &self.peers {
+        for (i, n) in self.peers.iter().enumerate() {
             let events: Vec<crate::plugins::replay::ReplayEvent> = n
                 .db
                 .range_by_pk::<crate::plugins::replay::ReplayEvent>(&0u64.to_be_bytes(), &u64::MAX.to_be_bytes(), None)
@@ -255,8 +257,12 @@ impl SyncTester {
             let bytes = bincode::encode_to_vec(&events, bincode::config::standard())
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
-            let uuid: uuid::Uuid = n.peer_id.into();
-            let fname = format!("replay_{}.bin", uuid.as_hyphenated());
+            let fname = if let Some(base) = &self.export_basename {
+                format!("{}_peer_{}.bin", base, i + 1)
+            } else {
+                let uuid: uuid::Uuid = n.peer_id.into();
+                format!("replay_{}.bin", uuid.as_hyphenated())
+            };
             let path = dir.join(fname);
             fs::write(path, bytes)?;
         }
@@ -268,6 +274,7 @@ impl SyncTester {
 pub struct SyncTesterOptions {
     pub record_replay: bool,
     pub export_dir: Option<PathBuf>,
+    pub export_basename: Option<String>,
 }
 
 #[cfg(test)]
