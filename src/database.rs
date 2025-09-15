@@ -130,6 +130,11 @@ pub struct KuramotoDb {
     entity_delete_planners: RwLock<HashMap<String, Arc<TableDeletePlanFn>>>,
     data_table_by_hash: RwLock<HashMap<u64, StaticTableDef>>,
     index_table_by_hash: RwLock<HashMap<u64, (StaticTableDef, StaticTableDef)>>,
+    // Name lookup for index tables: index name -> (index table, parent data table)
+    index_table_by_name: RwLock<HashMap<String, (StaticTableDef, StaticTableDef)>>,
+    // Name lookups for data/meta tables (populated on create_table_and_indexes)
+    data_table_by_name: RwLock<HashMap<String, StaticTableDef>>,
+    meta_table_by_name: RwLock<HashMap<String, StaticTableDef>>,
 }
 
 impl KuramotoDb {
@@ -149,9 +154,12 @@ impl KuramotoDb {
             plugins,
             data_table_by_hash: RwLock::new(HashMap::new()),
             index_table_by_hash: RwLock::new(HashMap::new()),
+            index_table_by_name: RwLock::new(HashMap::new()),
             entity_putters: RwLock::new(HashMap::new()),
             entity_deleters: RwLock::new(HashMap::new()),
             entity_delete_planners: RwLock::new(HashMap::new()),
+            data_table_by_name: RwLock::new(HashMap::new()),
+            meta_table_by_name: RwLock::new(HashMap::new()),
         });
 
         for p in &sys.plugins {
@@ -252,7 +260,20 @@ impl KuramotoDb {
                     .write()
                     .unwrap()
                     .insert(ih, (idx.table_def, E::table_def()));
+                self.index_table_by_name
+                    .write()
+                    .unwrap()
+                    .insert(idx.table_def.name().to_string(), (idx.table_def, E::table_def()));
             }
+            // Name lookups for data & meta tables
+            self.data_table_by_name
+                .write()
+                .unwrap()
+                .insert(E::table_def().name().to_string(), E::table_def());
+            self.meta_table_by_name
+                .write()
+                .unwrap()
+                .insert(E::table_def().name().to_string(), E::meta_table_def());
         }
         {
             // Create the table
@@ -322,6 +343,142 @@ impl KuramotoDb {
     }
     pub fn resolve_index_table_by_hash(&self, h: u64) -> Option<(StaticTableDef, StaticTableDef)> {
         self.index_table_by_hash.read().unwrap().get(&h).copied()
+    }
+    pub fn resolve_index_pair_by_name(&self, name: &str) -> Option<(StaticTableDef, StaticTableDef)> {
+        self.index_table_by_name.read().unwrap().get(name).copied()
+    }
+    pub fn resolve_data_table_by_name(&self, name: &str) -> Option<StaticTableDef> {
+        self.data_table_by_name.read().unwrap().get(name).copied()
+    }
+    pub fn resolve_meta_table_by_name(&self, name: &str) -> Option<StaticTableDef> {
+        self.meta_table_by_name.read().unwrap().get(name).copied()
+    }
+
+    /// Iterate meta-table keys in [start, end), pairing each with optional data bytes
+    /// and raw meta bytes. Includes tombstones (data=None) where meta exists but data is absent.
+    pub async fn range_raw_with_meta_by_pk_table(
+        &self,
+        table_name: &str,
+        start: &[u8],
+        end: &[u8],
+        limit: Option<usize>,
+    ) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>, Vec<u8>)>, StorageError> {
+        let data_t = self
+            .resolve_data_table_by_name(table_name)
+            .ok_or_else(|| StorageError::Other(format!(
+                "no entity registered for table '{table_name}'"
+            )))?;
+        let meta_t = self
+            .resolve_meta_table_by_name(table_name)
+            .ok_or_else(|| StorageError::Other(format!(
+                "no meta table registered for table '{table_name}'"
+            )))?;
+
+        self.with_read(None, |rt| {
+            let meta = rt
+                .open_table(meta_t.clone())
+                .map_err(|e| StorageError::Other(e.to_string()))?;
+            let data = rt
+                .open_table(data_t.clone())
+                .map_err(|e| StorageError::Other(e.to_string()))?;
+
+            let mut out = Vec::new();
+            for row in meta
+                .range(start..end)
+                .map_err(|e| StorageError::Other(e.to_string()))?
+            {
+                let (k, v) = row.map_err(|e| StorageError::Other(e.to_string()))?;
+                let pk = k.value().to_vec();
+                let meta_raw = v.value().to_vec();
+                let data_opt = data
+                    .get(k.value())
+                    .map_err(|e| StorageError::Other(e.to_string()))?
+                    .map(|v| v.value().to_vec());
+                out.push((pk, data_opt, meta_raw));
+                if limit.map_or(false, |n| out.len() >= n) { break; }
+            }
+            Ok(out)
+        })
+    }
+
+    /// Read raw meta bytes by table name + primary key.
+    pub async fn get_meta_raw_by_table_pk(
+        &self,
+        table_name: &str,
+        pk: &[u8],
+    ) -> Result<Vec<u8>, StorageError> {
+        let meta_t = self
+            .resolve_meta_table_by_name(table_name)
+            .ok_or_else(|| StorageError::Other(format!(
+                "no meta table registered for table '{table_name}'"
+            )))?;
+        self.with_read(None, |rt| {
+            let t = rt
+                .open_table(meta_t.clone())
+                .map_err(|e| StorageError::Other(e.to_string()))?;
+            let v = t
+                .get(pk)
+                .map_err(|e| StorageError::Other(e.to_string()))?
+                .ok_or(StorageError::NotFound)?
+                .value()
+                .to_vec();
+            Ok(v)
+        })
+    }
+
+    /// Iterate an index table range and resolve (index_key, pk, data_opt, meta_raw) tuples.
+    pub async fn range_raw_with_meta_by_index_table(
+        &self,
+        index_table_name: &str,
+        start_idx_key: &[u8],
+        end_idx_key: &[u8],
+        limit: Option<usize>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>, Option<Vec<u8>>, Vec<u8>)>, StorageError> {
+        let (idx_tdef, data_tdef) = self
+            .resolve_index_pair_by_name(index_table_name)
+            .ok_or_else(|| StorageError::Other(format!(
+                "no index registered for table '{index_table_name}'"
+            )))?;
+        // Meta table shares the same parent name as data table
+        let meta_tdef = self
+            .resolve_meta_table_by_name(data_tdef.name())
+            .ok_or_else(|| StorageError::Other("no meta table for index parent".into()))?;
+
+        self.with_read(None, |rt| {
+            let idx = rt
+                .open_table(idx_tdef.clone())
+                .map_err(|e| StorageError::Other(e.to_string()))?;
+            let data = rt
+                .open_table(data_tdef.clone())
+                .map_err(|e| StorageError::Other(e.to_string()))?;
+            let meta = rt
+                .open_table(meta_tdef.clone())
+                .map_err(|e| StorageError::Other(e.to_string()))?;
+
+            let mut out = Vec::new();
+            for row in idx
+                .range(start_idx_key..end_idx_key)
+                .map_err(|e| StorageError::Other(e.to_string()))?
+            {
+                let (ik, pkv) = row.map_err(|e| StorageError::Other(e.to_string()))?;
+                let ikb = ik.value().to_vec();
+                let pk = pkv.value().to_vec();
+                let data_opt = data
+                    .get(&*pk)
+                    .map_err(|e| StorageError::Other(e.to_string()))?
+                    .map(|v| v.value().to_vec());
+                let meta_raw = match meta
+                    .get(&*pk)
+                    .map_err(|e| StorageError::Other(e.to_string()))?
+                {
+                    Some(v) => v.value().to_vec(),
+                    None => continue, // If no meta, skip (shouldn't happen for well-formed rows)
+                };
+                out.push((ikb, pk, data_opt, meta_raw));
+                if limit.map_or(false, |n| out.len() >= n) { break; }
+            }
+            Ok(out)
+        })
     }
 
     pub async fn collect_pks_in_data_range_tx(

@@ -6,9 +6,10 @@ use redb::ReadTransaction;
 pub mod communication;
 pub mod versioning;
 
+// NOTE: disabled
 // Harmonizer is optional; gate entire module behind feature.
-#[cfg(feature = "harmonizer")]
-pub mod harmonizer;
+// #[cfg(feature = "harmonizer")]
+// pub mod harmonizer;
 
 // Web admin plugin (optional)
 #[cfg(feature = "web_admin")]
@@ -20,8 +21,11 @@ pub mod replay;
 // Self-identity plugin: manages local persistent peer id (unsyncable)
 pub mod self_identity;
 
-use crate::{KuramotoDb, WriteBatch, storage_error::StorageError, WriteOrigin};
+// Remote fetch plugin: simple symmetric fetch/export over communication router.
+pub mod fetch;
+
 use crate::database::WriteRequest;
+use crate::{KuramotoDb, WriteBatch, WriteOrigin, storage_error::StorageError};
 
 // Just to hash the name into something nice and stable.
 pub const fn fnv1a_16(s: &str) -> u16 {
@@ -218,7 +222,8 @@ mod tests {
             _origin: crate::WriteOrigin,
         ) -> Result<(), StorageError> {
             // Increment by number of items to ensure we saw the batch
-            self.count.fetch_add(applied.len() as u32, Ordering::Relaxed);
+            self.count
+                .fetch_add(applied.len() as u32, Ordering::Relaxed);
             Ok(())
         }
 
@@ -231,7 +236,9 @@ mod tests {
         let db_path = dir.path().join("plugins_after.redb");
 
         let counter = Arc::new(AtomicU32::new(0));
-        let plugin = Arc::new(AfterWriteCounter { count: counter.clone() });
+        let plugin = Arc::new(AfterWriteCounter {
+            count: counter.clone(),
+        });
 
         let clock = Arc::new(MockClock::new(0));
         let db = KuramotoDb::new(db_path.to_str().unwrap(), clock, vec![plugin]).await;
