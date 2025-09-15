@@ -25,9 +25,11 @@ use std::time::Instant;
 use crate::{
     KuramotoDb,
     plugins::harmonizer::{
-        availability::Availability,
+        availability::{
+            Availability, AVAILABILITY_BY_PEER_AND_ENTITY, AVAILABILITY_INCOMPLETE_BY_PEER,
+        },
         availability::roots_for_peer,
-        availability_queries::{range_cover, resolve_child_avail, child_count},
+        availability_queries::{child_count, range_cover, resolve_child_avail},
         harmonizer::PeerContext,
         range_cube::RangeCube,
         scorers::Scorer,
@@ -39,6 +41,14 @@ use crate::{
     storage_error::StorageError,
     uuid_bytes::UuidBytes,
 };
+
+fn debug_enabled() -> bool {
+    static ONCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ONCE.get_or_init(|| match std::env::var("KDB_DEBUG_RANGE") {
+        Ok(v) => !v.is_empty() && v != "0" && v.to_lowercase() != "false",
+        Err(_) => false,
+    })
+}
 
 /*──────────────────── drafts & actions (public) ───────────────────*/
 
@@ -62,6 +72,12 @@ impl From<&Availability> for AvailabilityDraft {
 pub enum Action {
     Insert(AvailabilityDraft),
     Delete(UuidBytes),
+    /// Replace an existing availability (by id) with a new draft.
+    /// Semantically equivalent to: Insert(draft) + Delete(id), but expressed atomically
+    /// so the planner can compete fairly without sequence-length penalties.
+    Replace { id: UuidBytes, draft: AvailabilityDraft },
+    /// Overlay hint for a storage atom at a specific location (level=0 semantics).
+    Atom(RangeCube),
 }
 pub type ActionSet = Vec<Action>;
 
@@ -79,7 +95,7 @@ pub struct Caps {
 impl Default for Caps {
     fn default() -> Self {
         Self {
-            depth: 2,
+            depth: 1,
             beam_width: 12,
             eps: 0.0,
         }
@@ -95,6 +111,7 @@ pub trait Optimizer: Send + Sync {
         db: &KuramotoDb,
         txn: &ReadTransaction,
         seeds: &[AvailabilityDraft],
+        seed_atom: Option<RangeCube>,
     ) -> Result<Option<ActionSet>, StorageError>;
 }
 
@@ -106,12 +123,7 @@ struct PlanState {
     overlay: ActionSet,
 }
 impl PlanState {
-    fn new(seed: AvailabilityDraft) -> Self {
-        Self {
-            focus: seed,
-            overlay: Vec::new(),
-        }
-    }
+    fn new(seed: AvailabilityDraft, overlay: ActionSet) -> Self { Self { focus: seed, overlay } }
 }
 impl State for PlanState {
     type Action = Action;
@@ -123,6 +135,12 @@ impl State for PlanState {
                 next.focus = d.clone();
             }
             Action::Delete(id) => push_delete(&mut next.overlay, *id),
+            Action::Replace { id, draft } => {
+                // Replace updates focus to the new draft and stages a delete for the old id
+                next.focus = draft.clone();
+                push_delete(&mut next.overlay, *id);
+            }
+            Action::Atom(r) => push_atom(&mut next.overlay, r.clone()),
         }
         next
     }
@@ -156,6 +174,7 @@ impl Optimizer for BasicOptimizer {
         db: &KuramotoDb,
         txn: &ReadTransaction,
         seeds: &[AvailabilityDraft],
+        seed_atom: Option<RangeCube>,
     ) -> Result<Option<ActionSet>, StorageError> {
         // Filter obviously invalid seeds (empty range)
         let seeds: Vec<_> = seeds
@@ -171,19 +190,25 @@ impl Optimizer for BasicOptimizer {
             depth: self.caps.depth,
             beam_width: self.caps.beam_width,
             eps: self.caps.eps,
-            max_evals: 0, // unlimited
+            max_evals: 0,
+            // Depth-1 should be cheap: disable tie-rollout to avoid large plateaus.
+            rollout_depth: if self.caps.depth == 1 { 0 } else { 2 },
             ..Default::default()
         };
 
         let mut merged: ActionSet = Vec::new();
 
-
         let mut search = BeamSearch::new(cfg);
+
+        // Initial overlay: include seed atom if provided
+        let mut initial_overlay: ActionSet = Vec::new();
+        if let Some(r) = seed_atom.clone() { initial_overlay.push(Action::Atom(r)); }
 
         for seed in seeds {
             // Build delete candidates for this seed by walking the local frontier under the seed range.
             // For every touched availability, propose deleting it and its parent(s).
-            let mut dels_set: std::collections::HashSet<UuidBytes> = std::collections::HashSet::new();
+            let mut dels_set: std::collections::HashSet<UuidBytes> =
+                std::collections::HashSet::new();
 
             let roots = if let Some(fd) = seed.range.dims().first() {
                 crate::plugins::harmonizer::availability::roots_for_peer_and_entity(
@@ -198,12 +223,84 @@ impl Optimizer for BasicOptimizer {
             };
             let root_ids: Vec<_> = roots.into_iter().map(|r| r.key).collect();
             let mut qcache = None;
-            let (frontier, no_overlap) =
-                range_cover(db, Some(txn), &seed.range, &root_ids, None, &vec![], &mut qcache).await?;
+            if debug_enabled() {
+                println!(
+                    "opt.propose: range_cover for seed level={} dims={} roots={}",
+                    seed.level,
+                    seed.range.dims().len(),
+                    root_ids.len()
+                );
+            }
+            // If there are no roots visible in this snapshot/scope, print diagnostics.
+            if root_ids.is_empty() && debug_enabled() {
+                // Count peer-scoped availabilities (complete + incomplete) in this snapshot
+                let mut key_incomplete = self.ctx.peer_id.as_bytes().to_vec();
+                key_incomplete.push(0);
+                let mut key_complete = self.ctx.peer_id.as_bytes().to_vec();
+                key_complete.push(1);
+                let peer_incomplete = db
+                    .get_by_index_all_tx::<Availability>(
+                        Some(txn),
+                        AVAILABILITY_INCOMPLETE_BY_PEER,
+                        &key_incomplete,
+                    )
+                    .await
+                    .unwrap_or_default()
+                    .len();
+                let peer_complete = db
+                    .get_by_index_all_tx::<Availability>(
+                        Some(txn),
+                        AVAILABILITY_INCOMPLETE_BY_PEER,
+                        &key_complete,
+                    )
+                    .await
+                    .unwrap_or_default()
+                    .len();
+                // If seed is entity-scoped, also count per-entity rows
+                let entity_count = if let Some(fd) = seed.range.dims().first() {
+                    let mut k = self.ctx.peer_id.as_bytes().to_vec();
+                    k.extend_from_slice(&fd.hash().to_be_bytes());
+                    db.get_by_index_all_tx::<Availability>(
+                        Some(txn),
+                        AVAILABILITY_BY_PEER_AND_ENTITY,
+                        &k,
+                    )
+                    .await
+                    .unwrap_or_default()
+                    .len()
+                } else {
+                    0
+                };
+                println!(
+                    "opt.propose: DIAG roots empty | peer_avails: complete={} incomplete={} | entity_avails={} | note: range_cover ignores overlay inserts",
+                    peer_complete, peer_incomplete, entity_count
+                );
+                // Previous early-exit removed for investigation:
+                // continue;
+            }
+
+            let (frontier, no_overlap) = range_cover(
+                db,
+                Some(txn),
+                &seed.range,
+                &root_ids,
+                None,
+                &vec![],
+                &mut qcache,
+            )
+            .await?;
+            if debug_enabled() {
+                println!(
+                    "opt.propose: range_cover frontier_len={} no_overlap={}",
+                    frontier.len(),
+                    no_overlap
+                );
+            }
             if !no_overlap {
                 for a in frontier.into_iter() {
                     // local, complete nodes touched by this seed
-                    if a.peer_id == self.ctx.peer_id && a.complete && a.range.overlaps(&seed.range) {
+                    if a.peer_id == self.ctx.peer_id && a.complete && a.range.overlaps(&seed.range)
+                    {
                         dels_set.insert(a.key);
                         // Propose deleting immediate parents as well (if any)
                         let parents = crate::plugins::harmonizer::child_set::ChildSet::parents_of(
@@ -226,12 +323,84 @@ impl Optimizer for BasicOptimizer {
 
             let mut dels: Vec<UuidBytes> = dels_set.into_iter().collect();
 
-            let start = PlanState::new(seed.clone());
-            let g = PlannerGen { caps: self.caps, deletes: dels };
+            // Resolve overlap targets to full records for Replace candidates
+            let mut replace_targets: Vec<crate::plugins::harmonizer::availability::Availability> =
+                Vec::new();
+            for id in &dels {
+                if let Some(av) = crate::plugins::harmonizer::availability_queries::resolve_child_avail(
+                    db,
+                    Some(txn),
+                    id,
+                )
+                .await?
+                {
+                    // Only consider local, complete nodes as replacement targets
+                    if av.peer_id == self.ctx.peer_id && av.complete {
+                        replace_targets.push(av);
+                    }
+                }
+            }
+
+            let start = PlanState::new(seed.clone(), initial_overlay.clone());
+            let g = PlannerGen {
+                caps: self.caps,
+                deletes: dels,
+                replace_targets,
+            };
             let eval = PlannerEval::new(db, txn, &self.ctx, &*self.scorer);
 
             let t_search = Instant::now();
-            let Some(path) = search.propose_step(&start, &g, &eval).await else {
+
+            // Tiny-plateau lookahead: if caps.depth == 1 and the best immediate
+            // action is tied with a very small plateau (e.g., 2), perform a
+            // constrained depth-2 pass (no rollout) to break the tie.
+            let mut path_opt = None;
+            if self.caps.depth == 1 {
+                // Score root once
+                let s0 = eval.score(&start).await;
+                // Score immediate children to detect tie plateau among feasible actions
+                let kids = g.candidates(&start);
+                let mut best_sc = f32::NEG_INFINITY;
+                let mut scores: Vec<(f32, bool, Action)> = Vec::with_capacity(kids.len());
+                for a in kids.into_iter() {
+                    let st = start.apply(&a);
+                    let sc = eval.score(&st).await;
+                    let feas = eval.feasible(&st);
+                    if feas && sc > best_sc {
+                        best_sc = sc;
+                    }
+                    scores.push((sc, feas, a));
+                }
+                let mut ties = 0usize;
+                let tie_margin = 1e-6f32;
+                for (sc, feas, _a) in &scores {
+                    if *feas && (best_sc - *sc).abs() <= tie_margin {
+                        ties += 1;
+                    }
+                }
+                let best_gain = best_sc - s0;
+                // If tiny plateau (1-2 ties) with a positive gain, attempt limited depth-2
+                if best_gain > self.caps.eps && ties > 1 && ties <= 2 {
+                    let cfg2 = BeamConfig {
+                        depth: 2,
+                        beam_width: self.caps.beam_width.min(4),
+                        eps: self.caps.eps,
+                        max_evals: 10_000,
+                        rollout_depth: 0, // no selective rollout for speed
+                        beam_slack: 0.0,
+                        prefer_longer_on_tie: false,
+                        selective_rollout_top_r: 0,
+                        tie_margin,
+                    };
+                    let mut bs2 = BeamSearch::new(cfg2);
+                    path_opt = bs2.propose_step(&start, &g, &eval).await;
+                }
+            }
+
+            let Some(path) = (match path_opt {
+                Some(p) => Some(p),
+                None => search.propose_step(&start, &g, &eval).await,
+            }) else {
                 let (calls, ns) = eval.timing_summary();
                 #[cfg(feature = "harmonizer_debug")]
                 if calls > 0 {
@@ -241,6 +410,39 @@ impl Optimizer for BasicOptimizer {
                         avg_us = %((ns / calls as u128) / 1000),
                         "opt.propose_step: no path"
                     );
+                }
+                // Surgical fallback: If the seed adds coverage that isn't already
+                // provided by the current tree, return the seed insert. This preserves
+                // the contract that propose() only returns None when the seed is
+                // unnecessary (already covered or empty).
+                // Conditions: level-0, cube has storage atoms, and not already
+                // covered locally by this peer.
+                if seed.level == 0 && !range_is_empty(&seed.range) {
+                    // Fast atom existence check (overlay-aware)
+                    if let Ok(Some(n)) = crate::plugins::harmonizer::availability_queries::storage_atom_count_in_cube_tx_overlay(
+                        db,
+                        Some(txn),
+                        &seed.range,
+                        &start.overlay,
+                    ).await {
+                        if n > 0 {
+                            // Already covered check (snapshot-aware)
+                            let mut qcache = None;
+                            let covered = crate::plugins::harmonizer::availability_queries::peer_contains_range_local(
+                                db,
+                                Some(txn),
+                                &self.ctx.peer_id,
+                                &seed.range,
+                                &vec![],
+                                &mut qcache,
+                            )
+                            .await
+                            .unwrap_or(false);
+                            if !covered && !contains_insert(&merged, &seed) {
+                                push_insert(&mut merged, seed.clone());
+                            }
+                        }
+                    }
                 }
                 continue;
             };
@@ -286,62 +488,154 @@ impl Optimizer for BasicOptimizer {
 struct PlannerGen {
     caps: Caps,
     deletes: Vec<UuidBytes>,
+    replace_targets: Vec<crate::plugins::harmonizer::availability::Availability>,
 }
 impl CandidateGen<PlanState> for PlannerGen {
     fn candidates(&self, s: &PlanState) -> Vec<Action> {
-        let steps = step_ladder(8); // TODO: make adjustable
+        // Multi-magnitude ladder: include steps at 1,2,4,... across byte magnitudes
+        fn step_ladder_multimag(coord_len: usize) -> Vec<usize> {
+            let base: [usize; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
+            let max_mag = coord_len.saturating_sub(1).min(3); // up to 3 byte-shifts (24 bits)
+            let mut out = Vec::with_capacity(base.len() * (max_mag + 1));
+            for mag in 0..=max_mag {
+                let shift = 8 * mag;
+                for &b in &base {
+                    out.push(b << shift);
+                }
+            }
+            out
+        }
         let d = s.focus.range.mins().len().min(s.focus.range.maxs().len());
-        let mut out: Vec<Action> = Vec::with_capacity(8);
+        let mut out: Vec<Action> = Vec::with_capacity(16);
 
-        // Identity
+        // Always include identity Insert for the seed focus and a promotion Insert (for cases
+        // where no replacement target exists). These preserve previous behavior.
         out.push(Action::Insert(s.focus.clone()));
-        // Promotion (same geometry, higher level)
         out.push(Action::Insert(AvailabilityDraft {
             level: s.focus.level.saturating_add(1),
             range: s.focus.range.clone(),
             complete: true,
         }));
 
-        for &st in &steps {
+        // If we have overlapping local nodes, generate Replace candidates instead of
+        // standalone Insert mutations for geometry tweaks. Promotion (level+1) is always
+        // modeled as an Insert so children can be adopted (do not delete the child).
+        if !self.replace_targets.is_empty() {
+            for tgt in &self.replace_targets {
+                let td = tgt
+                    .range
+                    .mins()
+                    .len()
+                    .min(tgt.range.maxs().len());
+                // Promotion of target → Insert parent (keep child; adoption handled by evaluator)
+                out.push(Action::Insert(AvailabilityDraft {
+                    level: tgt.level.saturating_add(1),
+                    range: tgt.range.clone(),
+                    complete: true,
+                }));
+                for ax in 0..td {
+                    let steps = step_ladder_multimag(tgt.range.mins()[ax].len());
+                    for &st in &steps {
+                        // min -= Δ
+                        if let Some(min2) =
+                            be_add_signed(&tgt.range.mins()[ax], -(st as i128))
+                        {
+                            let mut r = tgt.range.clone();
+                            r.set_min(ax, min2);
+                            if !range_is_empty(&r) {
+                                out.push(Action::Replace {
+                                    id: tgt.key,
+                                    draft: AvailabilityDraft {
+                                        level: tgt.level,
+                                        range: r.clone(),
+                                        complete: true,
+                                    },
+                                });
+                            }
+                        }
+                        // max += Δ
+                        if let Some(max2) = be_add_signed(&tgt.range.maxs()[ax], st as i128) {
+                            let mut r = tgt.range.clone();
+                            r.set_max(ax, max2);
+                            if !range_is_empty(&r) {
+                                out.push(Action::Replace {
+                                    id: tgt.key,
+                                    draft: AvailabilityDraft {
+                                        level: tgt.level,
+                                        range: r.clone(),
+                                        complete: true,
+                                    },
+                                });
+                            }
+                        }
+                        // grow both
+                        if let (Some(min2), Some(max2)) = (
+                            be_add_signed(&tgt.range.mins()[ax], -(st as i128)),
+                            be_add_signed(&tgt.range.maxs()[ax], st as i128),
+                        ) {
+                            let mut r = tgt.range.clone();
+                            r.set_min(ax, min2);
+                            r.set_max(ax, max2);
+                            if !range_is_empty(&r) {
+                                out.push(Action::Replace {
+                                    id: tgt.key,
+                                    draft: AvailabilityDraft {
+                                        level: tgt.level,
+                                        range: r.clone(),
+                                        complete: true,
+                                    },
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            // No replacement targets → keep legacy Insert ladder mutations around the seed
             for ax in 0..d {
-                // min -= Δ
-                if let Some(min2) = be_add_signed(&s.focus.range.mins()[ax], -(st as i128)) {
-                    let mut r = s.focus.range.clone();
-                    r.set_min(ax, min2);
-                    if !range_is_empty(&r) {
-                        out.push(Action::Insert(AvailabilityDraft {
-                            level: s.focus.level,
-                            range: r.clone(),
-                            complete: true,
-                        }));
+                let steps = step_ladder_multimag(s.focus.range.mins()[ax].len());
+                for &st in &steps {
+                    // min -= Δ
+                    if let Some(min2) =
+                        be_add_signed(&s.focus.range.mins()[ax], -(st as i128))
+                    {
+                        let mut r = s.focus.range.clone();
+                        r.set_min(ax, min2);
+                        if !range_is_empty(&r) {
+                            out.push(Action::Insert(AvailabilityDraft {
+                                level: s.focus.level,
+                                range: r.clone(),
+                                complete: true,
+                            }));
+                        }
                     }
-                }
-                // max += Δ
-                if let Some(max2) = be_add_signed(&s.focus.range.maxs()[ax], st as i128) {
-                    let mut r = s.focus.range.clone();
-                    r.set_max(ax, max2);
-                    if !range_is_empty(&r) {
-                        out.push(Action::Insert(AvailabilityDraft {
-                            level: s.focus.level,
-                            range: r.clone(),
-                            complete: true,
-                        }));
+                    // max += Δ
+                    if let Some(max2) = be_add_signed(&s.focus.range.maxs()[ax], st as i128) {
+                        let mut r = s.focus.range.clone();
+                        r.set_max(ax, max2);
+                        if !range_is_empty(&r) {
+                            out.push(Action::Insert(AvailabilityDraft {
+                                level: s.focus.level,
+                                range: r.clone(),
+                                complete: true,
+                            }));
+                        }
                     }
-                }
-                // grow both
-                if let (Some(min2), Some(max2)) = (
-                    be_add_signed(&s.focus.range.mins()[ax], -(st as i128)),
-                    be_add_signed(&s.focus.range.maxs()[ax], st as i128),
-                ) {
-                    let mut r = s.focus.range.clone();
-                    r.set_min(ax, min2);
-                    r.set_max(ax, max2);
-                    if !range_is_empty(&r) {
-                        out.push(Action::Insert(AvailabilityDraft {
-                            level: s.focus.level,
-                            range: r.clone(),
-                            complete: true,
-                        }));
+                    // grow both
+                    if let (Some(min2), Some(max2)) = (
+                        be_add_signed(&s.focus.range.mins()[ax], -(st as i128)),
+                        be_add_signed(&s.focus.range.maxs()[ax], st as i128),
+                    ) {
+                        let mut r = s.focus.range.clone();
+                        r.set_min(ax, min2);
+                        r.set_max(ax, max2);
+                        if !range_is_empty(&r) {
+                            out.push(Action::Insert(AvailabilityDraft {
+                                level: s.focus.level,
+                                range: r.clone(),
+                                complete: true,
+                            }));
+                        }
                     }
                 }
             }
@@ -352,7 +646,7 @@ impl CandidateGen<PlanState> for PlannerGen {
             out.push(Action::Delete(*id));
         }
 
-        // De-dup by (level, range, complete) and unique Delete ids, capped
+        // De-dup by geometry and unique ids for Delete/Replace. Skip Replace that doesn't change geometry.
         let mut uniq: ActionSet = Vec::with_capacity(out.len());
         for a in out.into_iter() {
             if let Action::Insert(ref d) = a {
@@ -361,7 +655,33 @@ impl CandidateGen<PlanState> for PlannerGen {
                 }
             }
             if let Action::Delete(id) = a {
-                if uniq.iter().any(|u| matches!(u, Action::Delete(x) if *x == id)) {
+                if uniq
+                    .iter()
+                    .any(|u| matches!(u, Action::Delete(x) if *x == id))
+                {
+                    continue;
+                }
+            }
+            if let Action::Replace { id, ref draft } = a {
+                // Skip if another Replace for same (id, geom) exists or if geometry is unchanged
+                let same_geom = self
+                    .replace_targets
+                    .iter()
+                    .find(|t| t.key == id)
+                    .map(|t| ranges_equal(&t.range, &draft.range) && t.level == draft.level)
+                    .unwrap_or(false);
+                if same_geom {
+                    continue;
+                }
+                if uniq.iter().any(|u| match u {
+                    Action::Replace { id: id2, draft: d2 } => *id2 == id && draft_eq(d2, draft),
+                    _ => false,
+                }) {
+                    continue;
+                }
+            }
+            if let Action::Atom(ref r) = a {
+                if contains_atom(&uniq, r) {
                     continue;
                 }
             }
@@ -460,9 +780,30 @@ impl<'a> PlannerEval<'a> {
         // Discover local children via frontier DFS under our roots, then filter for contained nodes.
         let roots_ids = self.ensure_roots().await?;
         let mut qcache = None;
-        let (frontier, no_overlap) =
-            range_cover(self.db, Some(self.txn), target, &roots_ids, None, &vec![], &mut qcache)
-                .await?;
+        if debug_enabled() {
+            println!(
+                "opt.eval: local_child_ids roots={} dims={}",
+                roots_ids.len(),
+                target.dims().len()
+            );
+        }
+        let (frontier, no_overlap) = range_cover(
+            self.db,
+            Some(self.txn),
+            target,
+            &roots_ids,
+            None,
+            &vec![],
+            &mut qcache,
+        )
+        .await?;
+        if debug_enabled() {
+            println!(
+                "opt.eval: range_cover frontier_len={} no_overlap={} (for local_child_ids)",
+                frontier.len(),
+                no_overlap
+            );
+        }
         let mut seen = std::collections::HashSet::<UuidBytes>::new();
         if !no_overlap {
             for a in frontier {
@@ -490,18 +831,40 @@ impl<'a> PlannerEval<'a> {
         // for parents (level > 0), adopt only when there are at least two local, complete
         // contained availability children (bottom-up rule) and none are masked by deletes.
         let adopts = if s.focus.level == 0 {
-            // Level 0 adopts if there are underlying storage atoms in range
-            let n = crate::plugins::harmonizer::availability_queries::storage_atom_count_in_cube_tx(
+            // Level 0 adopts if there are underlying storage atoms in range (overlay-aware)
+            let n = crate::plugins::harmonizer::availability_queries::storage_atom_count_in_cube_tx_overlay(
                 self.db,
                 Some(self.txn),
                 &s.focus.range,
+                &s.overlay,
             )
             .await?;
-            n.unwrap_or(0) > 0
+            let ok = n.unwrap_or(0) > 0;
+            if debug_enabled() {
+                println!("opt.eval: adopts(level0)={} atoms?={:?}", ok, n);
+            }
+            ok
         } else {
             let ids = self.local_child_ids(&s.focus.range).await?;
             let kept = ids.iter().filter(|id| !deleted.contains(id)).count();
-            kept >= 2
+            // Also treat overlay atoms as provisional children for parent adoption.
+            let overlay_atoms_in_range = s
+                .overlay
+                .iter()
+                .filter(|a| matches!(a, Action::Atom(r) if s.focus.range.contains(r)))
+                .count();
+            let ok = (kept + overlay_atoms_in_range) >= 2;
+            if debug_enabled() {
+                println!(
+                    "opt.eval: adopts(level{})={} kept_children={} overlay_atoms_in_range={} (raw_ids={})",
+                    s.focus.level,
+                    ok,
+                    kept,
+                    overlay_atoms_in_range,
+                    ids.len()
+                );
+            }
+            ok
         };
         if adopts {
             push_insert(&mut eff, s.focus.clone());
@@ -552,6 +915,12 @@ fn push_delete(overlay: &mut ActionSet, id: UuidBytes) {
     }
 }
 
+fn push_atom(overlay: &mut ActionSet, r: RangeCube) {
+    if !overlay.iter().any(|a| matches!(a, Action::Atom(x) if ranges_equal(x, &r))) {
+        overlay.push(Action::Atom(r));
+    }
+}
+
 /*──────────────────── equality / de-dup helpers ───────────────────*/
 
 fn contains_insert(haystack: &[Action], needle: &AvailabilityDraft) -> bool {
@@ -559,11 +928,18 @@ fn contains_insert(haystack: &[Action], needle: &AvailabilityDraft) -> bool {
         .iter()
         .any(|a| matches!(a, Action::Insert(d) if draft_eq(d, needle)))
 }
+fn contains_atom(haystack: &[Action], needle: &RangeCube) -> bool {
+    haystack
+        .iter()
+        .any(|a| matches!(a, Action::Atom(r) if ranges_equal(r, needle)))
+}
 fn draft_eq(a: &AvailabilityDraft, b: &AvailabilityDraft) -> bool {
     a.level == b.level && a.complete == b.complete && ranges_equal(&a.range, &b.range)
 }
 fn ranges_equal(x: &RangeCube, y: &RangeCube) -> bool {
-    if x.dims().len() != y.dims().len() || x.mins().len() != y.mins().len() || x.maxs().len() != y.maxs().len()
+    if x.dims().len() != y.dims().len()
+        || x.mins().len() != y.mins().len()
+        || x.maxs().len() != y.maxs().len()
     {
         return false;
     }
@@ -674,10 +1050,10 @@ fn trim_leading_zeros(v: Vec<u8>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugins::harmonizer::SyncTester;
     use smallvec::smallvec;
     use std::sync::Arc;
     use tempfile::tempdir;
-    use crate::plugins::harmonizer::SyncTester;
 
     use crate::{
         clock::MockClock,
@@ -691,9 +1067,8 @@ mod tests {
 
     fn draft(level: u16, mins: &[&[u8]], maxs: &[&[u8]]) -> AvailabilityDraft {
         let len = mins.len().min(maxs.len());
-        let dims: smallvec::SmallVec<[TableHash; 4]> = (0..len)
-            .map(|i| TableHash { hash: i as u64 })
-            .collect();
+        let dims: smallvec::SmallVec<[TableHash; 4]> =
+            (0..len).map(|i| TableHash { hash: i as u64 }).collect();
         let mins_sv: smallvec::SmallVec<[Vec<u8>; 4]> = mins.iter().map(|m| m.to_vec()).collect();
         let maxs_sv: smallvec::SmallVec<[Vec<u8>; 4]> = maxs.iter().map(|m| m.to_vec()).collect();
         AvailabilityDraft {
@@ -713,8 +1088,10 @@ mod tests {
         )
         .await;
         db.create_table_and_indexes::<Availability>().unwrap();
-        db.create_table_and_indexes::<crate::plugins::harmonizer::child_set::Child>().unwrap();
-        db.create_table_and_indexes::<crate::plugins::harmonizer::child_set::DigestChunk>().unwrap();
+        db.create_table_and_indexes::<crate::plugins::harmonizer::child_set::Child>()
+            .unwrap();
+        db.create_table_and_indexes::<crate::plugins::harmonizer::child_set::DigestChunk>()
+            .unwrap();
         db
     }
 
@@ -771,7 +1148,10 @@ mod tests {
             _a: &AvailabilityDraft,
             overlay: &ActionSet,
         ) -> f32 {
-            overlay.iter().filter(|x| matches!(x, Action::Delete(_))).count() as f32
+            overlay
+                .iter()
+                .filter(|x| matches!(x, Action::Delete(_)))
+                .count() as f32
         }
     }
 
@@ -797,7 +1177,7 @@ mod tests {
 
         let base = draft(0, &[b"a"], &[b"a\x01"]);
         let txn = db.begin_read_txn().unwrap();
-        let got = opt.propose(&db, &txn, &[base]).await.unwrap();
+        let got = opt.propose(&db, &txn, &[base], None).await.unwrap();
         assert!(got.is_none());
     }
 
@@ -810,7 +1190,9 @@ mod tests {
         t.step(5).await;
         // Integrity check (no availability yet) should be clean
         for n in t.peers().iter() {
-            let errs = crate::plugins::harmonizer::integrity_run_all(&n.db, None, n.peer_id, false).await.unwrap();
+            let errs = crate::plugins::harmonizer::integrity_run_all(&n.db, None, n.peer_id, false)
+                .await
+                .unwrap();
             assert!(errs.is_empty());
         }
     }
@@ -829,7 +1211,7 @@ mod tests {
         // small leaf
         let base = draft(0, &[&[15u8, 0x00]], &[&[15u8, 0x01]]);
         let txn = db.begin_read_txn().unwrap();
-        let plan = opt.propose(&db, &txn, &[base]).await.unwrap().unwrap();
+        let plan = opt.propose(&db, &txn, &[base], None).await.unwrap().unwrap();
         assert!(
             plan.iter()
                 .any(|a| matches!(a, Action::Insert(d) if d.level >= 1)),
@@ -842,7 +1224,9 @@ mod tests {
     #[tokio::test]
     async fn planner_generates_delete_candidates() {
         let db = fresh_db().await;
-        let ctx = PeerContext { peer_id: UuidBytes::new() };
+        let ctx = PeerContext {
+            peer_id: UuidBytes::new(),
+        };
 
         // Create a leaf and a parent that contains it; parent is root (no parent edge)
         use crate::tables::TableHash;
@@ -850,11 +1234,8 @@ mod tests {
         let leaf = Availability {
             key: UuidBytes::new(),
             peer_id: ctx.peer_id,
-            range: RangeCube::new(
-                smallvec![dim],
-                smallvec![vec![0x10]],
-                smallvec![vec![0x11]],
-            ).unwrap(),
+            range: RangeCube::new(smallvec![dim], smallvec![vec![0x10]], smallvec![vec![0x11]])
+                .unwrap(),
             level: 0,
             schema_hash: 0,
             version: 0,
@@ -865,11 +1246,8 @@ mod tests {
         let parent = Availability {
             key: UuidBytes::new(),
             peer_id: ctx.peer_id,
-            range: RangeCube::new(
-                smallvec![dim],
-                smallvec![vec![0x10]],
-                smallvec![vec![0x12]],
-            ).unwrap(),
+            range: RangeCube::new(smallvec![dim], smallvec![vec![0x10]], smallvec![vec![0x12]])
+                .unwrap(),
             level: 1,
             schema_hash: 0,
             version: 0,
@@ -883,9 +1261,16 @@ mod tests {
         cs.add_child(&db, leaf.key).await.unwrap();
 
         let opt = BasicOptimizer::new(Box::new(DeleteFavorScorer), ctx.clone()).with_caps(caps());
-        let seed = AvailabilityDraft { level: 0, range: leaf.range.clone(), complete: true };
+        let seed = AvailabilityDraft {
+            level: 0,
+            range: leaf.range.clone(),
+            complete: true,
+        };
         let txn = db.begin_read_txn().unwrap();
-        let plan = opt.propose(&db, &txn, &[seed]).await.unwrap().unwrap();
-        assert!(plan.iter().any(|a| matches!(a, Action::Delete(_))), "expected a delete candidate to be proposed");
+        let plan = opt.propose(&db, &txn, &[seed], None).await.unwrap().unwrap();
+        assert!(
+            plan.iter().any(|a| matches!(a, Action::Delete(_))),
+            "expected a delete candidate to be proposed"
+        );
     }
 }

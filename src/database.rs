@@ -1177,6 +1177,13 @@ impl KuramotoDb {
         reply: tokio::sync::oneshot::Sender<Result<(), StorageError>>,
         origin: WriteOrigin,
     ) -> Result<(), StorageError> {
+        let dbg = std::env::var("KDB_DEBUG_RANGE").ok().is_some();
+        if dbg {
+            println!(
+                "db.write: handle_write start batch_len={} origin={:?}",
+                batch.len(), origin
+            );
+        }
         let wtxn = self
             .db
             .begin_write()
@@ -1192,6 +1199,12 @@ impl KuramotoDb {
             plugin
                 .before_update_with_origin(&*self, &rtxn, &mut batch, origin)
                 .await?;
+        }
+        if dbg {
+            println!(
+                "db.write: after before_update hooks batch_len={}",
+                batch.len()
+            );
         }
 
         // Keep a snapshot for after-write hooks
@@ -1209,6 +1222,7 @@ impl KuramotoDb {
                     index_puts,
                     index_removes,
                 } => {
+                    if dbg { println!("db.write: applying PUT table={}", data_table.name()); }
                     // ---- Version check ----
                     {
                         let meta_t = wtxn
@@ -1298,6 +1312,7 @@ impl KuramotoDb {
                     meta,
                     index_removes,
                 } => {
+                    if dbg { println!("db.write: applying DELETE table={}", data_table.name()); }
                     // ---- Delete main row ----
                     {
                         let mut t = wtxn
@@ -1330,21 +1345,27 @@ impl KuramotoDb {
         }
 
         // Commit once
+        if dbg { println!("db.write: commit begin"); }
         wtxn.commit()
             .map_err(|e| StorageError::Other(e.to_string()))?;
+        if dbg { println!("db.write: commit done"); }
 
         // Trigger after-write hooks asynchronously to avoid deadlocks.
         let db_for_hooks = self.clone();
         let plugins = self.plugins.clone();
         tokio::spawn(async move {
+            let dbg = std::env::var("KDB_DEBUG_RANGE").ok().is_some();
             for plugin in plugins.iter() {
+                if dbg { println!("db.write: after_write start"); }
                 if let Err(e) = plugin.after_write(&db_for_hooks, &applied_snapshot, origin).await {
                     tracing::error!("after_write error: {}", e);
                 }
+                if dbg { println!("db.write: after_write end"); }
             }
         });
 
         // Reply once for the whole batch
+        if dbg { println!("db.write: sending reply Ok(())"); }
         let _ = reply.send(Ok(()));
         Ok(())
     }

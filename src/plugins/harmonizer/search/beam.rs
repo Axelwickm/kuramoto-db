@@ -211,6 +211,9 @@ where
         }
 
         // -------- Depth 1: score all kids; optionally do selective rollout on the tie plateau -----
+        // TODO(future): Interleave candidate generation and scoring; evaluate common/simple
+        // variants first (and short-circuit on early dominance) instead of generating the
+        // full set upfront. This can cut large tie plateaus early and avoid expensive rollout.
         let t_gen = std::time::Instant::now();
         let raw_kids = cand.candidates(current);
         gen_candidates_ms = t_gen.elapsed().as_millis();
@@ -370,6 +373,47 @@ where
             if *feas && *sc - s0 > best_gain {
                 best_gain = *sc - s0;
                 best_seq = vec![act.clone()];
+            }
+        }
+
+        // Tie-aware early exit:
+        // If depth >= 2 but the best immediate, feasible action is uniquely best
+        // (within tie_margin) and exceeds eps, return it without looking ahead.
+        if self.cfg.depth >= 2 && best_gain > self.cfg.eps && !best_seq.is_empty() {
+            // Find the best feasible immediate score
+            let mut best_feas_sc = f32::NEG_INFINITY;
+            for (_prio, sc, feas, _act, _st) in &kids {
+                if *feas && *sc > best_feas_sc {
+                    best_feas_sc = *sc;
+                }
+            }
+            if best_feas_sc.is_finite() {
+                let mut ties = 0usize;
+                for (_prio, sc, feas, _act, _st) in &kids {
+                    if *feas && (best_feas_sc - *sc).abs() <= self.cfg.tie_margin {
+                        ties += 1;
+                    }
+                }
+                if ties <= 1 {
+                    println!(
+                        "search.best_single: unique best gain={:.3} -> early return",
+                        best_gain
+                    );
+                    println!(
+                        "search.best_seq: depth={} gain={:.3} len=1",
+                        self.cfg.depth, best_gain
+                    );
+                    println!(
+                        "search.timing: total={}ms \
+                         | gen={}ms d1_rollout={}ms d1_score={}ms d1_sort={}ms (early)",
+                        t_total.elapsed().as_millis(),
+                        gen_candidates_ms,
+                        d1_rollout_ms,
+                        d1_score_ms,
+                        d1_sort_ms
+                    );
+                    return Some(best_seq);
+                }
             }
         }
 

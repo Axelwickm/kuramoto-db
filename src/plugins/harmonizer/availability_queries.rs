@@ -1,16 +1,18 @@
 use redb::ReadTransaction;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use crate::plugins::harmonizer::optimizer::Action::Delete;
 use crate::plugins::harmonizer::optimizer::Action::Insert;
+use crate::plugins::harmonizer::optimizer::Action::Atom;
 use crate::tables::TableHash;
 use crate::{
     KuramotoDb, StaticTableDef,
     plugins::harmonizer::{
         availability::{Availability, roots_for_peer, AVAILABILITY_BY_RANGE_MIN},
         child_set::ChildSet,
-        optimizer::ActionSet,
+        optimizer::{ActionSet, AvailabilityDraft},
         range_cube::RangeCube,
     },
     storage_error::StorageError,
@@ -41,6 +43,18 @@ impl AvailabilityQueryCache {
             None => false,
         }
     }
+}
+
+/*──────────────────────── Debug controls ─────────────────────*/
+
+fn debug_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        match std::env::var("KDB_DEBUG_RANGE") {
+            Ok(v) => !v.is_empty() && v != "0" && v.to_lowercase() != "false",
+            Err(_) => false,
+        }
+    })
 }
 
 /// Txn-aware loader for a child **availability** by its *availability key*.
@@ -79,6 +93,48 @@ pub async fn range_cover(
     overlay: &ActionSet,
     cache: &mut Option<&mut AvailabilityQueryCache>,
 ) -> Result<(Vec<Availability>, bool), StorageError> {
+    // Use the unified frontier engine and synthesize overlay nodes into
+    // Availability rows to preserve existing public API semantics.
+    let (nodes, no_overlap) =
+        cover_frontier_raw(db, txn, target, root_ids, level_limit, overlay, cache).await?;
+    let mut out: Vec<Availability> = Vec::new();
+    for n in nodes {
+        match n {
+            FrontierNode::Db(a) => out.push(a),
+            FrontierNode::Overlay(d) => {
+                let ov = Availability {
+                    key: UuidBytes::new(),
+                    peer_id: UuidBytes::new(),
+                    range: d.range.clone(),
+                    level: d.level,
+                    schema_hash: 0,
+                    version: 0,
+                    updated_at: 0,
+                    complete: true,
+                };
+                out.push(ov);
+            }
+        }
+    }
+    Ok((out, no_overlap))
+}
+
+/// Unified frontier engine used by `range_cover` and `peer_contains_range_local`.
+/// Returns overlay inserts as tagged drafts without synthesizing DB rows.
+pub enum FrontierNode {
+    Db(Availability),
+    Overlay(AvailabilityDraft),
+}
+
+pub async fn cover_frontier_raw(
+    db: &KuramotoDb,
+    txn: Option<&ReadTransaction>,
+    target: &RangeCube,
+    root_ids: &[UuidBytes],
+    level_limit: Option<usize>,
+    overlay: &ActionSet,
+    cache: &mut Option<&mut AvailabilityQueryCache>,
+) -> Result<(Vec<FrontierNode>, bool), StorageError> {
     #[async_recursion::async_recursion]
     async fn dfs(
         db: &KuramotoDb,
@@ -89,52 +145,127 @@ pub async fn range_cover(
         budget: Option<usize>,
         touched: &mut bool,
         cache: &mut Option<&mut AvailabilityQueryCache>,
+        dbg_stack: &mut Option<Vec<UuidBytes>>,
     ) -> Result<(), StorageError> {
         if budget == Some(0) {
             return Ok(());
         }
         let next_budget = budget.map(|d| d.saturating_sub(1));
 
-        // Load node from the same snapshot (if any)
+        if debug_enabled() {
+            let stack = dbg_stack.get_or_insert_with(|| Vec::new());
+            if stack.contains(&id) {
+                let mut path_hex: Vec<String> = stack
+                    .iter()
+                    .cloned()
+                    .chain(std::iter::once(id))
+                    .map(|u| {
+                        let b = u.as_bytes();
+                        b.iter().map(|bb| format!("{:02x}", bb)).collect::<String>()
+                    })
+                    .collect();
+                println!(
+                    "aq.range_cover: cycle detected depth={} path=[{}]",
+                    stack.len(),
+                    path_hex.join(" -> ")
+                );
+                return Ok(());
+            }
+            stack.push(id);
+            println!(
+                "aq.range_cover: enter id={:02x?} depth={} budget={:?}",
+                id.as_bytes(),
+                stack.len(),
+                budget
+            );
+        }
+
         let Some(av) = resolve_child_avail_cached(db, txn, &id, cache).await? else {
+            if debug_enabled() {
+                if let Some(stack) = dbg_stack.as_mut() { let _ = stack.pop(); }
+                println!("aq.range_cover: missing child id={:02x?}", id.as_bytes());
+            }
             return Ok(());
         };
 
-        // Only consider nodes that *touch* target
         if av.range.intersect(cube).is_none() {
+            if debug_enabled() {
+                if let Some(stack) = dbg_stack.as_mut() { let _ = stack.pop(); }
+                println!(
+                    "aq.range_cover: skip id={:02x?} (no intersect)",
+                    av.key.as_bytes()
+                );
+            }
             return Ok(());
         }
         *touched = true;
 
-        // Leaf or incomplete → frontier (children resolved via child table)
         let cs = open_childset_cached(db, txn, av.key, cache).await?;
         let is_leaf = cs.count() == 0;
         if !av.complete || is_leaf {
+            if debug_enabled() {
+                println!(
+                    "aq.range_cover: frontier add id={:02x?} (incomplete_or_leaf) children={}",
+                    av.key.as_bytes(),
+                    cs.count()
+                );
+                if let Some(stack) = dbg_stack.as_mut() { let _ = stack.pop(); }
+            }
             out.push(av);
             return Ok(());
         }
 
-        // Resolve all children first; if any is missing → frontier
         let mut child_ids = Vec::with_capacity(cs.count());
         for cid in &cs.children {
             match resolve_child_avail_cached(db, txn, cid, cache).await? {
                 Some(_) => child_ids.push(*cid),
                 None => {
+                    if debug_enabled() {
+                        println!(
+                            "aq.range_cover: frontier add id={:02x?} (missing child)",
+                            av.key.as_bytes()
+                        );
+                        if let Some(stack) = dbg_stack.as_mut() { let _ = stack.pop(); }
+                    }
                     out.push(av);
                     return Ok(());
                 }
             }
         }
 
-        // Recurse into resolvable children
         for cid in child_ids {
-            dfs(db, txn, out, cube, cid, next_budget, touched, cache).await?;
+            if debug_enabled() {
+                println!(
+                    "aq.range_cover: descend id={:02x?} -> child={:02x?}",
+                    av.key.as_bytes(),
+                    cid.as_bytes()
+                );
+            }
+            dfs(db, txn, out, cube, cid, next_budget, touched, cache, dbg_stack).await?;
+        }
+        if debug_enabled() {
+            if let Some(stack) = dbg_stack.as_mut() { let _ = stack.pop(); }
+            println!(
+                "aq.range_cover: exit id={:02x?} depth_done",
+                av.key.as_bytes()
+            );
         }
         Ok(())
     }
 
     let mut results = Vec::<Availability>::new();
     let mut touched = false;
+    let mut dbg_stack: Option<Vec<UuidBytes>> = if debug_enabled() {
+        println!(
+            "aq.range_cover: start target_dims={} roots={} level_limit={:?}",
+            target.dims().len(),
+            root_ids.len(),
+            level_limit
+        );
+        Some(Vec::new())
+    } else {
+        None
+    };
 
     for rid in root_ids {
         dfs(
@@ -146,28 +277,48 @@ pub async fn range_cover(
             level_limit,
             &mut touched,
             cache,
+            &mut dbg_stack,
         )
         .await?;
     }
 
-    // Dedup by key (roots may share subtrees)
     let mut seen = HashSet::<UuidBytes>::new();
     results.retain(|a| seen.insert(a.key));
 
-    // Overlay-aware: mask out deletes (deletes hide nodes; inserts ignored here)
     if !overlay.is_empty() {
         let mut deleted = HashSet::<UuidBytes>::new();
         for act in overlay {
-            if let Delete(id) = act {
-                deleted.insert(*id);
+            if let Delete(id) = act { deleted.insert(*id); }
+        }
+        if !deleted.is_empty() { results.retain(|a| !deleted.contains(&a.key)); }
+    }
+
+    let mut overlay_drafts: Vec<AvailabilityDraft> = Vec::new();
+    if !overlay.is_empty() {
+        use crate::plugins::harmonizer::optimizer::Action::Insert;
+        let mut geom = std::collections::HashSet::<(u16, Vec<Vec<u8>>, Vec<Vec<u8>>)>::new();
+        for act in overlay {
+            if let Insert(d) = act {
+                if d.complete {
+                    if target.intersect(&d.range).is_some() {
+                        let key = (d.level, d.range.mins().to_vec(), d.range.maxs().to_vec());
+                        if geom.insert(key) {
+                            overlay_drafts.push(d.clone());
+                        }
+                    }
+                }
             }
         }
-        if !deleted.is_empty() {
-            results.retain(|a| !deleted.contains(&a.key));
+        if !overlay_drafts.is_empty() {
+            results.retain(|a| !overlay_drafts.iter().any(|ov| ov.range.contains(&a.range)));
+            touched = true;
         }
     }
 
-    Ok((results, !touched))
+    let mut out: Vec<FrontierNode> = Vec::new();
+    for d in overlay_drafts.into_iter() { out.push(FrontierNode::Overlay(d)); }
+    for a in results.into_iter() { out.push(FrontierNode::Db(a)); }
+    Ok((out, !touched))
 }
 
 /// Internal: cached resolve by id (DB snapshot only)
@@ -306,6 +457,32 @@ pub(crate) async fn storage_atom_count_in_cube_tx(
     }
 
     Ok(Some(total))
+}
+
+/// Overlay-aware variant: counts atoms from the snapshot and also any `Action::Atom`
+/// overlay entries whose cube is contained within `cube`. If dims are unknown in the
+/// snapshot (returns None) but overlay provides atoms, returns Some(count_from_overlay).
+pub(crate) async fn storage_atom_count_in_cube_tx_overlay(
+    db: &KuramotoDb,
+    txn: Option<&ReadTransaction>,
+    cube: &RangeCube,
+    overlay: &ActionSet,
+) -> Result<Option<usize>, StorageError> {
+    let base = storage_atom_count_in_cube_tx(db, txn, cube).await?;
+    let mut overlay_cnt = 0usize;
+    for act in overlay.iter() {
+        if let Atom(r) = act {
+            if cube.contains(r) {
+                overlay_cnt += 1;
+            }
+        }
+    }
+    match base {
+        Some(n) => Ok(Some(n + overlay_cnt)),
+        None => {
+            if overlay_cnt > 0 { Ok(Some(overlay_cnt)) } else { Ok(None) }
+        }
+    }
 }
 
 /// Fast lookup of availabilities fully contained in `cube` using the axis-min index.
@@ -472,10 +649,9 @@ pub async fn child_count(
     cache: &mut Option<&mut AvailabilityQueryCache>,
 ) -> Result<usize, StorageError> {
     if level == 0 {
-        // Storage atoms only. Cache by cube geometry per-txn.
-        // Level 0: count storage atoms in the cube (direct, no extra memoization here)
+        // Storage atoms only. Include overlay atoms when present.
         let t0 = Instant::now();
-        let out = storage_atom_count_in_cube_tx(db, txn, cube)
+        let out = storage_atom_count_in_cube_tx_overlay(db, txn, cube, overlay)
             .await?
             .unwrap_or(0);
         // println!(
@@ -499,8 +675,8 @@ pub async fn child_count(
         geom.insert((a.level, a.range.mins().to_vec(), a.range.maxs().to_vec()));
     }
 
-    // Overlay: deletes mask existing; inserts are counted if contained and not already present.
-    use crate::plugins::harmonizer::optimizer::Action::{Delete, Insert};
+    // Overlay: deletes mask existing; inserts/atoms are counted if contained and not already present.
+    use crate::plugins::harmonizer::optimizer::Action::{Atom, Delete, Insert};
     let mut deleted: std::collections::HashSet<UuidBytes> = std::collections::HashSet::new();
     for act in overlay.iter() {
         if let Delete(id) = act {
@@ -513,13 +689,25 @@ pub async fn child_count(
     }
 
     for act in overlay.iter() {
-        if let Insert(d) = act {
-            if d.complete && (d.level as u16) < level && cube.contains(&d.range) {
-                let key = (d.level, d.range.mins().to_vec(), d.range.maxs().to_vec());
-                if !geom.contains(&key) {
-                    geom.insert(key);
+        match act {
+            Insert(d) => {
+                if d.complete && (d.level as u16) < level && cube.contains(&d.range) {
+                    let key = (d.level, d.range.mins().to_vec(), d.range.maxs().to_vec());
+                    if !geom.contains(&key) {
+                        geom.insert(key);
+                    }
                 }
             }
+            Atom(r) => {
+                // Treat atoms as level-0 provisional children
+                if 0u16 < level && cube.contains(r) {
+                    let key = (0u16, r.mins().to_vec(), r.maxs().to_vec());
+                    if !geom.contains(&key) {
+                        geom.insert(key);
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -536,15 +724,6 @@ pub async fn peer_contains_range_local(
     overlay: &ActionSet,
     cache: &mut Option<&mut AvailabilityQueryCache>,
 ) -> Result<bool, StorageError> {
-    // First honor overlay inserts: if any complete draft contains target, return true.
-    for act in overlay {
-        if let Insert(d) = act {
-            if d.complete && d.range.contains(target) {
-                return Ok(true);
-            }
-        }
-    }
-
     // Prefer entity-scoped roots when target carries dimensions
     let roots = if let Some(fd) = target.dims().first() {
         roots_for_peer_cached_scoped(db, txn, peer, fd.hash(), cache).await?
@@ -552,12 +731,22 @@ pub async fn peer_contains_range_local(
         roots_for_peer_cached(db, txn, peer, cache).await?
     };
     let root_ids: Vec<UuidBytes> = roots.into_iter().map(|r| r.key).collect();
-    let (frontier, no_overlap) =
-        range_cover(db, txn, target, &root_ids, None, overlay, cache).await?;
-    // Do not early-return on no_overlap; overlay may cover target even if roots don't.
-    for a in frontier {
-        if a.peer_id == *peer && a.complete && a.range.contains(target) {
-            return Ok(true);
+    let (nodes, _no_overlap) =
+        cover_frontier_raw(db, txn, target, &root_ids, None, overlay, cache).await?;
+    // Overlay nodes first: if any complete overlay draft contains target, we're covered
+    for n in &nodes {
+        if let FrontierNode::Overlay(d) = n {
+            if d.complete && d.range.contains(target) {
+                return Ok(true);
+            }
+        }
+    }
+    // Then check DB frontier for a local, complete container
+    for n in nodes {
+        if let FrontierNode::Db(a) = n {
+            if a.peer_id == *peer && a.complete && a.range.contains(target) {
+                return Ok(true);
+            }
         }
     }
     Ok(false)
@@ -933,6 +1122,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn overlay_atoms_count_for_level0_and_overlay_only_dims() {
+        let db = fresh_db().await;
+
+        // Use a fake dim hash not registered in DB so base counting returns None.
+        let fake = TableHash { hash: 0xDEAD_BEEF_DEAD_BEEFu64 };
+        // Point-like cube [m, m+1)
+        let r = cube(fake, b"m", &{
+            let mut v = b"m".to_vec();
+            v.push(1);
+            v
+        });
+
+        // Overlay with a single atom at r
+        let overlay: ActionSet = vec![crate::plugins::harmonizer::optimizer::Action::Atom(r.clone())];
+
+        // storage_atom_count_in_cube_tx_overlay should return Some(1) even when base is None
+        let n = super::storage_atom_count_in_cube_tx_overlay(&db, None, &r, &overlay)
+            .await
+            .unwrap();
+        assert_eq!(n, Some(1));
+
+        // child_count(level=0) should also see the overlay atom
+        let mut cache = None;
+        let cnt = super::child_count(
+            &db,
+            None,
+            &UuidBytes::new(),
+            &r,
+            0,
+            &overlay,
+            &mut cache,
+        )
+        .await
+        .unwrap();
+        assert_eq!(cnt, 1);
+    }
+
+    #[tokio::test]
+    async fn child_count_level_gt0_counts_overlay_atoms_as_children() {
+        let db = fresh_db().await;
+        let dim = TableHash { hash: 0xABCDEF01 };
+
+        // Candidate parent covering [10..13)
+        let parent = cube(dim, &[10], &[13]);
+
+        // Overlay atom at [11..12)
+        let atom = cube(dim, &[11], &[12]);
+        let overlay: ActionSet = vec![crate::plugins::harmonizer::optimizer::Action::Atom(atom.clone())];
+
+        // With no DB children, level=1 should count the overlay atom as one child
+        let mut cache = None;
+        let cnt = super::child_count(&db, None, &UuidBytes::new(), &parent, 1, &overlay, &mut cache)
+            .await
+            .unwrap();
+        assert_eq!(cnt, 1);
+
+        // Add a DB leaf [12..13) for the same peer; now expect 2 children total
+        let peer = UuidBytes::new();
+        let leaf = Availability {
+            key: UuidBytes::new(),
+            peer_id: peer,
+            range: cube(dim, &[12], &[13]),
+            level: 0,
+            schema_hash: 0,
+            version: 0,
+            updated_at: 0,
+            complete: true,
+        };
+        db.put(leaf).await.unwrap();
+
+        let mut cache2 = None;
+        let cnt2 = super::child_count(&db, None, &peer, &parent, 1, &overlay, &mut cache2)
+            .await
+            .unwrap();
+        assert_eq!(cnt2, 2);
+    }
+
+    #[tokio::test]
     async fn contained_lookup_by_narrow_axis() {
         let db = fresh_db().await;
         let d1 = TableHash { hash: 10 };
@@ -1211,9 +1478,9 @@ mod tests {
     }
 
     #[tokio::test]
-    // Overlay inserts should not modify range_cover (DB-only),
-    // but must be visible via helpers (containment/child count).
-    async fn overlay_inserts_affect_helpers_not_range_cover() {
+    // Overlay inserts should be visible to range_cover even without DB roots
+    // and also be honored by helpers (containment/child count).
+    async fn overlay_inserts_affect_range_cover_and_helpers() {
         let db = fresh_db().await;
         let dim = TableHash { hash: 43 };
 
@@ -1226,12 +1493,13 @@ mod tests {
         };
         let overlay = vec![Action::Insert(draft)];
 
-        // Range-cover with no roots remains empty
+        // Range-cover with no roots should return the overlay node covering target
         let (nodes, no_overlap) = range_cover(&db, None, &target, &[], None, &overlay, &mut None)
             .await
             .unwrap();
-        assert!(no_overlap);
-        assert!(nodes.is_empty());
+        assert!(!no_overlap);
+        assert_eq!(nodes.len(), 1, "overlay insert should appear as frontier");
+        assert_eq!(nodes[0].level, 0);
 
         // Containment helper should see overlay
         let peer = UuidBytes::new();
@@ -1245,6 +1513,58 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(cnt0, 0);
+    }
+
+    #[tokio::test]
+    async fn overlay_inserts_prioritize_over_db_nodes() {
+        let db = fresh_db().await;
+        let dim = TableHash { hash: 44 };
+        // Build root -> leaf
+        let leaf = Availability {
+            key: UuidBytes::new(),
+            peer_id: UuidBytes::new(),
+            range: cube(dim, b"m", b"n"),
+            level: 0,
+            schema_hash: 0,
+            version: 0,
+            updated_at: 0,
+            complete: true,
+        };
+        let root = Availability {
+            key: UuidBytes::new(),
+            peer_id: leaf.peer_id,
+            range: cube(dim, b"a", b"z"),
+            level: 2,
+            schema_hash: 0,
+            version: 0,
+            updated_at: 0,
+            complete: true,
+        };
+        db.put(root.clone()).await.unwrap();
+        db.put(leaf.clone()).await.unwrap();
+        let mut cs = ChildSet::open(&db, root.key).await.unwrap();
+        cs.add_child(&db, leaf.key).await.unwrap();
+
+        // Overlay insert covering the same region
+        use crate::plugins::harmonizer::optimizer::{Action, AvailabilityDraft};
+        let draft = AvailabilityDraft {
+            level: 1,
+            range: cube(dim, b"m", b"n"),
+            complete: true,
+        };
+        let overlay = vec![Action::Insert(draft)];
+        let target = cube(dim, b"m", b"n");
+
+        // Range cover should return the overlay node (priority) and not the DB leaf
+        let (nodes, no_overlap) =
+            range_cover(&db, None, &target, &[root.key], None, &overlay, &mut None)
+                .await
+                .unwrap();
+        assert!(!no_overlap);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].level, 1, "overlay insert should take precedence");
+        // ensure the DB leaf wasn't returned
+        assert_ne!(nodes[0].key, leaf.key);
     }
 
     #[tokio::test]
