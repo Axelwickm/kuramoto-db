@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use redb::ReadTransaction;
 
 pub mod communication;
+pub mod versioning;
 
 // Harmonizer is optional; gate entire module behind feature.
 #[cfg(feature = "harmonizer")]

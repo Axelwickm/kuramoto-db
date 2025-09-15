@@ -84,8 +84,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("selfid.redb");
         let clock = Arc::new(MockClock::new(0));
-        let p = SelfIdentity::new();
-        let db = KuramotoDb::new(path.to_str().unwrap(), clock.clone(), vec![p.clone()]).await;
+        // Build DB without registering the plugin to avoid concurrent spawn in attach_db.
+        let db = KuramotoDb::new(path.to_str().unwrap(), clock.clone(), vec![]).await;
         let a = SelfIdentity::get_peer_id(&db).await.unwrap();
         let b = SelfIdentity::get_peer_id(&db).await.unwrap();
         assert_eq!(a, b, "self id should be stable within process");

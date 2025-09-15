@@ -16,10 +16,7 @@ use crate::plugins::Plugin;
 use crate::storage_entity::IndexCardinality;
 use crate::tables::TableHash;
 
-use super::{
-    clock::Clock, meta::BlobMeta, region_lock::RegionLock, storage_entity::StorageEntity,
-    storage_error::StorageError,
-};
+use super::{clock::Clock, storage_entity::StorageEntity, storage_error::StorageError};
 
 pub type StaticTableDef = &'static TableDefinition<'static, &'static [u8], Vec<u8>>;
 
@@ -205,13 +202,6 @@ impl KuramotoDb {
                     Box::pin(async move {
                         // Fetch the current entity so we can generate all index keys to remove
                         let old_entity = db.get_data::<E>(pk).await?;
-                        let old_meta = db.get_meta::<E>(pk).await?;
-                        let now = db.clock.now();
-                        let meta = BlobMeta {
-                            deleted_at: Some(now),
-                            updated_at: now,
-                            ..old_meta
-                        };
 
                         let index_removes: Vec<IndexRemoveRequest> = E::indexes()
                             .iter()
@@ -241,11 +231,8 @@ impl KuramotoDb {
                             data_table: &E::table_def(),
                             meta_table: &E::meta_table_def(),
                             key: pk.to_vec(),
-                            meta: bincode::encode_to_vec(
-                                meta,
-                                bincode::config::standard(),
-                            )
-                            .map_err(|e| StorageError::Bincode(e.to_string()))?,
+                            // Leave meta empty; a plugin may synthesize it.
+                            meta: Vec::new(),
                             index_removes,
                         })
                     })
@@ -570,16 +557,16 @@ impl KuramotoDb {
             .await
     }
 
-    /// Like `range_by_index_tx`, but returns `(entity, BlobMeta)` pairs resolved
+    /// Like `range_by_index_tx`, but returns `(entity, meta_bytes)` pairs resolved
     /// from the same snapshot (`txn` or a fresh one if `None`).
-    pub async fn range_with_meta_by_index_tx<E: StorageEntity>(
+    pub async fn range_with_meta_raw_by_index_tx<E: StorageEntity>(
         &self,
         txn: Option<&redb::ReadTransaction>,
         index_table: StaticTableDef,
         start_idx_key: &[u8],
         end_idx_key: &[u8],
         limit: Option<usize>,
-    ) -> Result<Vec<(E, BlobMeta)>, StorageError> {
+    ) -> Result<Vec<(E, Vec<u8>)>, StorageError> {
         let rtxn_guard;
         let rt = if let Some(rt) = txn {
             rt
@@ -627,26 +614,28 @@ impl KuramotoDb {
                     .map_err(|e| StorageError::Other(e.to_string()))?
                     .ok_or(StorageError::NotFound)?
                     .value();
-                let (m, _) = bincode::decode_from_slice::<BlobMeta, _>(
-                    &meta_raw,
-                    bincode::config::standard(),
-                )
-                .map_err(|e| StorageError::Bincode(e.to_string()))?;
-                out.push((e, m));
+                out.push((e, meta_raw.to_vec()));
             }
         }
         Ok(out)
     }
 
-    /// Convenience wrapper for `range_with_meta_by_index_tx(None, ...)`.
-    pub async fn range_with_meta_by_index<E: StorageEntity>(
+    /// Convenience wrapper for `range_with_meta_raw_by_index_tx(None, ...)`.
+    pub async fn range_with_meta_raw_by_index<E: StorageEntity>(
         &self,
         index_table: StaticTableDef,
         start_idx_key: &[u8],
         end_idx_key: &[u8],
         limit: Option<usize>,
-    ) -> Result<Vec<(E, BlobMeta)>, StorageError> {
-        self.range_with_meta_by_index_tx::<E>(None, index_table, start_idx_key, end_idx_key, limit)
+    ) -> Result<Vec<(E, Vec<u8>)>, StorageError> {
+        self
+            .range_with_meta_raw_by_index_tx::<E>(
+                None,
+                index_table,
+                start_idx_key,
+                end_idx_key,
+                limit,
+            )
             .await
     }
 
@@ -733,11 +722,11 @@ impl KuramotoDb {
         self.get_by_index_all_tx::<E>(None, t, k).await
     }
 
-    pub async fn get_meta_tx<E: StorageEntity>(
+    pub async fn get_meta_raw_tx<E: StorageEntity>(
         &self,
         txn: Option<&redb::ReadTransaction>,
         key: &[u8],
-    ) -> Result<BlobMeta, StorageError> {
+    ) -> Result<Vec<u8>, StorageError> {
         self.with_read(txn, |rt| {
             let t = rt
                 .open_table(E::meta_table_def().clone())
@@ -746,21 +735,19 @@ impl KuramotoDb {
                 .get(key)
                 .map_err(|e| StorageError::Other(e.to_string()))?
                 .ok_or(StorageError::NotFound)?;
-            bincode::decode_from_slice::<BlobMeta, _>(&v.value(), bincode::config::standard())
-                .map(|(m, _)| m)
-                .map_err(|e| StorageError::Bincode(e.to_string()))
+            Ok(v.value().to_vec())
         })
     }
 
-    pub async fn get_meta<E: StorageEntity>(&self, key: &[u8]) -> Result<BlobMeta, StorageError> {
-        self.get_meta_tx::<E>(None, key).await
+    pub async fn get_meta_raw<E: StorageEntity>(&self, key: &[u8]) -> Result<Vec<u8>, StorageError> {
+        self.get_meta_raw_tx::<E>(None, key).await
     }
 
-    pub async fn get_with_meta_tx<E: StorageEntity>(
+    pub async fn get_with_meta_raw_tx<E: StorageEntity>(
         &self,
         txn: Option<&redb::ReadTransaction>,
         key: &[u8],
-    ) -> Result<(E, BlobMeta), StorageError> {
+    ) -> Result<(E, Vec<u8>), StorageError> {
         self.with_read(txn, |rt| {
             let data_t = rt
                 .open_table(E::table_def().clone())
@@ -779,18 +766,15 @@ impl KuramotoDb {
                 .get(key)
                 .map_err(|e| StorageError::Other(e.to_string()))?
                 .ok_or(StorageError::NotFound)?;
-            let (m, _) =
-                bincode::decode_from_slice::<BlobMeta, _>(&mv.value(), bincode::config::standard())
-                    .map_err(|e| StorageError::Bincode(e.to_string()))?;
-            Ok((e, m))
+            Ok((e, mv.value().to_vec()))
         })
     }
 
-    pub async fn get_with_meta<E: StorageEntity>(
+    pub async fn get_with_meta_raw<E: StorageEntity>(
         &self,
         key: &[u8],
-    ) -> Result<(E, BlobMeta), StorageError> {
-        self.get_with_meta_tx::<E>(None, key).await
+    ) -> Result<(E, Vec<u8>), StorageError> {
+        self.get_with_meta_raw_tx::<E>(None, key).await
     }
 
     // ------------  RANGE API  ------------
@@ -832,13 +816,13 @@ impl KuramotoDb {
         self.range_by_pk_tx::<E>(None, s, e, l).await
     }
 
-    pub async fn range_with_meta_by_pk_tx<E: StorageEntity>(
+    pub async fn range_with_meta_raw_by_pk_tx<E: StorageEntity>(
         &self,
         txn: Option<&redb::ReadTransaction>,
         start: &[u8],
         end: &[u8],
         limit: Option<usize>,
-    ) -> Result<Vec<(E, BlobMeta)>, StorageError> {
+    ) -> Result<Vec<(E, Vec<u8>)>, StorageError> {
         self.with_read(txn, |rt| {
             let data_t = rt
                 .open_table(E::table_def().clone())
@@ -859,12 +843,7 @@ impl KuramotoDb {
                     .map_err(|e| StorageError::Other(e.to_string()))?
                     .ok_or(StorageError::NotFound)?
                     .value();
-                let (m, _) = bincode::decode_from_slice::<BlobMeta, _>(
-                    &meta_raw,
-                    bincode::config::standard(),
-                )
-                .map_err(|e| StorageError::Bincode(e.to_string()))?;
-                out.push((e, m));
+                out.push((e, meta_raw.to_vec()));
                 if limit.map_or(false, |n| out.len() >= n) {
                     break;
                 }
@@ -873,13 +852,13 @@ impl KuramotoDb {
         })
     }
 
-    pub async fn range_with_meta_by_pk<E: StorageEntity>(
+    pub async fn range_with_meta_raw_by_pk<E: StorageEntity>(
         &self,
         s: &[u8],
         e: &[u8],
         l: Option<usize>,
-    ) -> Result<Vec<(E, BlobMeta)>, StorageError> {
-        self.range_with_meta_by_pk_tx::<E>(None, s, e, l).await
+    ) -> Result<Vec<(E, Vec<u8>)>, StorageError> {
+        self.range_with_meta_raw_by_pk_tx::<E>(None, s, e, l).await
     }
 
     pub async fn put_by_table_bytes(
@@ -976,27 +955,7 @@ impl KuramotoDb {
     ) -> Result<(), StorageError> {
         let (tx, rx) = oneshot::channel();
         let key = entity.primary_key();
-        let now = self.clock.now();
         let old_entity = self.get_data::<E>(&key).await.ok(); // To detect key changes
-        let old_meta = self.get_meta::<E>(&key).await.ok();
-
-        let meta = if let Some(old) = old_meta {
-            BlobMeta {
-                version: old.version + 1,
-                created_at: old.created_at,
-                updated_at: now,
-                deleted_at: None,
-                region_lock: RegionLock::None,
-            }
-        } else {
-            BlobMeta {
-                version: 0,
-                created_at: now,
-                updated_at: now,
-                deleted_at: None,
-                region_lock: RegionLock::None,
-            }
-        };
 
         let (index_puts, index_removes) = if let Some(old) = old_entity {
             // For updates: diff old vs new key sets per index.
@@ -1069,7 +1028,8 @@ impl KuramotoDb {
             meta_table: &E::meta_table_def(),
             key,
             value: entity.to_bytes(),
-            meta: bincode::encode_to_vec(meta, bincode::config::standard()).unwrap(),
+            // Leave meta empty; a plugin may synthesize/validate it.
+            meta: Vec::new(),
             index_puts,
             index_removes,
         };
@@ -1092,19 +1052,9 @@ impl KuramotoDb {
         origin: WriteOrigin,
     ) -> Result<(), StorageError> {
         let (tx, rx) = oneshot::channel();
-        let now = self.clock.now();
 
         // Fetch the current entity so we can generate all index keys to remove
         let old_entity = self.get_data::<E>(key).await?;
-
-        let meta = {
-            let old_meta = self.get_meta::<E>(key).await?;
-            BlobMeta {
-                deleted_at: Some(now),
-                updated_at: now,
-                ..old_meta
-            }
-        };
 
         // Generate index_removes
         let pk = key.to_vec();
@@ -1128,7 +1078,8 @@ impl KuramotoDb {
             data_table: &E::table_def(),
             meta_table: &E::meta_table_def(),
             key: key.to_vec(),
-            meta: bincode::encode_to_vec(meta, bincode::config::standard()).unwrap(),
+            // Leave meta empty; a plugin may synthesize/validate it.
+            meta: Vec::new(),
             index_removes,
         };
         self.write_tx
@@ -1223,7 +1174,8 @@ impl KuramotoDb {
                     index_removes,
                 } => {
                     if dbg { println!("db.write: applying PUT table={}", data_table.name()); }
-                    // ---- Version check ----
+                    // Minimal safety: if caller supplies meta bytes identical to existing,
+                    // reject as a no-op put without version increase (opaque check, no decode).
                     {
                         let meta_t = wtxn
                             .open_table(*meta_table)
@@ -1232,19 +1184,7 @@ impl KuramotoDb {
                             .get(&*key)
                             .map_err(|e| StorageError::Other(e.to_string()))?
                         {
-                            let (existing_meta, _) = bincode::decode_from_slice::<BlobMeta, _>(
-                                &existing_meta_raw.value(),
-                                bincode::config::standard(),
-                            )
-                            .map_err(|e| StorageError::Bincode(e.to_string()))?;
-                            let new_meta: BlobMeta = bincode::decode_from_slice::<BlobMeta, _>(
-                                &meta,
-                                bincode::config::standard(),
-                            )
-                            .map_err(|e| StorageError::Bincode(e.to_string()))?
-                            .0;
-
-                            if new_meta.version <= existing_meta.version {
+                            if existing_meta_raw.value() == meta.as_slice() && !meta.is_empty() {
                                 let _ = reply.send(Err(StorageError::PutButNoVersionIncrease));
                                 return Err(StorageError::PutButNoVersionIncrease);
                             }
@@ -1459,26 +1399,15 @@ mod tests {
     }
 
     // ---------- ASSERT HELPERS ----------
-    async fn assert_row<E: StorageEntity + PartialEq + std::fmt::Debug>(
+    async fn assert_row_exists<E: StorageEntity + PartialEq + std::fmt::Debug>(
         sys: &KuramotoDb,
         key: &[u8],
         expect_data: Option<&E>,
-        expect_version: u32,
-        expect_created: u64,
-        expect_updated: u64,
-        expect_deleted: bool,
     ) {
         match expect_data {
             Some(d) => assert_eq!(sys.get_data::<E>(key).await.unwrap(), *d),
             None => assert!(sys.get_data::<E>(key).await.is_err()),
         };
-        let meta = sys.get_meta::<E>(key).await.unwrap();
-        assert_eq!(meta.created_at, expect_created);
-        assert_eq!(meta.updated_at, expect_updated);
-        assert_eq!(meta.version, expect_version);
-
-        assert_eq!(meta.deleted_at.is_some(), expect_deleted);
-        assert_eq!(meta.region_lock, RegionLock::None);
     }
 
     async fn assert_index_row(
@@ -1534,112 +1463,12 @@ mod tests {
         // Now create table and indexes
         sys.create_table_and_indexes::<TestEntity>().unwrap();
 
-        // Now put should succeed
+        // Now put should succeed and be readable
         sys.put(e.clone()).await.unwrap();
-
-        assert_row::<TestEntity>(&sys, &e.id.to_be_bytes(), Some(&e), 0, 1_000, 1_000, false).await;
+        assert_row_exists::<TestEntity>(&sys, &e.id.to_be_bytes(), Some(&e)).await;
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn overwrite_updates_meta() {
-        let dir = tempdir().unwrap();
-        let clock = Arc::new(MockClock::new(10));
-        let sys = KuramotoDb::new(
-            dir.path().join("db.redb").to_str().unwrap(),
-            clock.clone(),
-            vec![],
-        )
-        .await;
-
-        sys.create_table_and_indexes::<TestEntity>().unwrap();
-
-        let mut e = TestEntity {
-            id: 99,
-            name: "X".into(),
-            value: 1,
-        };
-        sys.put(e.clone()).await.unwrap(); // initial
-        assert_row::<TestEntity>(&sys, &e.id.to_be_bytes(), Some(&e), 0, 10, 10, false).await;
-        clock.advance(5).await;
-        e.value = 2;
-        sys.put(e.clone()).await.unwrap(); // overwrite
-
-        assert_row::<TestEntity>(&sys, &e.id.to_be_bytes(), Some(&e), 1, 10, 15, false).await;
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn delete_and_undelete() {
-        let dir = tempdir().unwrap();
-        let clock = Arc::new(MockClock::new(500));
-        let sys = KuramotoDb::new(
-            dir.path().join("db.redb").to_str().unwrap(),
-            clock.clone(),
-            vec![],
-        )
-        .await;
-
-        sys.create_table_and_indexes::<TestEntity>().unwrap();
-
-        let e = TestEntity {
-            id: 7,
-            name: "Y".into(),
-            value: 0,
-        };
-        sys.put(e.clone()).await.unwrap(); // insert
-        clock.advance(10).await;
-        sys.delete::<TestEntity>(&e.id.to_be_bytes()).await.unwrap(); // delete
-        assert_row::<TestEntity>(&sys, &e.id.to_be_bytes(), None, 0, 500, 510, true).await;
-
-        clock.advance(5).await;
-        sys.put(e.clone()).await.unwrap(); // undelete / re-insert
-        assert_row::<TestEntity>(&sys, &e.id.to_be_bytes(), Some(&e), 1, 500, 515, false).await;
-    }
-
-    #[tokio::test]
-    async fn stale_version_rejected() {
-        let dir = tempdir().unwrap();
-        let clock = Arc::new(MockClock::new(50));
-        let sys = KuramotoDb::new(
-            dir.path().join("stale.redb").to_str().unwrap(),
-            clock.clone(),
-            vec![],
-        )
-        .await;
-
-        sys.create_table_and_indexes::<TestEntity>().unwrap();
-
-        // --- insert normally ---
-        let e = TestEntity {
-            id: 5,
-            name: "S".into(),
-            value: 5,
-        };
-        sys.put(e.clone()).await.unwrap();
-
-        // --- fetch existing meta so we can craft a stale write ---
-        let meta = sys
-            .get_meta::<TestEntity>(&e.id.to_be_bytes())
-            .await
-            .unwrap();
-
-        // Build a stale WriteRequest by hand (version not bumped)
-        let stale_wr = WriteRequest::Put {
-            data_table: TestEntity::table_def(),
-            meta_table: TestEntity::meta_table_def(),
-            key: e.primary_key(),
-            value: e.to_bytes(),
-            meta: bincode::encode_to_vec(meta, bincode::config::standard()).unwrap(), // same version
-            index_puts: vec![],
-            index_removes: vec![],
-        };
-
-        // Push manually and expect StaleVersion
-        let outcome = sys.raw_write(stale_wr).await;
-        assert!(matches!(
-            outcome,
-            Err(StorageError::PutButNoVersionIncrease)
-        ));
-    }
+    // Meta-related tests moved under plugins/versioning.
 
     // ============== INDEX TESTS ==============
     #[tokio::test(start_paused = true)]
@@ -1905,87 +1734,7 @@ mod tests {
         assert!(matches!(err, StorageError::DuplicateIndexKey { .. }));
     }
 
-    // ===== Plugins: order-dependent meta mutation =====
-    struct Add100Plugin;
-    #[async_trait]
-    impl Plugin for Add100Plugin {
-        async fn before_update(
-            &self,
-            _db: &KuramotoDb,
-            _txn: &ReadTransaction,
-            batch: &mut WriteBatch,
-        ) -> Result<(), StorageError> {
-            for req in batch {
-                if let WriteRequest::Put { meta, .. } = req {
-                    let (mut m, _): (BlobMeta, _) =
-                        bincode::decode_from_slice(meta, bincode::config::standard())
-                            .map_err(|o| StorageError::Bincode(o.to_string()))?;
-                    m.updated_at += 100;
-                    *meta = bincode::encode_to_vec(m, bincode::config::standard())
-                        .map_err(|o| StorageError::Bincode(o.to_string()))?;
-                }
-            }
-            Ok(())
-        }
-
-        fn attach_db(&self, _db: Arc<KuramotoDb>) {}
-    }
-
-    struct DoublePlugin;
-
-    #[async_trait]
-    impl Plugin for DoublePlugin {
-        async fn before_update(
-            &self,
-            _db: &KuramotoDb,
-            _txn: &ReadTransaction,
-            batch: &mut WriteBatch,
-        ) -> Result<(), StorageError> {
-            for req in batch {
-                if let WriteRequest::Put { meta, .. } = req {
-                    let (mut m, _): (BlobMeta, _) =
-                        bincode::decode_from_slice(meta, bincode::config::standard())
-                            .map_err(|o| StorageError::Bincode(o.to_string()))?;
-                    m.updated_at *= 2;
-                    *meta = bincode::encode_to_vec(m, bincode::config::standard())
-                        .map_err(|o| StorageError::Bincode(o.to_string()))?;
-                }
-            }
-            Ok(())
-        }
-
-        fn attach_db(&self, _db: Arc<KuramotoDb>) {}
-    }
-
-    #[tokio::test]
-    async fn plugins_applied_in_order() {
-        // ───── assemble DB with plugins in a specific order ─────
-        let dir = tempfile::tempdir().unwrap();
-        let clock = Arc::new(MockClock::new(100)); // initial now = 100
-
-        let db = KuramotoDb::new(
-            dir.path().join("order.redb").to_str().unwrap(),
-            clock.clone(),
-            vec![Arc::new(Add100Plugin), Arc::new(DoublePlugin)], // <- order!
-        )
-        .await;
-        db.create_table_and_indexes::<TestEntity>().unwrap();
-
-        // ───── put one entity ─────
-        let e = TestEntity {
-            id: 1,
-            name: "O".into(),
-            value: 9,
-        };
-        db.put(e.clone()).await.unwrap();
-
-        // ───── meta.updated_at should be (100 + 100) * 2 = 400 ─────
-        let meta = db
-            .get_meta::<TestEntity>(&1u64.to_be_bytes())
-            .await
-            .unwrap();
-        assert_eq!(meta.updated_at, 400);
-    }
+    // Plugins order test moved under plugins/versioning.
 
     // ───────── RANGE HELPERS: one test per public function ──────────────────────
 
@@ -2042,82 +1791,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn range_with_meta_by_pk_basic() {
-        let dir = tempdir().unwrap();
-        let clock = Arc::new(MockClock::new(123)); // initial now = 100
-        let db = KuramotoDb::new(
-            dir.path().join("pk_meta.redb").to_str().unwrap(),
-            clock,
-            vec![],
-        )
-        .await;
-        db.create_table_and_indexes::<TestEntity>().unwrap();
-
-        db.put(TestEntity {
-            id: 10,
-            name: "X".into(),
-            value: 1,
-        })
-        .await
-        .unwrap();
-        db.put(TestEntity {
-            id: 11,
-            name: "Y".into(),
-            value: 1,
-        })
-        .await
-        .unwrap();
-
-        let got = db
-            .range_with_meta_by_pk::<TestEntity>(&10u64.to_be_bytes(), &12u64.to_be_bytes(), None)
-            .await
-            .unwrap();
-        assert_eq!(got.len(), 2);
-        assert!(
-            got.iter()
-                .all(|(_, m)| m.version == 0 && m.created_at == 123)
-        );
-    }
-
-    #[tokio::test]
-    async fn range_with_meta_by_index_basic() {
-        let dir = tempdir().unwrap();
-        let clock = Arc::new(MockClock::new(999));
-        let db = KuramotoDb::new(
-            dir.path().join("idx_meta.redb").to_str().unwrap(),
-            clock,
-            vec![],
-        )
-        .await;
-        db.create_table_and_indexes::<TestEntity>().unwrap();
-
-        let rows = [
-            TestEntity {
-                id: 5,
-                name: "K".into(),
-                value: 2,
-            },
-            TestEntity {
-                id: 6,
-                name: "L".into(),
-                value: 2,
-            },
-        ];
-        for r in &rows {
-            db.put(r.clone()).await.unwrap();
-        }
-
-        let got = db
-            .range_with_meta_by_index::<TestEntity>(&TEST_NAME_INDEX, b"K", b"M", None)
-            .await
-            .unwrap();
-        assert_eq!(got.len(), 2);
-        for ((e, meta), expected) in got.iter().zip(rows.iter()) {
-            assert_eq!(e, expected);
-            assert_eq!(meta.created_at, 999);
-        }
-    }
+    // Meta-range helpers moved under plugins/versioning.
 
     #[tokio::test]
     async fn put_by_table_bytes_decodes_and_indexes() {
@@ -2647,138 +2321,7 @@ mod tests {
         assert_eq!(got[1].id, 2);
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn get_with_meta_tx_respects_snapshot() {
-        let dir = tempfile::tempdir().unwrap();
-        let clock = Arc::new(MockClock::new(100));
-        let db = KuramotoDb::new(
-            dir.path().join("gwmtx.redb").to_str().unwrap(),
-            clock.clone(),
-            vec![],
-        )
-        .await;
-        db.create_table_and_indexes::<TestEntity>().unwrap();
-
-        let mut e = TestEntity {
-            id: 1,
-            name: "X".into(),
-            value: 0,
-        };
-        db.put(e.clone()).await.unwrap(); // version 0, created_at = 100
-
-        let snap = db.begin_read_txn().unwrap();
-
-        clock.advance(5).await;
-        e.value = 1;
-        db.put(e.clone()).await.unwrap(); // version 1, updated_at = 105
-
-        let (se, sm) = db
-            .get_with_meta_tx::<TestEntity>(Some(&snap), &1u64.to_be_bytes())
-            .await
-            .unwrap();
-        assert_eq!(se.value, 0);
-        assert_eq!(sm.version, 0);
-        assert_eq!(sm.created_at, 100);
-
-        let (_ne, nm) = db
-            .get_with_meta::<TestEntity>(&1u64.to_be_bytes())
-            .await
-            .unwrap();
-        assert_eq!(nm.version, 1);
-        assert_eq!(nm.updated_at, 105);
-    }
-
-    #[tokio::test]
-    async fn range_with_meta_by_index_tx_respects_snapshot() {
-        let dir = tempfile::tempdir().unwrap();
-        let clock = Arc::new(MockClock::new(777));
-        let db = KuramotoDb::new(
-            dir.path().join("rwmbi.redb").to_str().unwrap(),
-            clock.clone(),
-            vec![],
-        )
-        .await;
-        db.create_table_and_indexes::<TestEntity>().unwrap();
-
-        for (id, name) in [(1, "A"), (2, "B")] {
-            db.put(TestEntity {
-                id,
-                name: name.into(),
-                value: 0,
-            })
-            .await
-            .unwrap();
-        }
-
-        let snap = db.begin_read_txn().unwrap();
-
-        // Add a third row after snapshot
-        db.put(TestEntity {
-            id: 3,
-            name: "C".into(),
-            value: 0,
-        })
-        .await
-        .unwrap();
-
-        let got_snap = db
-            .range_with_meta_by_index_tx::<TestEntity>(
-                Some(&snap),
-                &TEST_NAME_INDEX,
-                b"A",
-                b"Z",
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(got_snap.len(), 2);
-        for (_, m) in &got_snap {
-            assert_eq!(m.created_at, 777);
-        }
-
-        let got_now = db
-            .range_with_meta_by_index::<TestEntity>(&TEST_NAME_INDEX, b"A", b"Z", None)
-            .await
-            .unwrap();
-        assert_eq!(got_now.len(), 3);
-    }
-
-    #[tokio::test]
-    async fn get_meta_tx_and_wrappers_match() {
-        let dir = tempfile::tempdir().unwrap();
-        let clock = Arc::new(MockClock::new(1));
-        let db = KuramotoDb::new(
-            dir.path().join("gmtx.redb").to_str().unwrap(),
-            clock,
-            vec![],
-        )
-        .await;
-        db.create_table_and_indexes::<TestEntity>().unwrap();
-
-        let e = TestEntity {
-            id: 9,
-            name: "Z".into(),
-            value: 1,
-        };
-        db.put(e.clone()).await.unwrap();
-
-        let snap = db.begin_read_txn().unwrap();
-
-        let m1 = db
-            .get_meta::<TestEntity>(&9u64.to_be_bytes())
-            .await
-            .unwrap();
-        let m2 = db
-            .get_meta_tx::<TestEntity>(Some(&snap), &9u64.to_be_bytes())
-            .await
-            .unwrap();
-        let m3 = db
-            .get_meta_tx::<TestEntity>(None, &9u64.to_be_bytes())
-            .await
-            .unwrap();
-        assert_eq!(m1, m2);
-        assert_eq!(m1, m3);
-    }
+    // Meta snapshot tests moved under plugins/versioning.
 
     #[tokio::test]
     async fn range_by_pk_tx_reads_from_read_txn_snapshot() {
