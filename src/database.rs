@@ -1331,22 +1331,6 @@ impl KuramotoDb {
                     index_removes,
                 } => {
                     if dbg { println!("db.write: applying PUT table={}", data_table.name()); }
-                    // Minimal safety: if caller supplies meta bytes identical to existing,
-                    // reject as a no-op put without version increase (opaque check, no decode).
-                    {
-                        let meta_t = wtxn
-                            .open_table(*meta_table)
-                            .map_err(|e| StorageError::Other(e.to_string()))?;
-                        if let Some(existing_meta_raw) = meta_t
-                            .get(&*key)
-                            .map_err(|e| StorageError::Other(e.to_string()))?
-                        {
-                            if existing_meta_raw.value() == meta.as_slice() && !meta.is_empty() {
-                                let _ = reply.send(Err(StorageError::PutButNoVersionIncrease));
-                                return Err(StorageError::PutButNoVersionIncrease);
-                            }
-                        }
-                    }
 
                     // ---- Insert/overwrite main row ----
                     {
