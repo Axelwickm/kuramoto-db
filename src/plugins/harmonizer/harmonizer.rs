@@ -35,10 +35,11 @@ use crate::plugins::{
 use crate::tables::TableHash;
 use crate::{
     KuramotoDb, StaticTableDef, WriteBatch, WriteOrigin, plugins::Plugin,
-    storage_entity::StorageEntity, storage_error::StorageError, uuid_bytes::UuidBytes,
+    plugins::versioning::VERSIONING_AUX_ROLE,
+    storage_entity::{AuxTableSpec, StorageEntity}, storage_error::StorageError, uuid_bytes::UuidBytes,
 };
 use crate::{
-    database::{IndexPutRequest, WriteRequest},
+    database::{AuxOp, IndexPutRequest, WriteRequest},
     plugins::communication::transports::PeerId,
 };
 
@@ -1136,10 +1137,13 @@ impl Plugin for Harmonizer {
                             if dbg { println!("harm.before_update: STAGE avail.put level={} dims={}", node.level, node.range.dims().len()); }
                             batch.push(WriteRequest::Put {
                                 data_table: AVAILABILITIES_TABLE,
-                                meta_table: AVAILABILITIES_META_TABLE,
                                 key: node_pk.clone(),
                                 value: node.to_bytes(),
-                                meta: meta2,
+                                aux_ops: vec![AuxOp {
+                                    table: AVAILABILITIES_META_TABLE,
+                                    key: node_pk.clone(),
+                                    value: Some(meta2),
+                                }],
                                 index_removes: Vec::new(),
                                 index_puts: {
                                     // (peer, complete_flag)
@@ -1247,10 +1251,13 @@ impl Plugin for Harmonizer {
                             if dbg { println!("harm.before_update: STAGE avail.put (replace) level={} dims={}", node.level, node.range.dims().len()); }
                             batch.push(WriteRequest::Put {
                                 data_table: AVAILABILITIES_TABLE,
-                                meta_table: AVAILABILITIES_META_TABLE,
                                 key: node_pk.clone(),
                                 value: node.to_bytes(),
-                                meta: meta2,
+                                aux_ops: vec![AuxOp {
+                                    table: AVAILABILITIES_META_TABLE,
+                                    key: node_pk.clone(),
+                                    value: Some(meta2),
+                                }],
                                 index_removes: Vec::new(),
                                 index_puts: {
                                     let mut v = Vec::new();
@@ -1366,9 +1373,12 @@ impl Plugin for Harmonizer {
                                         idx_key.extend_from_slice(&pk);
                                         batch.push(WriteRequest::Delete {
                                             data_table: crate::plugins::harmonizer::child_set::AVAIL_CHILDREN_TBL,
-                                            meta_table: crate::plugins::harmonizer::child_set::AVAIL_CHILDREN_META_TBL,
                                             key: pk,
-                                            meta: meta.clone(),
+                                            aux_ops: vec![AuxOp {
+                                                table: crate::plugins::harmonizer::child_set::AVAIL_CHILDREN_META_TBL,
+                                                key: pk.clone(),
+                                                value: Some(meta.clone()),
+                                            }],
                                             index_removes: vec![crate::database::make_index_remove(
                                                 crate::plugins::harmonizer::child_set::AVAIL_CHILDREN_BY_CHILD_TBL,
                                                 idx_key,
@@ -1399,9 +1409,12 @@ impl Plugin for Harmonizer {
                                     for row in rows {
                                         batch.push(WriteRequest::Delete {
                                             data_table: crate::plugins::harmonizer::child_set::AVAIL_DIG_CHUNK_TBL,
-                                            meta_table: crate::plugins::harmonizer::child_set::AVAIL_DIG_CHUNK_META_TBL,
                                             key: row.primary_key(),
-                                            meta: meta.clone(),
+                                            aux_ops: vec![AuxOp {
+                                                table: crate::plugins::harmonizer::child_set::AVAIL_DIG_CHUNK_META_TBL,
+                                                key: row.primary_key(),
+                                                value: Some(meta.clone()),
+                                            }],
                                             index_removes: Vec::new(),
                                         });
                                     }
@@ -1456,9 +1469,12 @@ impl Plugin for Harmonizer {
                                 }
                                 batch.push(WriteRequest::Delete {
                                     data_table: AVAILABILITIES_TABLE,
-                                    meta_table: AVAILABILITIES_META_TABLE,
                                     key: id.as_bytes().to_vec(),
-                                    meta: meta2,
+                                    aux_ops: vec![AuxOp {
+                                        table: AVAILABILITIES_META_TABLE,
+                                        key: id.as_bytes().to_vec(),
+                                        value: Some(meta2),
+                                    }],
                                     index_removes: {
                                         let mut v = vec![
                                             crate::database::make_index_remove(
@@ -1539,15 +1555,18 @@ impl Plugin for Harmonizer {
                                         idx_key.push(0);
                                         idx_key.extend_from_slice(&pk);
                                         batch.push(WriteRequest::Delete {
-                                        data_table: crate::plugins::harmonizer::child_set::AVAIL_CHILDREN_TBL,
-                                        meta_table: crate::plugins::harmonizer::child_set::AVAIL_CHILDREN_META_TBL,
-                                        key: pk,
-                                        meta: meta.clone(),
-                                        index_removes: vec![crate::database::make_index_remove(
-                                            crate::plugins::harmonizer::child_set::AVAIL_CHILDREN_BY_CHILD_TBL,
-                                            idx_key,
-                                        )],
-                                    });
+                                            data_table: crate::plugins::harmonizer::child_set::AVAIL_CHILDREN_TBL,
+                                            key: pk.clone(),
+                                            aux_ops: vec![AuxOp {
+                                                table: crate::plugins::harmonizer::child_set::AVAIL_CHILDREN_META_TBL,
+                                                key: pk,
+                                                value: Some(meta.clone()),
+                                            }],
+                                            index_removes: vec![crate::database::make_index_remove(
+                                                crate::plugins::harmonizer::child_set::AVAIL_CHILDREN_BY_CHILD_TBL,
+                                                idx_key,
+                                            )],
+                                        });
                                     }
                                 }
 
@@ -1572,12 +1591,15 @@ impl Plugin for Harmonizer {
                                     .map_err(|e| StorageError::Bincode(e.to_string()))?;
                                     for row in rows {
                                         batch.push(WriteRequest::Delete {
-                                        data_table: crate::plugins::harmonizer::child_set::AVAIL_DIG_CHUNK_TBL,
-                                        meta_table: crate::plugins::harmonizer::child_set::AVAIL_DIG_CHUNK_META_TBL,
-                                        key: row.primary_key(),
-                                        meta: meta.clone(),
-                                        index_removes: Vec::new(),
-                                    });
+                                            data_table: crate::plugins::harmonizer::child_set::AVAIL_DIG_CHUNK_TBL,
+                                            key: row.primary_key(),
+                                            aux_ops: vec![AuxOp {
+                                                table: crate::plugins::harmonizer::child_set::AVAIL_DIG_CHUNK_META_TBL,
+                                                key: row.primary_key(),
+                                                value: Some(meta.clone()),
+                                            }],
+                                            index_removes: Vec::new(),
+                                        });
                                     }
                                 }
 
@@ -1631,9 +1653,12 @@ impl Plugin for Harmonizer {
                                 }
                                 batch.push(WriteRequest::Delete {
                                     data_table: AVAILABILITIES_TABLE,
-                                    meta_table: AVAILABILITIES_META_TABLE,
                                     key: id.as_bytes().to_vec(),
-                                    meta: meta2,
+                                    aux_ops: vec![AuxOp {
+                                        table: AVAILABILITIES_META_TABLE,
+                                        key: id.as_bytes().to_vec(),
+                                        value: Some(meta2),
+                                    }],
                                     index_removes: {
                                         let mut v = vec![crate::database::make_index_remove(
                                             AVAILABILITY_INCOMPLETE_BY_PEER,
@@ -1839,10 +1864,14 @@ mod tests {
                 TableDefinition::new("foo");
             &TBL
         }
-        fn meta_table_def() -> StaticTableDef {
-            static TBL: TableDefinition<'static, &'static [u8], Vec<u8>> =
+        fn aux_tables() -> &'static [AuxTableSpec] {
+            static META: TableDefinition<'static, &'static [u8], Vec<u8>> =
                 TableDefinition::new("foo_meta");
-            &TBL
+            static AUX: &[AuxTableSpec] = &[AuxTableSpec {
+                role: VERSIONING_AUX_ROLE,
+                table: &META,
+            }];
+            AUX
         }
         fn load_and_migrate(data: &[u8]) -> Result<Self, StorageError> {
             if data.is_empty() {
@@ -1874,10 +1903,14 @@ mod tests {
                 TableDefinition::new("bar");
             &TBL
         }
-        fn meta_table_def() -> StaticTableDef {
-            static TBL: TableDefinition<'static, &'static [u8], Vec<u8>> =
+        fn aux_tables() -> &'static [AuxTableSpec] {
+            static META: TableDefinition<'static, &'static [u8], Vec<u8>> =
                 TableDefinition::new("bar_meta");
-            &TBL
+            static AUX: &[AuxTableSpec] = &[AuxTableSpec {
+                role: VERSIONING_AUX_ROLE,
+                table: &META,
+            }];
+            AUX
         }
         fn load_and_migrate(data: &[u8]) -> Result<Self, StorageError> {
             if data.is_empty() {

@@ -6,7 +6,7 @@ use crate::{
     meta::BlobMeta,
     plugins::{
         communication::router::{Handler, Router},
-        fnv1a_16, Plugin,
+        fnv1a_16, versioning::VERSIONING_AUX_ROLE, Plugin,
     },
     storage_error::StorageError,
     KuramotoDb, WriteOrigin,
@@ -39,6 +39,8 @@ pub struct ExportRequest {
     pub end: Vec<u8>,
     /// Query mode
     pub mode: FetchMode,
+    /// Auxiliary table role to include alongside each row.
+    pub aux_role: String,
     /// Maximum rows per batch. If 0, defaults to 10,000,000.
     pub limit: u32,
     /// Resume token: last PK when ByPkRange, or last index key when ByIndexRange; exclusive resume.
@@ -95,6 +97,11 @@ impl Handler for FetchProto {
             .ok_or_else(|| "no db attached".to_string())?;
 
         let limit = if req.limit == 0 { self.default_limit } else { req.limit } as usize;
+        let aux_role = if req.aux_role.is_empty() {
+            VERSIONING_AUX_ROLE
+        } else {
+            &req.aux_role
+        };
 
         // Mode-specific scanning
         let scan_limit = if req.cursor.is_some() { limit.saturating_add(1) } else { limit };
@@ -102,7 +109,7 @@ impl Handler for FetchProto {
             FetchMode::ByPkRange => {
                 let scan_start = req.cursor.as_ref().unwrap_or(&req.start);
                 let rows = db
-                    .range_raw_with_meta_by_pk_table(&req.table, scan_start, &req.end, Some(scan_limit))
+                    .range_raw_with_aux_by_pk_table(&req.table, aux_role, scan_start, &req.end, Some(scan_limit))
                     .await
                     .map_err(|e| e.to_string())?;
                 let n_read = rows.len();
@@ -120,7 +127,7 @@ impl Handler for FetchProto {
             FetchMode::ByIndexRange { index_table, start_idx, end_idx } => {
                 let scan_start = req.cursor.as_ref().unwrap_or(start_idx);
                 let rows = db
-                    .range_raw_with_meta_by_index_table(index_table, scan_start, end_idx, Some(scan_limit))
+                    .range_raw_with_aux_by_index_table(index_table, aux_role, scan_start, end_idx, Some(scan_limit))
                     .await
                     .map_err(|e| e.to_string())?;
                 let n_read = rows.len();
@@ -174,6 +181,11 @@ impl RemoteFetch {
 
         let mut stats = FetchStats::default();
         let timeout = self.router_config_timeout();
+        let aux_role: &str = if req.aux_role.is_empty() {
+            VERSIONING_AUX_ROLE
+        } else {
+            &req.aux_role
+        };
 
         loop {
             let batch: ExportBatch = self
@@ -183,7 +195,9 @@ impl RemoteFetch {
                 .map_err(|e| StorageError::Other(format!("router: {e}")))?;
 
             for row in &batch.rows {
-                let applied = self.apply_row(&db, &batch.table, row).await?;
+                let applied = self
+                    .apply_row(&db, &batch.table, aux_role, row)
+                    .await?;
                 if applied { stats.applied += 1; } else { stats.skipped += 1; }
             }
             stats.fetched += batch.rows.len() as u64;
@@ -200,15 +214,21 @@ impl RemoteFetch {
         std::time::Duration::from_secs(5)
     }
 
-    /// Apply one row: compare meta.updated_at, prefer newer.
-    async fn apply_row(&self, db: &KuramotoDb, table: &str, row: &RowEnvelope) -> Result<bool, StorageError> {
+    /// Apply one row: compare aux.updated_at, prefer newer.
+    async fn apply_row(
+        &self,
+        db: &KuramotoDb,
+        table: &str,
+        aux_role: &str,
+        row: &RowEnvelope,
+    ) -> Result<bool, StorageError> {
         let remote_meta: BlobMeta = bincode::decode_from_slice(&row.meta, bincode::config::standard())
             .map_err(|e| StorageError::Bincode(e.to_string()))?
             .0;
 
         // Fetch local meta if present; if missing treat as older.
         let local_meta_raw = db
-            .get_meta_raw_by_table_pk(table, &row.pk)
+            .get_aux_raw_by_table_pk(table, aux_role, &row.pk)
             .await
             .ok();
         if let Some(lr) = local_meta_raw {
@@ -273,10 +293,11 @@ mod tests {
 
     use crate::{
         clock::MockClock,
-        storage_entity::{IndexCardinality, IndexSpec, StorageEntity},
+        storage_entity::{AuxTableSpec, IndexCardinality, IndexSpec, StorageEntity},
         storage_error::StorageError,
         KuramotoDb, StaticTableDef,
     };
+    use crate::plugins::versioning::VERSIONING_AUX_ROLE;
     use crate::plugins::communication::router::{Router, RouterConfig};
     use crate::plugins::communication::transports::{
         Connector, PeerResolver,
@@ -289,6 +310,7 @@ mod tests {
 
     static TBL: TableDefinition<'static, &'static [u8], Vec<u8>> = TableDefinition::new("f_test");
     static META: TableDefinition<'static, &'static [u8], Vec<u8>> = TableDefinition::new("f_test_meta");
+    static AUX_TABLES: &[AuxTableSpec] = &[AuxTableSpec { role: VERSIONING_AUX_ROLE, table: &META }];
     static IDX_NAME: TableDefinition<'static, &'static [u8], Vec<u8>> = TableDefinition::new("f_test_name_idx"); // UNIQUE
     static IDX_TAG: TableDefinition<'static, &'static [u8], Vec<u8>> = TableDefinition::new("f_test_tag_idx"); // NON-UNIQUE
 
@@ -301,7 +323,7 @@ mod tests {
         const STRUCT_VERSION: u8 = 0;
         fn primary_key(&self) -> Vec<u8> { self.id.to_be_bytes().to_vec() }
         fn table_def() -> StaticTableDef { &TBL }
-        fn meta_table_def() -> StaticTableDef { &META }
+        fn aux_tables() -> &'static [AuxTableSpec] { AUX_TABLES }
         fn load_and_migrate(data: &[u8]) -> Result<Self, StorageError> {
             match data.first().copied() {
                 Some(0) => bincode::decode_from_slice(&data[1..], bincode::config::standard()).map(|(v, _)| v).map_err(|e| StorageError::Bincode(e.to_string())),
@@ -375,7 +397,7 @@ mod tests {
         }
 
         // Fetch into B
-        let req = ExportRequest { table: TBL.name().into(), start: vec![], end: vec![0xFF], mode: FetchMode::ByPkRange, limit: 0, cursor: None };
+        let req = ExportRequest { table: TBL.name().into(), start: vec![], end: vec![0xFF], mode: FetchMode::ByPkRange, aux_role: VERSIONING_AUX_ROLE.into(), limit: 0, cursor: None };
         let stats = fb.fetch_from(pa, req).await.unwrap();
         assert_eq!(stats.applied, 3);
         assert_eq!(stats.fetched, 3);
@@ -398,7 +420,7 @@ mod tests {
             db_a.put(TEnt { id, name: format!("N{id}"), tag: 7 }).await.unwrap();
         }
 
-        let req = ExportRequest { table: TBL.name().into(), start: vec![], end: vec![0xFF], mode: FetchMode::ByPkRange, limit: 0, cursor: None };
+        let req = ExportRequest { table: TBL.name().into(), start: vec![], end: vec![0xFF], mode: FetchMode::ByPkRange, aux_role: VERSIONING_AUX_ROLE.into(), limit: 0, cursor: None };
         let _stats1 = fb.fetch_from(pa, req.clone()).await.unwrap();
         let stats2 = fb.fetch_from(pa, req).await.unwrap();
         assert_eq!(stats2.applied, 0);
@@ -412,7 +434,7 @@ mod tests {
         let (db_a, _fa, _ra, pa, db_b, fb, _rb, _pb) = setup_pair(ns, 10_000, 10).await;
         db_a.put(TEnt { id: 42, name: "Z".into(), tag: 9 }).await.unwrap();
 
-        let req = ExportRequest { table: TBL.name().into(), start: vec![], end: vec![0xFF], mode: FetchMode::ByPkRange, limit: 0, cursor: None };
+        let req = ExportRequest { table: TBL.name().into(), start: vec![], end: vec![0xFF], mode: FetchMode::ByPkRange, aux_role: VERSIONING_AUX_ROLE.into(), limit: 0, cursor: None };
         fb.fetch_from(pa, req.clone()).await.unwrap();
         // Delete on A (meta.updated_at increases on A)
         db_a.delete::<TEnt>(&42u64.to_be_bytes()).await.unwrap();
@@ -430,7 +452,7 @@ mod tests {
             db_a.put(TEnt { id, name: format!("N{id}"), tag: (id % 2) as u8 }).await.unwrap();
         }
 
-        let req = ExportRequest { table: TBL.name().into(), start: 1u64.to_be_bytes().to_vec(), end: 6u64.to_be_bytes().to_vec(), mode: FetchMode::ByPkRange, limit: 2, cursor: None };
+        let req = ExportRequest { table: TBL.name().into(), start: 1u64.to_be_bytes().to_vec(), end: 6u64.to_be_bytes().to_vec(), mode: FetchMode::ByPkRange, aux_role: VERSIONING_AUX_ROLE.into(), limit: 2, cursor: None };
         let stats = fb.fetch_from(pa, req).await.unwrap();
         assert_eq!(stats.applied, 5);
     }
@@ -439,7 +461,7 @@ mod tests {
     async fn error_on_unknown_table() {
         let ns = 9005u64;
         let (_db_a, _fa, _ra, pa, _db_b, fb, _rb, _pb) = setup_pair(ns, 100, 200).await;
-        let req = ExportRequest { table: "nope".into(), start: vec![], end: vec![0xFF], mode: FetchMode::ByPkRange, limit: 0, cursor: None };
+        let req = ExportRequest { table: "nope".into(), start: vec![], end: vec![0xFF], mode: FetchMode::ByPkRange, aux_role: VERSIONING_AUX_ROLE.into(), limit: 0, cursor: None };
         let err = fb.fetch_from(pa, req).await.err().expect("should error");
         match err { StorageError::Other(msg) => assert!(msg.contains("router")), _ => panic!("unexpected err: {err:?}") }
     }
@@ -456,6 +478,7 @@ mod tests {
             start: vec![],
             end: vec![],
             mode: FetchMode::ByIndexRange { index_table: IDX_NAME.name().into(), start_idx: b"B".to_vec(), end_idx: b"Z".to_vec() },
+            aux_role: VERSIONING_AUX_ROLE.into(),
             limit: 0,
             cursor: None,
         };
@@ -480,6 +503,7 @@ mod tests {
             start: vec![],
             end: vec![],
             mode: FetchMode::ByIndexRange { index_table: IDX_TAG.name().into(), start_idx: 1u8.to_be_bytes().to_vec(), end_idx: 2u8.to_be_bytes().to_vec() },
+            aux_role: VERSIONING_AUX_ROLE.into(),
             limit: 0,
             cursor: None,
         };

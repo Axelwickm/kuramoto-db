@@ -15,6 +15,8 @@ use crate::{
         optimizer::{ActionSet, AvailabilityDraft},
         range_cube::RangeCube,
     },
+    plugins::versioning::VERSIONING_AUX_ROLE,
+    storage_entity::{AuxTableSpec, IndexCardinality, IndexSpec, StorageEntity},
     storage_error::StorageError,
     uuid_bytes::UuidBytes,
 };
@@ -1987,6 +1989,7 @@ mod tests {
     static TBL: TableDefinition<'static, &'static [u8], Vec<u8>> = TableDefinition::new("t_ent");
     static META: TableDefinition<'static, &'static [u8], Vec<u8>> =
         TableDefinition::new("t_ent_meta");
+    static AUX: &[AuxTableSpec] = &[AuxTableSpec { role: VERSIONING_AUX_ROLE, table: &META }];
     static IDX_TAG: TableDefinition<'static, &'static [u8], Vec<u8>> =
         TableDefinition::new("t_ent_tag_idx"); // NON-UNIQUE
     static IDX_UNIQ: TableDefinition<'static, &'static [u8], Vec<u8>> =
@@ -2015,8 +2018,8 @@ mod tests {
         fn table_def() -> crate::StaticTableDef {
             &TBL
         }
-        fn meta_table_def() -> crate::StaticTableDef {
-            &META
+        fn aux_tables() -> &'static [AuxTableSpec] {
+            AUX
         }
         fn load_and_migrate(data: &[u8]) -> Result<Self, crate::storage_error::StorageError> {
             match data.first().copied() {

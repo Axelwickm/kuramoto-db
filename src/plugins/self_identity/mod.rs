@@ -5,8 +5,11 @@ use bincode::{Encode, Decode};
 use redb::ReadTransaction;
 use redb::TableDefinition;
 
-use crate::{KuramotoDb, WriteBatch, WriteOrigin, StaticTableDef, storage_error::StorageError, storage_entity::{IndexSpec, StorageEntity}};
-use crate::plugins::Plugin;
+use crate::{
+    KuramotoDb, WriteBatch, WriteOrigin, StaticTableDef, storage_error::StorageError,
+    storage_entity::{AuxTableSpec, IndexSpec, StorageEntity},
+};
+use crate::plugins::{versioning::VERSIONING_AUX_ROLE, Plugin};
 use crate::uuid_bytes::UuidBytes;
 
 // Simple single-row table holding a persistent local peer id
@@ -18,13 +21,14 @@ struct SelfIdRow {
 
 static TBL: TableDefinition<'static, &'static [u8], Vec<u8>> = TableDefinition::new("self_identity");
 static META: TableDefinition<'static, &'static [u8], Vec<u8>> = TableDefinition::new("self_identity_meta");
+static AUX_TABLES: &[AuxTableSpec] = &[AuxTableSpec { role: VERSIONING_AUX_ROLE, table: &META }];
 static INDEXES: &[IndexSpec<SelfIdRow>] = &[];
 
 impl StorageEntity for SelfIdRow {
     const STRUCT_VERSION: u8 = 0;
     fn primary_key(&self) -> Vec<u8> { vec![self.key] }
     fn table_def() -> StaticTableDef { &TBL }
-    fn meta_table_def() -> StaticTableDef { &META }
+    fn aux_tables() -> &'static [AuxTableSpec] { AUX_TABLES }
     fn load_and_migrate(data: &[u8]) -> Result<Self, StorageError> {
         match data.first().copied() {
             Some(0) => bincode::decode_from_slice::<Self, _>(&data[1..], bincode::config::standard())

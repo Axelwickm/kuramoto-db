@@ -8,15 +8,15 @@ pub mod versioning;
 
 // NOTE: disabled
 // Harmonizer is optional; gate entire module behind feature.
-#[cfg(feature = "harmonizer")]
-pub mod harmonizer;
+// #[cfg(feature = "harmonizer")]
+// pub mod harmonizer;
 
 // Web admin plugin (optional)
-#[cfg(feature = "web_admin")]
-pub mod web_admin;
+// #[cfg(feature = "web_admin")]
+// pub mod web_admin;
 
 // Replay plugin: persists write batches for later inspection/replay.
-pub mod replay;
+// pub mod replay;
 
 // Self-identity plugin: manages local persistent peer id (unsyncable)
 pub mod self_identity;
@@ -92,7 +92,8 @@ mod tests {
     use crate::{
         KuramotoDb, StaticTableDef,
         clock::MockClock,
-        storage_entity::{IndexSpec, StorageEntity},
+        plugins::versioning::VERSIONING_AUX_ROLE,
+        storage_entity::{AuxTableSpec, IndexSpec, StorageEntity},
     };
 
     /* ───── Hook that increments a counter ───── */
@@ -147,6 +148,10 @@ mod tests {
         TableDefinition::new("foo");
     static FOO_META: TableDefinition<'static, &'static [u8], Vec<u8>> =
         TableDefinition::new("foo_meta");
+    static FOO_AUX: &[AuxTableSpec] = &[AuxTableSpec {
+        role: VERSIONING_AUX_ROLE,
+        table: &FOO_META,
+    }];
     static FOO_INDEXES: &[IndexSpec<Foo>] = &[];
 
     impl StorageEntity for Foo {
@@ -158,8 +163,8 @@ mod tests {
         fn table_def() -> StaticTableDef {
             &FOO_TABLE
         }
-        fn meta_table_def() -> StaticTableDef {
-            &FOO_META
+        fn aux_tables() -> &'static [AuxTableSpec] {
+            FOO_AUX
         }
         fn load_and_migrate(data: &[u8]) -> Result<Self, StorageError> {
             match data.first().copied() {

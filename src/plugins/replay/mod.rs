@@ -6,7 +6,7 @@ use redb::{ReadTransaction, TableHandle};
 
 use crate::{
     KuramotoDb, WriteBatch, WriteOrigin, WriteRequest,
-    storage_entity::{IndexSpec, StorageEntity},
+    storage_entity::{AuxTableSpec, IndexSpec, StorageEntity},
     storage_error::StorageError,
     tables::TableHash,
     StaticTableDef,
@@ -32,21 +32,26 @@ pub struct LogIndexRemove {
 }
 
 #[derive(Clone, Debug, Encode, Decode)]
+pub struct LogAuxOp {
+    table_hash: u64,
+    key: Vec<u8>,
+    value: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, Encode, Decode)]
 pub enum LogWriteRequest {
     Put {
         data_table_hash: u64,
-        meta_table_hash: u64,
+        aux_ops: Vec<LogAuxOp>,
         key: Vec<u8>,
         value: Vec<u8>,
-        meta: Vec<u8>,
         index_removes: Vec<LogIndexRemove>,
         index_puts: Vec<LogIndexPut>,
     },
     Delete {
         data_table_hash: u64,
-        meta_table_hash: u64,
+        aux_ops: Vec<LogAuxOp>,
         key: Vec<u8>,
-        meta: Vec<u8>,
         index_removes: Vec<LogIndexRemove>,
     },
     // Periodic database stats snapshot for replay browsing
@@ -108,6 +113,7 @@ pub struct ReplayEvent {
 
 static REPLAY_TABLE: TableDefinition<'static, &'static [u8], Vec<u8>> = TableDefinition::new("replay_events");
 static REPLAY_META: TableDefinition<'static, &'static [u8], Vec<u8>> = TableDefinition::new("replay_events_meta");
+static REPLAY_AUX: &[AuxTableSpec] = &[AuxTableSpec { role: crate::plugins::versioning::VERSIONING_AUX_ROLE, table: &REPLAY_META }];
 static REPLAY_INDEXES: &[IndexSpec<ReplayEvent>] = &[];
 
 impl StorageEntity for ReplayEvent {
@@ -115,7 +121,7 @@ impl StorageEntity for ReplayEvent {
 
     fn primary_key(&self) -> Vec<u8> { self.id.to_be_bytes().to_vec() }
     fn table_def() -> StaticTableDef { &REPLAY_TABLE }
-    fn meta_table_def() -> StaticTableDef { &REPLAY_META }
+    fn aux_tables() -> &'static [AuxTableSpec] { REPLAY_AUX }
     fn load_and_migrate(data: &[u8]) -> Result<Self, StorageError> {
         match data.first().copied() {
             Some(0) => bincode::decode_from_slice(&data[1..], bincode::config::standard())
@@ -145,30 +151,42 @@ impl ReplayPlugin {
         batch
             .iter()
             .map(|req| match req {
-                WriteRequest::Put { data_table, meta_table, key, value, meta, index_removes, index_puts } => {
+                WriteRequest::Put { data_table, key, value, aux_ops, index_removes, index_puts } => {
                     let dth = TableHash::from(*data_table).hash();
-                    let mth = TableHash::from(*meta_table).hash();
                     let irs = index_removes.iter().map(|ir| LogIndexRemove { table_hash: TableHash::from(ir.table).hash(), key: ir.key.clone() }).collect();
                     let ips = index_puts.iter().map(|ip| LogIndexPut { table_hash: TableHash::from(ip.table).hash(), key: ip.key.clone(), value: ip.value.clone(), unique: ip.unique }).collect();
+                    let auxs = aux_ops
+                        .iter()
+                        .map(|op| LogAuxOp {
+                            table_hash: TableHash::from(op.table).hash(),
+                            key: op.key.clone(),
+                            value: op.value.clone(),
+                        })
+                        .collect();
                     LogWriteRequest::Put {
                         data_table_hash: dth,
-                        meta_table_hash: mth,
+                        aux_ops: auxs,
                         key: key.clone(),
                         value: value.clone(),
-                        meta: meta.clone(),
                         index_removes: irs,
                         index_puts: ips,
                     }
                 }
-                WriteRequest::Delete { data_table, meta_table, key, meta, index_removes } => {
+                WriteRequest::Delete { data_table, key, aux_ops, index_removes } => {
                     let dth = TableHash::from(*data_table).hash();
-                    let mth = TableHash::from(*meta_table).hash();
                     let irs = index_removes.iter().map(|ir| LogIndexRemove { table_hash: TableHash::from(ir.table).hash(), key: ir.key.clone() }).collect();
+                    let auxs = aux_ops
+                        .iter()
+                        .map(|op| LogAuxOp {
+                            table_hash: TableHash::from(op.table).hash(),
+                            key: op.key.clone(),
+                            value: op.value.clone(),
+                        })
+                        .collect();
                     LogWriteRequest::Delete {
                         data_table_hash: dth,
-                        meta_table_hash: mth,
+                        aux_ops: auxs,
                         key: key.clone(),
-                        meta: meta.clone(),
                         index_removes: irs,
                     }
                 }
@@ -397,7 +415,7 @@ impl Plugin for ReplayPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{KuramotoDb, storage_entity::{IndexSpec, StorageEntity}, storage_error::StorageError};
+    use crate::{KuramotoDb, storage_entity::{AuxTableSpec, IndexSpec, StorageEntity}, storage_error::StorageError};
     use bincode::{Encode, Decode};
     use redb::TableDefinition;
     use std::sync::Arc;
@@ -407,13 +425,14 @@ mod tests {
 
     static FOO: TableDefinition<'static, &'static [u8], Vec<u8>> = TableDefinition::new("foo");
     static FOO_META: TableDefinition<'static, &'static [u8], Vec<u8>> = TableDefinition::new("foo_meta");
+    static FOO_AUX: &[AuxTableSpec] = &[AuxTableSpec { role: crate::plugins::versioning::VERSIONING_AUX_ROLE, table: &FOO_META }];
     static FOO_INDEXES: &[IndexSpec<Foo>] = &[];
 
     impl StorageEntity for Foo {
         const STRUCT_VERSION: u8 = 0;
         fn primary_key(&self) -> Vec<u8> { self.id.to_be_bytes().to_vec() }
         fn table_def() -> StaticTableDef { &FOO }
-        fn meta_table_def() -> StaticTableDef { &FOO_META }
+        fn aux_tables() -> &'static [AuxTableSpec] { FOO_AUX }
         fn load_and_migrate(data: &[u8]) -> Result<Self, StorageError> {
             match data.first().copied() {
                 Some(0) => bincode::decode_from_slice(&data[1..], bincode::config::standard()).map(|(v, _)| v).map_err(|e| StorageError::Bincode(e.to_string())),

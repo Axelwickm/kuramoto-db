@@ -282,7 +282,8 @@ mod tests {
     use super::*;
     use crate::{
         plugins::harmonizer::integrity_run_all,
-        storage_entity::StorageEntity,
+        plugins::versioning::VERSIONING_AUX_ROLE,
+        storage_entity::{AuxTableSpec, StorageEntity},
     };
     use redb::{TableDefinition, TableHandle};
 
@@ -292,8 +293,15 @@ mod tests {
     impl StorageEntity for TestEnt {
         const STRUCT_VERSION: u8 = 0;
         fn primary_key(&self) -> Vec<u8> { self.id.to_le_bytes().to_vec() }
-        fn table_def() -> crate::StaticTableDef { static T: TableDefinition<'static, &'static [u8], Vec<u8>> = TableDefinition::new("test_ent"); &T }
-        fn meta_table_def() -> crate::StaticTableDef { static M: TableDefinition<'static, &'static [u8], Vec<u8>> = TableDefinition::new("test_ent_meta"); &M }
+        fn table_def() -> crate::StaticTableDef {
+            static T: TableDefinition<'static, &'static [u8], Vec<u8>> = TableDefinition::new("test_ent");
+            &T
+        }
+        fn aux_tables() -> &'static [AuxTableSpec] {
+            static M: TableDefinition<'static, &'static [u8], Vec<u8>> = TableDefinition::new("test_ent_meta");
+            static AUX: &[AuxTableSpec] = &[AuxTableSpec { role: VERSIONING_AUX_ROLE, table: &M }];
+            AUX
+        }
         fn load_and_migrate(data: &[u8]) -> Result<Self, crate::storage_error::StorageError> {
             match data.first().copied() {
                 Some(0) => bincode::decode_from_slice::<Self, _>(&data[1..], bincode::config::standard())

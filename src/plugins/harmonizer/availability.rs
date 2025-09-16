@@ -7,7 +7,8 @@ use crate::{
         child_set::{AVAIL_CHILDREN_BY_CHILD_TBL, Child},
         range_cube::RangeCube,
     },
-    storage_entity::{IndexCardinality, IndexSpec, StorageEntity},
+    plugins::versioning::VERSIONING_AUX_ROLE,
+    storage_entity::{AuxTableSpec, IndexCardinality, IndexSpec, StorageEntity},
     storage_error::StorageError,
     uuid_bytes::UuidBytes,
 };
@@ -17,6 +18,10 @@ use crate::{
 /// Main storage & meta tables
 pub static AVAILABILITIES_TABLE: StaticTableDef = &TableDefinition::new("availabilities");
 pub static AVAILABILITIES_META_TABLE: StaticTableDef = &TableDefinition::new("availabilities_meta");
+pub static AVAILABILITIES_AUX_TABLES: &[AuxTableSpec] = &[AuxTableSpec {
+    role: VERSIONING_AUX_ROLE,
+    table: AVAILABILITIES_META_TABLE,
+}];
 
 /// Secondary index: `peer_id` → availability rows
 /// Secondary index: `(peer_id, complete_flag)` → availability rows (complete_flag: 0=incomplete,1=complete)
@@ -111,8 +116,8 @@ impl StorageEntity for AvailabilityV0 {
     fn table_def() -> StaticTableDef {
         AVAILABILITIES_TABLE
     }
-    fn meta_table_def() -> StaticTableDef {
-        AVAILABILITIES_META_TABLE
+    fn aux_tables() -> &'static [AuxTableSpec] {
+        AVAILABILITIES_AUX_TABLES
     }
 
     fn load_and_migrate(data: &[u8]) -> Result<Self, StorageError> {

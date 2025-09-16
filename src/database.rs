@@ -35,6 +35,13 @@ pub struct IndexRemoveRequest {
     pub key: Vec<u8>,
 }
 
+#[derive(Clone)]
+pub struct AuxOp {
+    pub table: StaticTableDef,
+    pub key: Vec<u8>,
+    pub value: Option<Vec<u8>>,
+}
+
 pub type WriteBatch = Vec<WriteRequest>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,18 +63,16 @@ type WriteMsg = (
 pub enum WriteRequest {
     Put {
         data_table: StaticTableDef,
-        meta_table: StaticTableDef,
         key: Vec<u8>,
         value: Vec<u8>,
-        meta: Vec<u8>,
+        aux_ops: Vec<AuxOp>,
         index_removes: Vec<IndexRemoveRequest>,
         index_puts: Vec<IndexPutRequest>,
     },
     Delete {
         data_table: StaticTableDef,
-        meta_table: StaticTableDef,
         key: Vec<u8>,
-        meta: Vec<u8>,
+        aux_ops: Vec<AuxOp>,
         index_removes: Vec<IndexRemoveRequest>,
     },
 }
@@ -130,11 +135,12 @@ pub struct KuramotoDb {
     entity_delete_planners: RwLock<HashMap<String, Arc<TableDeletePlanFn>>>,
     data_table_by_hash: RwLock<HashMap<u64, StaticTableDef>>,
     index_table_by_hash: RwLock<HashMap<u64, (StaticTableDef, StaticTableDef)>>,
+    aux_table_by_hash: RwLock<HashMap<u64, (StaticTableDef, StaticTableDef, String)>>,
     // Name lookup for index tables: index name -> (index table, parent data table)
     index_table_by_name: RwLock<HashMap<String, (StaticTableDef, StaticTableDef)>>,
     // Name lookups for data/meta tables (populated on create_table_and_indexes)
     data_table_by_name: RwLock<HashMap<String, StaticTableDef>>,
-    meta_table_by_name: RwLock<HashMap<String, StaticTableDef>>,
+    aux_tables_by_data: RwLock<HashMap<String, HashMap<String, StaticTableDef>>>,
 }
 
 impl KuramotoDb {
@@ -154,12 +160,13 @@ impl KuramotoDb {
             plugins,
             data_table_by_hash: RwLock::new(HashMap::new()),
             index_table_by_hash: RwLock::new(HashMap::new()),
+            aux_table_by_hash: RwLock::new(HashMap::new()),
             index_table_by_name: RwLock::new(HashMap::new()),
             entity_putters: RwLock::new(HashMap::new()),
             entity_deleters: RwLock::new(HashMap::new()),
             entity_delete_planners: RwLock::new(HashMap::new()),
             data_table_by_name: RwLock::new(HashMap::new()),
-            meta_table_by_name: RwLock::new(HashMap::new()),
+            aux_tables_by_data: RwLock::new(HashMap::new()),
         });
 
         for p in &sys.plugins {
@@ -237,10 +244,8 @@ impl KuramotoDb {
 
                         Ok(WriteRequest::Delete {
                             data_table: &E::table_def(),
-                            meta_table: &E::meta_table_def(),
                             key: pk.to_vec(),
-                            // Leave meta empty; a plugin may synthesize it.
-                            meta: Vec::new(),
+                            aux_ops: Vec::new(),
                             index_removes,
                         })
                     })
@@ -270,10 +275,18 @@ impl KuramotoDb {
                 .write()
                 .unwrap()
                 .insert(E::table_def().name().to_string(), E::table_def());
-            self.meta_table_by_name
-                .write()
-                .unwrap()
-                .insert(E::table_def().name().to_string(), E::meta_table_def());
+            {
+                let mut by_role = self.aux_tables_by_data.write().unwrap();
+                let mut by_hash = self.aux_table_by_hash.write().unwrap();
+                let entry = by_role
+                    .entry(E::table_def().name().to_string())
+                    .or_default();
+                for aux in E::aux_tables() {
+                    entry.insert(aux.role.to_string(), aux.table);
+                    let ah = TableHash::from(aux.table).hash();
+                    by_hash.insert(ah, (aux.table, E::table_def(), aux.role.to_string()));
+                }
+            }
         }
         {
             // Create the table
@@ -284,9 +297,11 @@ impl KuramotoDb {
             // Create main table
             txn.open_table(E::table_def().clone())
                 .map_err(|e| StorageError::Other(e.to_string()))?;
-            // Create meta table
-            txn.open_table(E::meta_table_def().clone())
-                .map_err(|e| StorageError::Other(e.to_string()))?;
+            // Create auxiliary tables
+            for aux in E::aux_tables() {
+                txn.open_table(aux.table.clone())
+                    .map_err(|e| StorageError::Other(e.to_string()))?;
+            }
             // Create index tables
             for idx in E::indexes() {
                 txn.open_table(idx.table_def.clone())
@@ -350,15 +365,60 @@ impl KuramotoDb {
     pub fn resolve_data_table_by_name(&self, name: &str) -> Option<StaticTableDef> {
         self.data_table_by_name.read().unwrap().get(name).copied()
     }
-    pub fn resolve_meta_table_by_name(&self, name: &str) -> Option<StaticTableDef> {
-        self.meta_table_by_name.read().unwrap().get(name).copied()
+    pub fn resolve_aux_table_by_role(
+        &self,
+        data_table: &str,
+        role: &str,
+    ) -> Option<StaticTableDef> {
+        self.aux_tables_by_data
+            .read()
+            .unwrap()
+            .get(data_table)
+            .and_then(|m| m.get(role))
+            .copied()
+    }
+    fn resolve_aux_table_for_data(
+        &self,
+        data_table: &str,
+        role: &str,
+    ) -> Result<StaticTableDef, StorageError> {
+        self
+            .resolve_aux_table_by_role(data_table, role)
+            .ok_or_else(|| {
+                StorageError::Other(format!(
+                    "no auxiliary table registered for '{data_table}' with role '{role}'",
+                ))
+            })
+    }
+    fn aux_table_for_entity<E: StorageEntity>(role: &str) -> Result<StaticTableDef, StorageError> {
+        E::aux_tables()
+            .iter()
+            .find(|aux| aux.role == role)
+            .map(|aux| aux.table)
+            .ok_or_else(|| {
+                StorageError::Other(format!(
+                    "entity '{}' has no auxiliary table for role '{role}'",
+                    E::table_def().name()
+                ))
+            })
+    }
+    pub fn resolve_aux_table_by_hash(
+        &self,
+        h: u64,
+    ) -> Option<(StaticTableDef, StaticTableDef, String)> {
+        self.aux_table_by_hash
+            .read()
+            .unwrap()
+            .get(&h)
+            .map(|(aux, data, role)| (*aux, *data, role.clone()))
     }
 
-    /// Iterate meta-table keys in [start, end), pairing each with optional data bytes
-    /// and raw meta bytes. Includes tombstones (data=None) where meta exists but data is absent.
-    pub async fn range_raw_with_meta_by_pk_table(
+    /// Iterate auxiliary-table keys in [start, end), pairing each with optional data bytes
+    /// and raw auxiliary payloads. Includes tombstones (data=None) where aux exists but data is absent.
+    pub async fn range_raw_with_aux_by_pk_table(
         &self,
         table_name: &str,
+        aux_role: &str,
         start: &[u8],
         end: &[u8],
         limit: Option<usize>,
@@ -368,53 +428,46 @@ impl KuramotoDb {
             .ok_or_else(|| StorageError::Other(format!(
                 "no entity registered for table '{table_name}'"
             )))?;
-        let meta_t = self
-            .resolve_meta_table_by_name(table_name)
-            .ok_or_else(|| StorageError::Other(format!(
-                "no meta table registered for table '{table_name}'"
-            )))?;
+        let aux_t = self.resolve_aux_table_for_data(table_name, aux_role)?;
 
         self.with_read(None, |rt| {
-            let meta = rt
-                .open_table(meta_t.clone())
+            let aux = rt
+                .open_table(aux_t.clone())
                 .map_err(|e| StorageError::Other(e.to_string()))?;
             let data = rt
                 .open_table(data_t.clone())
                 .map_err(|e| StorageError::Other(e.to_string()))?;
 
             let mut out = Vec::new();
-            for row in meta
+            for row in aux
                 .range(start..end)
                 .map_err(|e| StorageError::Other(e.to_string()))?
             {
                 let (k, v) = row.map_err(|e| StorageError::Other(e.to_string()))?;
                 let pk = k.value().to_vec();
-                let meta_raw = v.value().to_vec();
+                let aux_raw = v.value().to_vec();
                 let data_opt = data
                     .get(k.value())
                     .map_err(|e| StorageError::Other(e.to_string()))?
                     .map(|v| v.value().to_vec());
-                out.push((pk, data_opt, meta_raw));
+                out.push((pk, data_opt, aux_raw));
                 if limit.map_or(false, |n| out.len() >= n) { break; }
             }
             Ok(out)
         })
     }
 
-    /// Read raw meta bytes by table name + primary key.
-    pub async fn get_meta_raw_by_table_pk(
+    /// Read raw auxiliary bytes by table name + primary key.
+    pub async fn get_aux_raw_by_table_pk(
         &self,
         table_name: &str,
+        aux_role: &str,
         pk: &[u8],
     ) -> Result<Vec<u8>, StorageError> {
-        let meta_t = self
-            .resolve_meta_table_by_name(table_name)
-            .ok_or_else(|| StorageError::Other(format!(
-                "no meta table registered for table '{table_name}'"
-            )))?;
+        let aux_t = self.resolve_aux_table_for_data(table_name, aux_role)?;
         self.with_read(None, |rt| {
             let t = rt
-                .open_table(meta_t.clone())
+                .open_table(aux_t.clone())
                 .map_err(|e| StorageError::Other(e.to_string()))?;
             let v = t
                 .get(pk)
@@ -426,10 +479,11 @@ impl KuramotoDb {
         })
     }
 
-    /// Iterate an index table range and resolve (index_key, pk, data_opt, meta_raw) tuples.
-    pub async fn range_raw_with_meta_by_index_table(
+    /// Iterate an index table range and resolve (index_key, pk, data_opt, aux_raw) tuples.
+    pub async fn range_raw_with_aux_by_index_table(
         &self,
         index_table_name: &str,
+        aux_role: &str,
         start_idx_key: &[u8],
         end_idx_key: &[u8],
         limit: Option<usize>,
@@ -439,10 +493,8 @@ impl KuramotoDb {
             .ok_or_else(|| StorageError::Other(format!(
                 "no index registered for table '{index_table_name}'"
             )))?;
-        // Meta table shares the same parent name as data table
-        let meta_tdef = self
-            .resolve_meta_table_by_name(data_tdef.name())
-            .ok_or_else(|| StorageError::Other("no meta table for index parent".into()))?;
+        // Auxiliary table shares the same parent name as data table
+        let aux_tdef = self.resolve_aux_table_for_data(data_tdef.name(), aux_role)?;
 
         self.with_read(None, |rt| {
             let idx = rt
@@ -451,8 +503,8 @@ impl KuramotoDb {
             let data = rt
                 .open_table(data_tdef.clone())
                 .map_err(|e| StorageError::Other(e.to_string()))?;
-            let meta = rt
-                .open_table(meta_tdef.clone())
+            let aux = rt
+                .open_table(aux_tdef.clone())
                 .map_err(|e| StorageError::Other(e.to_string()))?;
 
             let mut out = Vec::new();
@@ -467,15 +519,59 @@ impl KuramotoDb {
                     .get(&*pk)
                     .map_err(|e| StorageError::Other(e.to_string()))?
                     .map(|v| v.value().to_vec());
-                let meta_raw = match meta
+                let aux_raw = match aux
                     .get(&*pk)
                     .map_err(|e| StorageError::Other(e.to_string()))?
                 {
                     Some(v) => v.value().to_vec(),
                     None => continue, // If no meta, skip (shouldn't happen for well-formed rows)
                 };
-                out.push((ikb, pk, data_opt, meta_raw));
+                out.push((ikb, pk, data_opt, aux_raw));
                 if limit.map_or(false, |n| out.len() >= n) { break; }
+            }
+            Ok(out)
+        })
+    }
+
+    /// Read raw bytes from an arbitrary table definition by primary key.
+    /// Returns Ok(Some(value)) if found, Ok(None) if missing.
+    pub async fn get_raw_from_table(
+        &self,
+        table: StaticTableDef,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        self.with_read(None, |rt| {
+            let t = rt
+                .open_table(table.clone())
+                .map_err(|e| StorageError::Other(e.to_string()))?;
+            t.get(key)
+                .map_err(|e| StorageError::Other(e.to_string()))
+                .map(|opt| opt.map(|v| v.value().to_vec()))
+        })
+    }
+
+    /// Iterate raw key/value pairs from an arbitrary table definition.
+    pub async fn range_raw_from_table(
+        &self,
+        table: StaticTableDef,
+        start: &[u8],
+        end: &[u8],
+        limit: Option<usize>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+        self.with_read(None, |rt| {
+            let t = rt
+                .open_table(table.clone())
+                .map_err(|e| StorageError::Other(e.to_string()))?;
+            let mut out = Vec::new();
+            for row in t
+                .range(start..end)
+                .map_err(|e| StorageError::Other(e.to_string()))?
+            {
+                let (k, v) = row.map_err(|e| StorageError::Other(e.to_string()))?;
+                out.push((k.value().to_vec(), v.value().to_vec()));
+                if limit.map_or(false, |n| out.len() >= n) {
+                    break;
+                }
             }
             Ok(out)
         })
@@ -714,11 +810,12 @@ impl KuramotoDb {
             .await
     }
 
-    /// Like `range_by_index_tx`, but returns `(entity, meta_bytes)` pairs resolved
+    /// Like `range_by_index_tx`, but returns `(entity, aux_bytes)` pairs resolved
     /// from the same snapshot (`txn` or a fresh one if `None`).
-    pub async fn range_with_meta_raw_by_index_tx<E: StorageEntity>(
+    pub async fn range_with_aux_raw_by_index_tx<E: StorageEntity>(
         &self,
         txn: Option<&redb::ReadTransaction>,
+        role: &str,
         index_table: StaticTableDef,
         start_idx_key: &[u8],
         end_idx_key: &[u8],
@@ -755,8 +852,9 @@ impl KuramotoDb {
         let data_t = rt
             .open_table(E::table_def().clone())
             .map_err(|e| StorageError::Other(e.to_string()))?;
-        let meta_t = rt
-            .open_table(E::meta_table_def().clone())
+        let aux_def = Self::aux_table_for_entity::<E>(role)?;
+        let aux_t = rt
+            .open_table(aux_def.clone())
             .map_err(|e| StorageError::Other(e.to_string()))?;
 
         let mut out = Vec::with_capacity(pks.len());
@@ -766,28 +864,30 @@ impl KuramotoDb {
                 .map_err(|e| StorageError::Other(e.to_string()))?
             {
                 let e = E::load_and_migrate(&v.value())?;
-                let meta_raw = meta_t
+                let aux_raw = aux_t
                     .get(pk.as_slice())
                     .map_err(|e| StorageError::Other(e.to_string()))?
                     .ok_or(StorageError::NotFound)?
                     .value();
-                out.push((e, meta_raw.to_vec()));
+                out.push((e, aux_raw.to_vec()));
             }
         }
         Ok(out)
     }
 
-    /// Convenience wrapper for `range_with_meta_raw_by_index_tx(None, ...)`.
-    pub async fn range_with_meta_raw_by_index<E: StorageEntity>(
+    /// Convenience wrapper for `range_with_aux_raw_by_index_tx(None, ...)`.
+    pub async fn range_with_aux_raw_by_index<E: StorageEntity>(
         &self,
+        role: &str,
         index_table: StaticTableDef,
         start_idx_key: &[u8],
         end_idx_key: &[u8],
         limit: Option<usize>,
     ) -> Result<Vec<(E, Vec<u8>)>, StorageError> {
         self
-            .range_with_meta_raw_by_index_tx::<E>(
+            .range_with_aux_raw_by_index_tx::<E>(
                 None,
+                role,
                 index_table,
                 start_idx_key,
                 end_idx_key,
@@ -879,14 +979,16 @@ impl KuramotoDb {
         self.get_by_index_all_tx::<E>(None, t, k).await
     }
 
-    pub async fn get_meta_raw_tx<E: StorageEntity>(
+    pub async fn get_aux_raw_tx<E: StorageEntity>(
         &self,
         txn: Option<&redb::ReadTransaction>,
+        role: &str,
         key: &[u8],
     ) -> Result<Vec<u8>, StorageError> {
         self.with_read(txn, |rt| {
+            let aux_t = Self::aux_table_for_entity::<E>(role)?;
             let t = rt
-                .open_table(E::meta_table_def().clone())
+                .open_table(aux_t.clone())
                 .map_err(|e| StorageError::Other(e.to_string()))?;
             let v = t
                 .get(key)
@@ -896,21 +998,26 @@ impl KuramotoDb {
         })
     }
 
-    pub async fn get_meta_raw<E: StorageEntity>(&self, key: &[u8]) -> Result<Vec<u8>, StorageError> {
-        self.get_meta_raw_tx::<E>(None, key).await
+    pub async fn get_aux_raw<E: StorageEntity>(
+        &self,
+        role: &str,
+        key: &[u8],
+    ) -> Result<Vec<u8>, StorageError> {
+        self.get_aux_raw_tx::<E>(None, role, key).await
     }
 
-    pub async fn get_with_meta_raw_tx<E: StorageEntity>(
+    pub async fn get_with_aux_raw_tx<E: StorageEntity>(
         &self,
         txn: Option<&redb::ReadTransaction>,
+        role: &str,
         key: &[u8],
     ) -> Result<(E, Vec<u8>), StorageError> {
         self.with_read(txn, |rt| {
             let data_t = rt
                 .open_table(E::table_def().clone())
                 .map_err(|e| StorageError::Other(e.to_string()))?;
-            let meta_t = rt
-                .open_table(E::meta_table_def().clone())
+            let aux_t = rt
+                .open_table(Self::aux_table_for_entity::<E>(role)?.clone())
                 .map_err(|e| StorageError::Other(e.to_string()))?;
 
             let dv = data_t
@@ -919,7 +1026,7 @@ impl KuramotoDb {
                 .ok_or(StorageError::NotFound)?;
             let e = E::load_and_migrate(&dv.value())?;
 
-            let mv = meta_t
+            let mv = aux_t
                 .get(key)
                 .map_err(|e| StorageError::Other(e.to_string()))?
                 .ok_or(StorageError::NotFound)?;
@@ -927,11 +1034,12 @@ impl KuramotoDb {
         })
     }
 
-    pub async fn get_with_meta_raw<E: StorageEntity>(
+    pub async fn get_with_aux_raw<E: StorageEntity>(
         &self,
+        role: &str,
         key: &[u8],
     ) -> Result<(E, Vec<u8>), StorageError> {
-        self.get_with_meta_raw_tx::<E>(None, key).await
+        self.get_with_aux_raw_tx::<E>(None, role, key).await
     }
 
     // ------------  RANGE API  ------------
@@ -973,9 +1081,10 @@ impl KuramotoDb {
         self.range_by_pk_tx::<E>(None, s, e, l).await
     }
 
-    pub async fn range_with_meta_raw_by_pk_tx<E: StorageEntity>(
+    pub async fn range_with_aux_raw_by_pk_tx<E: StorageEntity>(
         &self,
         txn: Option<&redb::ReadTransaction>,
+        role: &str,
         start: &[u8],
         end: &[u8],
         limit: Option<usize>,
@@ -984,8 +1093,9 @@ impl KuramotoDb {
             let data_t = rt
                 .open_table(E::table_def().clone())
                 .map_err(|e| StorageError::Other(e.to_string()))?;
-            let meta_t = rt
-                .open_table(E::meta_table_def().clone())
+            let aux_def = Self::aux_table_for_entity::<E>(role)?;
+            let aux_t = rt
+                .open_table(aux_def.clone())
                 .map_err(|e| StorageError::Other(e.to_string()))?;
 
             let mut out = Vec::new();
@@ -995,12 +1105,12 @@ impl KuramotoDb {
             {
                 let (k, v) = row.map_err(|e| StorageError::Other(e.to_string()))?;
                 let e = E::load_and_migrate(v.value().as_slice())?;
-                let meta_raw = meta_t
+                let aux_raw = aux_t
                     .get(k.value())
                     .map_err(|e| StorageError::Other(e.to_string()))?
                     .ok_or(StorageError::NotFound)?
                     .value();
-                out.push((e, meta_raw.to_vec()));
+                out.push((e, aux_raw.to_vec()));
                 if limit.map_or(false, |n| out.len() >= n) {
                     break;
                 }
@@ -1009,13 +1119,14 @@ impl KuramotoDb {
         })
     }
 
-    pub async fn range_with_meta_raw_by_pk<E: StorageEntity>(
+    pub async fn range_with_aux_raw_by_pk<E: StorageEntity>(
         &self,
+        role: &str,
         s: &[u8],
         e: &[u8],
         l: Option<usize>,
     ) -> Result<Vec<(E, Vec<u8>)>, StorageError> {
-        self.range_with_meta_raw_by_pk_tx::<E>(None, s, e, l).await
+        self.range_with_aux_raw_by_pk_tx::<E>(None, role, s, e, l).await
     }
 
     pub async fn put_by_table_bytes(
@@ -1182,11 +1293,9 @@ impl KuramotoDb {
         };
         let req = WriteRequest::Put {
             data_table: &E::table_def(),
-            meta_table: &E::meta_table_def(),
             key,
             value: entity.to_bytes(),
-            // Leave meta empty; a plugin may synthesize/validate it.
-            meta: Vec::new(),
+            aux_ops: Vec::new(),
             index_puts,
             index_removes,
         };
@@ -1233,10 +1342,8 @@ impl KuramotoDb {
 
         let req = WriteRequest::Delete {
             data_table: &E::table_def(),
-            meta_table: &E::meta_table_def(),
             key: key.to_vec(),
-            // Leave meta empty; a plugin may synthesize/validate it.
-            meta: Vec::new(),
+            aux_ops: Vec::new(),
             index_removes,
         };
         self.write_tx
@@ -1323,10 +1430,9 @@ impl KuramotoDb {
             match req {
                 WriteRequest::Put {
                     data_table,
-                    meta_table,
                     key,
                     value,
-                    meta,
+                    aux_ops,
                     index_puts,
                     index_removes,
                 } => {
@@ -1375,22 +1481,31 @@ impl KuramotoDb {
                             .map_err(|e| StorageError::Other(e.to_string()))?;
                     }
 
-                    // ---- Write meta ----
-                    {
-                        let mut meta_t = wtxn
-                            .open_table(*meta_table)
+                    // ---- Auxiliary table updates ----
+                    for aux in aux_ops {
+                        let AuxOp { table, key, value } = aux;
+                        let mut aux_t = wtxn
+                            .open_table(*table)
                             .map_err(|e| StorageError::Other(e.to_string()))?;
-                        meta_t
-                            .insert(&*key, meta)
-                            .map_err(|e| StorageError::Other(e.to_string()))?;
+                        match value {
+                            Some(value) => {
+                                aux_t
+                                    .insert(key.as_slice(), value)
+                                    .map_err(|e| StorageError::Other(e.to_string()))?;
+                            }
+                            None => {
+                                aux_t
+                                    .remove(key.as_slice())
+                                    .map_err(|e| StorageError::Other(e.to_string()))?;
+                            }
+                        }
                     }
                 }
 
                 WriteRequest::Delete {
                     data_table,
-                    meta_table,
                     key,
-                    meta,
+                    aux_ops,
                     index_removes,
                 } => {
                     if dbg { println!("db.write: applying DELETE table={}", data_table.name()); }
@@ -1403,14 +1518,24 @@ impl KuramotoDb {
                             .map_err(|e| StorageError::Other(e.to_string()))?;
                     }
 
-                    // ---- Meta update ----
-                    {
-                        let mut meta_t = wtxn
-                            .open_table(*meta_table)
+                    // ---- Auxiliary table updates ----
+                    for aux in aux_ops {
+                        let AuxOp { table, key, value } = aux;
+                        let mut aux_t = wtxn
+                            .open_table(*table)
                             .map_err(|e| StorageError::Other(e.to_string()))?;
-                        meta_t
-                            .insert(&*key, meta)
-                            .map_err(|e| StorageError::Other(e.to_string()))?;
+                        match value {
+                            Some(value) => {
+                                aux_t
+                                    .insert(key.as_slice(), value)
+                                    .map_err(|e| StorageError::Other(e.to_string()))?;
+                            }
+                            None => {
+                                aux_t
+                                    .remove(key.as_slice())
+                                    .map_err(|e| StorageError::Other(e.to_string()))?;
+                            }
+                        }
                     }
 
                     // ---- Index removes ----
@@ -1469,9 +1594,9 @@ mod tests {
     use crate::{
         KuramotoDb, StaticTableDef, WriteBatch, WriteRequest,
         meta::BlobMeta,
-        plugins::Plugin,
+        plugins::{versioning::VERSIONING_AUX_ROLE, Plugin},
         region_lock::RegionLock,
-        storage_entity::{IndexCardinality, IndexSpec, StorageEntity},
+        storage_entity::{AuxTableSpec, IndexCardinality, IndexSpec, StorageEntity},
         storage_error::StorageError,
     };
 
@@ -1488,6 +1613,11 @@ mod tests {
 
     static TEST_META: TableDefinition<'static, &'static [u8], Vec<u8>> =
         TableDefinition::new("test_meta");
+
+    static TEST_AUX_TABLES: &[AuxTableSpec] = &[AuxTableSpec {
+        role: VERSIONING_AUX_ROLE,
+        table: &TEST_META,
+    }];
 
     static TEST_NAME_INDEX: TableDefinition<'static, &'static [u8], Vec<u8>> =
         TableDefinition::new("test_name_idx"); // UNIQUE
@@ -1521,8 +1651,8 @@ mod tests {
             &TEST_TABLE
         }
 
-        fn meta_table_def() -> StaticTableDef {
-            &TEST_META
+        fn aux_tables() -> &'static [AuxTableSpec] {
+            TEST_AUX_TABLES
         }
 
         fn load_and_migrate(data: &[u8]) -> Result<Self, StorageError> {
@@ -1746,6 +1876,11 @@ mod tests {
         TableDefinition::new("multi_idx_entity");
     static MULTI_META: TableDefinition<'static, &'static [u8], Vec<u8>> =
         TableDefinition::new("multi_idx_entity_meta");
+
+    static MULTI_AUX: &[AuxTableSpec] = &[AuxTableSpec {
+        role: VERSIONING_AUX_ROLE,
+        table: &MULTI_META,
+    }];
     static TAG_INDEX: TableDefinition<'static, &'static [u8], Vec<u8>> =
         TableDefinition::new("multi_by_tag");
 
@@ -1762,7 +1897,7 @@ mod tests {
 
         fn primary_key(&self) -> Vec<u8> { self.id.to_be_bytes().to_vec() }
         fn table_def() -> StaticTableDef { &MULTI_TBL }
-        fn meta_table_def() -> StaticTableDef { &MULTI_META }
+        fn aux_tables() -> &'static [AuxTableSpec] { MULTI_AUX }
         fn load_and_migrate(data: &[u8]) -> Result<Self, StorageError> {
             bincode::decode_from_slice(data.get(1..).unwrap_or_default(), bincode::config::standard())
                 .map(|(v, _)| v)
@@ -1826,6 +1961,11 @@ mod tests {
         TableDefinition::new("multi_unique");
     static MU_META: TableDefinition<'static, &'static [u8], Vec<u8>> =
         TableDefinition::new("multi_unique_meta");
+
+    static MU_AUX: &[AuxTableSpec] = &[AuxTableSpec {
+        role: VERSIONING_AUX_ROLE,
+        table: &MU_META,
+    }];
     static CODE_INDEX: TableDefinition<'static, &'static [u8], Vec<u8>> =
         TableDefinition::new("by_code_unique");
 
@@ -1840,7 +1980,7 @@ mod tests {
         const STRUCT_VERSION: u8 = 0;
         fn primary_key(&self) -> Vec<u8> { self.id.to_be_bytes().to_vec() }
         fn table_def() -> StaticTableDef { &MU_TBL }
-        fn meta_table_def() -> StaticTableDef { &MU_META }
+        fn aux_tables() -> &'static [AuxTableSpec] { MU_AUX }
         fn load_and_migrate(data: &[u8]) -> Result<Self, StorageError> {
             bincode::decode_from_slice(data.get(1..).unwrap_or_default(), bincode::config::standard())
                 .map(|(v, _)| v)

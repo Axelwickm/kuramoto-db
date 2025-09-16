@@ -6,16 +6,47 @@ use crate::{
     plugins::Plugin,
     storage_error::StorageError,
     KuramotoDb, WriteBatch, WriteOrigin,
-    database::WriteRequest,
+    database::{AuxOp, WriteRequest},
     meta::BlobMeta,
     region_lock::RegionLock,
 };
+
+use std::ptr;
+use redb::TableHandle;
+
+pub const VERSIONING_AUX_ROLE: &str = "versioning";
 
 pub struct VersioningPlugin;
 
 impl VersioningPlugin {
     pub fn new() -> Arc<Self> {
         Arc::new(Self)
+    }
+
+    fn ensure_aux_slot<'a>(
+        aux_ops: &'a mut Vec<AuxOp>,
+        table: crate::StaticTableDef,
+        key: &[u8],
+    ) -> &'a mut Vec<u8> {
+        if let Some(pos) = aux_ops.iter().position(|op| ptr::eq(op.table, table)) {
+            let op = &mut aux_ops[pos];
+            if op.key.as_slice() != key {
+                op.key = key.to_vec();
+            }
+            return op.value.get_or_insert_with(Vec::new);
+        }
+
+        aux_ops.push(AuxOp {
+            table,
+            key: key.to_vec(),
+            value: Some(Vec::new()),
+        });
+        aux_ops
+            .last_mut()
+            .expect("previous push succeeded")
+            .value
+            .as_mut()
+            .expect("value initialized")
     }
 }
 
@@ -35,22 +66,31 @@ impl Plugin for VersioningPlugin {
         for req in batch.iter_mut() {
             match req {
                 WriteRequest::Put {
-                    meta_table,
+                    data_table,
                     key,
-                    meta,
+                    aux_ops,
                     ..
                 } => {
-                    // If caller provided meta, validate version increase; otherwise synthesize.
-                    if meta.is_empty() {
+                    let data_table = *data_table;
+                    let Some(versioning_table) = db
+                        .resolve_aux_table_by_role(data_table.name(), VERSIONING_AUX_ROLE)
+                    else {
+                        continue;
+                    };
+                    let meta_buf = Self::ensure_aux_slot(aux_ops, versioning_table, key.as_slice());
+
+                    if meta_buf.is_empty() {
                         // Synthesize new meta from existing (if any)
                         let meta_t = rtxn
-                            .open_table((*meta_table).clone())
+                            .open_table(versioning_table.clone())
                             .map_err(|e| StorageError::Other(e.to_string()))?;
-                        let new_meta = if let Some(existing_raw) =
-                            meta_t.get(key.as_slice()).map_err(|e| StorageError::Other(e.to_string()))?
+                        let new_meta = if let Some(existing_raw) = meta_t
+                            .get(key.as_slice())
+                            .map_err(|e| StorageError::Other(e.to_string()))?
                         {
+                            let existing_bytes = existing_raw.value();
                             let (old, _) = bincode::decode_from_slice::<BlobMeta, _>(
-                                &existing_raw.value(),
+                                existing_bytes.as_slice(),
                                 bincode::config::standard(),
                             )
                             .map_err(|e| StorageError::Bincode(e.to_string()))?;
@@ -70,24 +110,26 @@ impl Plugin for VersioningPlugin {
                                 region_lock: RegionLock::None,
                             }
                         };
-                        *meta = bincode::encode_to_vec(new_meta, bincode::config::standard())
+                        *meta_buf = bincode::encode_to_vec(new_meta, bincode::config::standard())
                             .map_err(|e| StorageError::Bincode(e.to_string()))?;
                     } else {
                         // Validate version strictly increases over existing (if any)
                         let provided: BlobMeta = bincode::decode_from_slice(
-                            meta.as_slice(),
+                            meta_buf.as_slice(),
                             bincode::config::standard(),
                         )
                         .map_err(|e| StorageError::Bincode(e.to_string()))?
                         .0;
                         let meta_t = rtxn
-                            .open_table((*meta_table).clone())
+                            .open_table(versioning_table.clone())
                             .map_err(|e| StorageError::Other(e.to_string()))?;
-                        if let Some(existing_raw) =
-                            meta_t.get(key.as_slice()).map_err(|e| StorageError::Other(e.to_string()))?
+                        if let Some(existing_raw) = meta_t
+                            .get(key.as_slice())
+                            .map_err(|e| StorageError::Other(e.to_string()))?
                         {
+                            let existing_bytes = existing_raw.value();
                             let (existing, _) = bincode::decode_from_slice::<BlobMeta, _>(
-                                &existing_raw.value(),
+                                existing_bytes.as_slice(),
                                 bincode::config::standard(),
                             )
                             .map_err(|e| StorageError::Bincode(e.to_string()))?;
@@ -98,28 +140,37 @@ impl Plugin for VersioningPlugin {
                     }
                 }
                 WriteRequest::Delete {
-                    meta_table,
+                    data_table,
                     key,
-                    meta,
+                    aux_ops,
                     ..
                 } => {
+                    let data_table = *data_table;
+                    let Some(versioning_table) = db
+                        .resolve_aux_table_by_role(data_table.name(), VERSIONING_AUX_ROLE)
+                    else {
+                        continue;
+                    };
+                    let meta_buf = Self::ensure_aux_slot(aux_ops, versioning_table, key.as_slice());
+
                     // If meta provided, accept as-is. Otherwise synthesize delete meta.
-                    if meta.is_empty() {
+                    if meta_buf.is_empty() {
                         let meta_t = rtxn
-                            .open_table((*meta_table).clone())
+                            .open_table(versioning_table.clone())
                             .map_err(|e| StorageError::Other(e.to_string()))?;
                         let existing_raw = meta_t
                             .get(key.as_slice())
                             .map_err(|e| StorageError::Other(e.to_string()))?
                             .ok_or(StorageError::NotFound)?;
+                        let existing_bytes = existing_raw.value();
                         let (mut m, _) = bincode::decode_from_slice::<BlobMeta, _>(
-                            &existing_raw.value(),
+                            existing_bytes.as_slice(),
                             bincode::config::standard(),
                         )
                         .map_err(|e| StorageError::Bincode(e.to_string()))?;
                         m.deleted_at = Some(now);
                         m.updated_at = now;
-                        *meta = bincode::encode_to_vec(m, bincode::config::standard())
+                        *meta_buf = bincode::encode_to_vec(m, bincode::config::standard())
                             .map_err(|e| StorageError::Bincode(e.to_string()))?;
                     }
                 }
@@ -147,7 +198,9 @@ impl VersioningPlugin {
         db: &KuramotoDb,
         key: &[u8],
     ) -> Result<BlobMeta, StorageError> {
-        let raw = db.get_meta_raw::<E>(key).await?;
+        let raw = db
+            .get_aux_raw::<E>(VERSIONING_AUX_ROLE, key)
+            .await?;
         bincode::decode_from_slice::<BlobMeta, _>(&raw, bincode::config::standard())
             .map(|(m, _)| m)
             .map_err(|e| StorageError::Bincode(e.to_string()))
@@ -157,7 +210,9 @@ impl VersioningPlugin {
         db: &KuramotoDb,
         key: &[u8],
     ) -> Result<(E, BlobMeta), StorageError> {
-        let (e, raw) = db.get_with_meta_raw::<E>(key).await?;
+        let (e, raw) = db
+            .get_with_aux_raw::<E>(VERSIONING_AUX_ROLE, key)
+            .await?;
         let (m, _) = bincode::decode_from_slice::<BlobMeta, _>(&raw, bincode::config::standard())
             .map_err(|e| StorageError::Bincode(e.to_string()))?;
         Ok((e, m))
@@ -169,7 +224,9 @@ impl VersioningPlugin {
         e: &[u8],
         l: Option<usize>,
     ) -> Result<Vec<(E, BlobMeta)>, StorageError> {
-        let rows = db.range_with_meta_raw_by_pk::<E>(s, e, l).await?;
+        let rows = db
+            .range_with_aux_raw_by_pk::<E>(VERSIONING_AUX_ROLE, s, e, l)
+            .await?;
         rows.into_iter()
             .map(|(ent, raw)| {
                 bincode::decode_from_slice::<BlobMeta, _>(&raw, bincode::config::standard())
@@ -187,7 +244,13 @@ impl VersioningPlugin {
         limit: Option<usize>,
     ) -> Result<Vec<(E, BlobMeta)>, StorageError> {
         let rows = db
-            .range_with_meta_raw_by_index::<E>(index_table, start_idx_key, end_idx_key, limit)
+            .range_with_aux_raw_by_index::<E>(
+                VERSIONING_AUX_ROLE,
+                index_table,
+                start_idx_key,
+                end_idx_key,
+                limit,
+            )
             .await?;
         rows.into_iter()
             .map(|(ent, raw)| {
@@ -212,7 +275,8 @@ mod tests {
 
     use crate::{
         clock::MockClock,
-        storage_entity::{IndexCardinality, IndexSpec, StorageEntity},
+        database::AuxOp,
+        storage_entity::{AuxTableSpec, IndexCardinality, IndexSpec, StorageEntity},
         storage_error::StorageError,
         KuramotoDb, StaticTableDef, WriteRequest,
     };
@@ -222,6 +286,7 @@ mod tests {
 
     static TEST_TABLE: TableDefinition<'static, &'static [u8], Vec<u8>> = TableDefinition::new("test");
     static TEST_META: TableDefinition<'static, &'static [u8], Vec<u8>> = TableDefinition::new("test_meta");
+    static TEST_AUX: &[AuxTableSpec] = &[AuxTableSpec { role: VERSIONING_AUX_ROLE, table: &TEST_META }];
     static TEST_NAME_INDEX: TableDefinition<'static, &'static [u8], Vec<u8>> = TableDefinition::new("test_name_idx");
     static TEST_VALUE_INDEX: TableDefinition<'static, &'static [u8], Vec<u8>> = TableDefinition::new("test_value_idx");
     static TEST_INDEXES: &[IndexSpec<TestEntity>] = &[
@@ -232,7 +297,7 @@ mod tests {
         const STRUCT_VERSION: u8 = 0;
         fn primary_key(&self) -> Vec<u8> { self.id.to_be_bytes().to_vec() }
         fn table_def() -> StaticTableDef { &TEST_TABLE }
-        fn meta_table_def() -> StaticTableDef { &TEST_META }
+        fn aux_tables() -> &'static [AuxTableSpec] { TEST_AUX }
         fn load_and_migrate(data: &[u8]) -> Result<Self, StorageError> {
             match data.first().copied() {
                 Some(0) => bincode::decode_from_slice(&data[1..], bincode::config::standard()).map(|(v, _)| v).map_err(|e| StorageError::Bincode(e.to_string())),
@@ -300,12 +365,17 @@ mod tests {
         db.put(e.clone()).await.unwrap();
         // Craft a stale meta equal to the current meta (no version increase)
         let stale = VersioningPlugin::get_meta::<TestEntity>(&db, &e.id.to_be_bytes()).await.unwrap();
+        let pk = e.primary_key();
+        let aux_table = TestEntity::aux_tables()[0].table;
         let stale_wr = WriteRequest::Put {
             data_table: TestEntity::table_def(),
-            meta_table: TestEntity::meta_table_def(),
-            key: e.primary_key(),
+            key: pk.clone(),
             value: e.to_bytes(),
-            meta: bincode::encode_to_vec(stale, bincode::config::standard()).unwrap(),
+            aux_ops: vec![AuxOp {
+                table: aux_table,
+                key: pk,
+                value: Some(bincode::encode_to_vec(stale, bincode::config::standard()).unwrap()),
+            }],
             index_puts: vec![],
             index_removes: vec![],
         };
@@ -339,10 +409,19 @@ mod tests {
     impl Plugin for Add100Plugin {
         async fn before_update(&self, _db: &KuramotoDb, _txn: &redb::ReadTransaction, batch: &mut WriteBatch) -> Result<(), StorageError> {
             for req in batch {
-                if let WriteRequest::Put { meta, .. } = req {
-                    let (mut m, _): (BlobMeta, _) = bincode::decode_from_slice(meta, bincode::config::standard()).map_err(|o| StorageError::Bincode(o.to_string()))?;
-                    m.updated_at += 100;
-                    *meta = bincode::encode_to_vec(m, bincode::config::standard()).map_err(|o| StorageError::Bincode(o.to_string()))?;
+                if let WriteRequest::Put { aux_ops, .. } = req {
+                    for op in aux_ops.iter_mut() {
+                        if let Some(value) = op.value.as_mut() {
+                            let (mut m, _): (BlobMeta, _) = bincode::decode_from_slice(
+                                value,
+                                bincode::config::standard(),
+                            )
+                            .map_err(|o| StorageError::Bincode(o.to_string()))?;
+                            m.updated_at += 100;
+                            *value = bincode::encode_to_vec(m, bincode::config::standard())
+                                .map_err(|o| StorageError::Bincode(o.to_string()))?;
+                        }
+                    }
                 }
             }
             Ok(())
@@ -354,10 +433,19 @@ mod tests {
     impl Plugin for DoublePlugin {
         async fn before_update(&self, _db: &KuramotoDb, _txn: &redb::ReadTransaction, batch: &mut WriteBatch) -> Result<(), StorageError> {
             for req in batch {
-                if let WriteRequest::Put { meta, .. } = req {
-                    let (mut m, _): (BlobMeta, _) = bincode::decode_from_slice(meta, bincode::config::standard()).map_err(|o| StorageError::Bincode(o.to_string()))?;
-                    m.updated_at *= 2;
-                    *meta = bincode::encode_to_vec(m, bincode::config::standard()).map_err(|o| StorageError::Bincode(o.to_string()))?;
+                if let WriteRequest::Put { aux_ops, .. } = req {
+                    for op in aux_ops.iter_mut() {
+                        if let Some(value) = op.value.as_mut() {
+                            let (mut m, _): (BlobMeta, _) = bincode::decode_from_slice(
+                                value,
+                                bincode::config::standard(),
+                            )
+                            .map_err(|o| StorageError::Bincode(o.to_string()))?;
+                            m.updated_at *= 2;
+                            *value = bincode::encode_to_vec(m, bincode::config::standard())
+                                .map_err(|o| StorageError::Bincode(o.to_string()))?;
+                        }
+                    }
                 }
             }
             Ok(())

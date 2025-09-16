@@ -177,7 +177,7 @@ mod tests {
     use crate::plugins::harmonizer::{availability::Availability, range_cube::RangeCube};
     use crate::clock::MockClock;
     use crate::tables::TableHash;
-    use crate::storage_entity::StorageEntity;
+    use crate::storage_entity::{AuxTableSpec, StorageEntity};
     use smallvec::smallvec;
     use tempfile::tempdir;
     use std::sync::Arc;
@@ -192,9 +192,13 @@ mod tests {
             static T: redb::TableDefinition<'static, &'static [u8], Vec<u8>> = redb::TableDefinition::new("t_foo");
             &T
         }
-        fn meta_table_def() -> crate::StaticTableDef {
+        fn aux_tables() -> &'static [AuxTableSpec] {
             static M: redb::TableDefinition<'static, &'static [u8], Vec<u8>> = redb::TableDefinition::new("t_foo_meta");
-            &M
+            static AUX: &[AuxTableSpec] = &[AuxTableSpec {
+                role: crate::plugins::versioning::VERSIONING_AUX_ROLE,
+                table: &M,
+            }];
+            AUX
         }
         fn load_and_migrate(data: &[u8]) -> Result<Self, crate::storage_error::StorageError> {
             match data.first().copied() {

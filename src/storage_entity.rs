@@ -17,13 +17,21 @@ pub struct IndexSpec<T: StorageEntity> {
     pub cardinality: IndexCardinality,
 }
 
+#[derive(Copy, Clone)]
+pub struct AuxTableSpec {
+    pub role: &'static str,
+    pub table: StaticTableDef,
+}
+
 pub trait StorageEntity: Encode + Decode<()> + Sized + Send + Sync + 'static {
     const STRUCT_VERSION: u8;
 
     fn primary_key(&self) -> Vec<u8>;
 
     fn table_def() -> StaticTableDef;
-    fn meta_table_def() -> StaticTableDef;
+    fn aux_tables() -> &'static [AuxTableSpec] {
+        &[]
+    }
 
     fn to_bytes(&self) -> Vec<u8> {
         let payload = bincode::encode_to_vec(self, bincode::config::standard()).unwrap();

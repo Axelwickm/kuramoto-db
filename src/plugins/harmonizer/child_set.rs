@@ -4,7 +4,8 @@ use redb::TableDefinition;
 use crate::{
     KuramotoDb, StaticTableDef,
     plugins::harmonizer::riblt::{CodedSymbol, Encoder, Symbol},
-    storage_entity::{IndexCardinality, IndexSpec, StorageEntity},
+    plugins::versioning::VERSIONING_AUX_ROLE,
+    storage_entity::{AuxTableSpec, IndexCardinality, IndexSpec, StorageEntity},
     storage_error::StorageError,
     uuid_bytes::UuidBytes,
 };
@@ -37,6 +38,10 @@ impl Symbol<16> for UuidBytes {
 pub static AVAIL_CHILDREN_TBL: StaticTableDef = &TableDefinition::new("availability_children");
 pub static AVAIL_CHILDREN_META_TBL: StaticTableDef =
     &TableDefinition::new("availability_children_meta");
+pub static AVAIL_CHILDREN_AUX: &[AuxTableSpec] = &[AuxTableSpec {
+    role: VERSIONING_AUX_ROLE,
+    table: AVAIL_CHILDREN_META_TBL,
+}];
 
 // Index: child_id -> rows (parents of this child)
 pub static AVAIL_CHILDREN_BY_CHILD_TBL: StaticTableDef =
@@ -46,6 +51,10 @@ pub static AVAIL_DIG_CHUNK_TBL: StaticTableDef =
     &TableDefinition::new("availability_digest_chunks");
 pub static AVAIL_DIG_CHUNK_META_TBL: StaticTableDef =
     &TableDefinition::new("availability_digest_chunks_meta");
+pub static AVAIL_DIG_CHUNK_AUX: &[AuxTableSpec] = &[AuxTableSpec {
+    role: VERSIONING_AUX_ROLE,
+    table: AVAIL_DIG_CHUNK_META_TBL,
+}];
 
 /*────────────────────── Child row ───────────────────────────────*/
 
@@ -86,8 +95,8 @@ impl StorageEntity for Child {
     fn table_def() -> StaticTableDef {
         AVAIL_CHILDREN_TBL
     }
-    fn meta_table_def() -> StaticTableDef {
-        AVAIL_CHILDREN_META_TBL
+    fn aux_tables() -> &'static [AuxTableSpec] {
+        AVAIL_CHILDREN_AUX
     }
 
     fn load_and_migrate(src: &[u8]) -> Result<Self, StorageError> {
@@ -148,8 +157,8 @@ impl StorageEntity for DigestChunk {
     fn table_def() -> StaticTableDef {
         AVAIL_DIG_CHUNK_TBL
     }
-    fn meta_table_def() -> StaticTableDef {
-        AVAIL_DIG_CHUNK_META_TBL
+    fn aux_tables() -> &'static [AuxTableSpec] {
+        AVAIL_DIG_CHUNK_AUX
     }
 
     fn load_and_migrate(src: &[u8]) -> Result<Self, StorageError> {
