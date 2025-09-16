@@ -8,8 +8,8 @@ pub mod versioning;
 
 // NOTE: disabled
 // Harmonizer is optional; gate entire module behind feature.
-// #[cfg(feature = "harmonizer")]
-// pub mod harmonizer;
+#[cfg(feature = "harmonizer")]
+pub mod harmonizer;
 
 // Web admin plugin (optional)
 #[cfg(feature = "web_admin")]

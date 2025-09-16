@@ -23,6 +23,7 @@ rand = { version = "0.9.1" }
 getrandom = { version = "0.3.3", features = ["wasm_js"] }
 uuid = { version = "1.17", features = ["v4"] }
 smallvec = { version = "1.15.1", features = ["impl_bincode"] }
+bytes = { version = "1.7", optional = true }
 
 
 quinn = { version = "0.11.8", optional = true } # gated by feature `harmonizer`
@@ -31,6 +32,7 @@ rustls = { version = "0.23", default-features = false, features = [
 ], optional = true } # gated by feature `harmonizer`
 rcgen = { version = "0.13", optional = true } # gated by feature `harmonizer`
 tracing = "0.1.41"
+futures-util = "0.3"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # Web admin (optional) — compile only when feature enabled
@@ -38,6 +40,7 @@ tracing = "0.1.41"
 axum = { version = "0.7", features = ["http1", "macros"], optional = true }
 urlencoding = { version = "2.1", optional = true }
 hex = { version = "0.4", optional = true }
+tokio-tungstenite = { version = "0.21", optional = true, features = ["rustls-tls-webpki-roots"] }
 
 
 [features]
@@ -45,3 +48,26 @@ riblt_debug = []
 harmonizer_debug = []
 harmonizer = ["quinn", "rustls", "rcgen"]
 web_admin = ["axum", "urlencoding", "hex"]
+# Explicit backend features; pick one per target.
+webrtc_transport = []
+webrtc_native = ["webrtc", "bytes"]
+webrtc_wasm = ["wasm-bindgen", "web-sys"]
+ws_transport = []
+ws_native = ["tokio-tungstenite"]
+ws_wasm = ["wasm-bindgen", "wasm-bindgen-futures", "web-sys"]
+
+[dependencies.webrtc]
+version = "0.10"
+optional = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = { version = "0.2", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+web-sys = { version = "0.3", optional = true, features = [
+  "RtcPeerConnection",
+  "RtcDataChannel",
+  "RtcDataChannelEvent",
+  "RtcSdpType",
+  "RtcSessionDescriptionInit",
+  "EventTarget",
+] }

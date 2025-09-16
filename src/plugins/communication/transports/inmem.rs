@@ -22,8 +22,9 @@ pub struct InMemAddr {
 pub struct InMemResolver;
 
 #[async_trait::async_trait]
-impl PeerResolver<InMemAddr> for InMemResolver {
-    async fn resolve(&self, peer: PeerId) -> Result<InMemAddr, TransportError> {
+impl PeerResolver for InMemResolver {
+    type Addr = InMemAddr;
+    async fn resolve(&self, peer: PeerId) -> Result<Self::Addr, TransportError> {
         Ok(InMemAddr { peer })
     }
 }
@@ -132,8 +133,9 @@ impl InMemConnector {
 }
 
 #[async_trait::async_trait]
-impl Connector<InMemAddr> for InMemConnector {
-    async fn dial(&self, addr: &InMemAddr) -> Result<Arc<dyn TransportConn>, TransportError> {
+impl Connector for InMemConnector {
+    type Addr = InMemAddr;
+    async fn dial(&self, addr: &Self::Addr) -> Result<Arc<dyn TransportConn>, TransportError> {
         let remote = addr.peer;
 
         // Ensure both directed paths exist in this namespace.

@@ -1,5 +1,12 @@
 pub mod inmem;
-// pub mod quic; // TODO
+// QUIC transport is under construction. Re-enable when ready:
+// pub mod quic;
+// WebRTC transport intentionally disabled while pivoting to WebSockets:
+// #[cfg(feature = "webrtc_transport")]
+// pub mod webrtc;
+// WebSockets transport (native + wasm backends via features)
+#[cfg(feature = "ws_transport")]
+pub mod websockets;
 
 use crate::uuid_bytes::UuidBytes;
 use std::fmt::Debug;
@@ -21,13 +28,15 @@ pub trait PeerAddr: Send + Sync + Clone + Debug {}
 impl<T: Send + Sync + Clone + Debug> PeerAddr for T {}
 
 #[async_trait::async_trait]
-pub trait PeerResolver<A: PeerAddr>: Send + Sync {
-    async fn resolve(&self, peer: PeerId) -> Result<A, TransportError>;
+pub trait PeerResolver: Send + Sync {
+    type Addr: PeerAddr;
+    async fn resolve(&self, peer: PeerId) -> Result<Self::Addr, TransportError>;
 }
 
 #[async_trait::async_trait]
-pub trait Connector<A: PeerAddr>: Send + Sync {
-    async fn dial(&self, addr: &A) -> Result<Arc<dyn TransportConn>, TransportError>;
+pub trait Connector: Send + Sync {
+    type Addr: PeerAddr;
+    async fn dial(&self, addr: &Self::Addr) -> Result<Arc<dyn TransportConn>, TransportError>;
 }
 
 /*──────── per-peer connection ──────────*/
