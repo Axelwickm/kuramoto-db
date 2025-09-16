@@ -1,5 +1,11 @@
-use std::{fmt::Debug};
-use tokio::time::{Duration, Instant, advance};
+use std::fmt::Debug;
+use tokio::time::{Duration, Instant};
+
+#[cfg(not(target_arch = "wasm32"))]
+use tokio::time::advance;
+
+#[cfg(target_arch = "wasm32")]
+use tokio::time::sleep;
 
 pub trait Clock: Debug + Send + Sync + 'static {
     /// Monotonic seconds (maps Tokio's Instant → u64 seconds).
@@ -24,6 +30,17 @@ impl InstantMapper {
     fn now(&self) -> u64 {
         self.base + self.origin.elapsed().as_secs()
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn advance_time(delta_secs: u64) {
+    advance(Duration::from_secs(delta_secs)).await;
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn advance_time(delta_secs: u64) {
+    // No virtual time controls on wasm; fall back to real sleeps.
+    sleep(Duration::from_secs(delta_secs)).await;
 }
 
 /*──────────────────────── SystemClock (prod) ──────────────────*/
@@ -64,7 +81,7 @@ impl MockClock {
     /// Use only in tests with `#[tokio::test(start_paused = true)]`.
     pub async fn advance(&self, delta_secs: u64) {
         if delta_secs > 0 {
-            advance(Duration::from_secs(delta_secs)).await;
+            advance_time(delta_secs).await;
         }
     }
 
@@ -85,10 +102,10 @@ impl Clock for MockClock {
 
 /*──────────────────────────── tests ───────────────────────────*/
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
-    use tokio::time::{Duration, sleep};
+    use tokio::time::{Duration, advance, sleep};
 
     #[tokio::test(start_paused = true)]
     async fn system_clock_tracks_tokio_time() {

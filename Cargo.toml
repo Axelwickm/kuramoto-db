@@ -9,19 +9,14 @@ redb = "2.6.2"
 async-trait = "0.1.88"
 async-recursion = "1.0"
 tempfile = "3.20.0"
-tokio = { version = "1.43", features = [
-  "rt-multi-thread",
-  "rt",
-  "macros",
-  "sync",
-  "io-util",
-  "test-util",       # TODO: only if testing
-] }
+# Tokio runtime configuration differs across targets. Keep the base feature
+# set minimal so wasm builds compile, and enable heavier options for native
+# targets below.
 
 
 rand = { version = "0.9.1" }
 getrandom = { version = "0.3.3", features = ["wasm_js"] }
-uuid = { version = "1.17", features = ["v4"] }
+uuid = { version = "1.17", features = ["v4", "rng-getrandom"] }
 smallvec = { version = "1.15.1", features = ["impl_bincode"] }
 bytes = { version = "1.7", optional = true }
 
@@ -41,6 +36,14 @@ axum = { version = "0.7", features = ["http1", "macros"], optional = true }
 urlencoding = { version = "2.1", optional = true }
 hex = { version = "0.4", optional = true }
 tokio-tungstenite = { version = "0.21", optional = true, features = ["rustls-tls-webpki-roots"] }
+tokio = { version = "1.43", features = [
+  "rt-multi-thread",
+  "rt",
+  "macros",
+  "sync",
+  "io-util",
+  "test-util",
+] }
 
 
 [features]
@@ -61,6 +64,13 @@ version = "0.10"
 optional = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { version = "1.43", features = [
+  "rt",
+  "macros",
+  "sync",
+  "io-util",
+  "time",
+] }
 wasm-bindgen = { version = "0.2", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
 web-sys = { version = "0.3", optional = true, features = [
