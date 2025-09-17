@@ -11,8 +11,11 @@ use std::{
 };
 
 use bincode::{Decode, Encode};
-use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Semaphore};
 use tracing::{debug, info, instrument, warn};
+
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen_futures::spawn_local;
 
 use crate::{
     KuramotoDb, WriteBatch,
@@ -266,7 +269,7 @@ impl Router {
         // SEND WORKER (per-peer) — uses this conn directly
         let this = Arc::clone(self);
         let conn_for_send = conn.clone();
-        tokio::spawn(async move {
+        let send_task = async move {
             while let Some(bytes) = rx_bytes.recv().await {
                 if let Err(_e) = conn_for_send.send_bytes(bytes).await {
                     warn!(%peer, "router: send failed, dropping peer");
@@ -275,14 +278,26 @@ impl Router {
                 }
             }
             debug!(%peer, "router: send worker exit");
-        });
+        };
+
+        #[cfg(target_arch = "wasm32")]
+        spawn_local(send_task);
+
+        #[cfg(not(target_arch = "wasm32"))]
+        tokio::spawn(send_task);
 
         // READ LOOP — move the receiver into the task (don’t store it in a map)
         let mut rx_frames = conn.recv();
         let this2 = Arc::clone(self);
-        tokio::spawn(async move {
+        let read_task = async move {
             this2.read_loop(peer, &mut rx_frames).await;
-        });
+        };
+
+        #[cfg(target_arch = "wasm32")]
+        spawn_local(read_task);
+
+        #[cfg(not(target_arch = "wasm32"))]
+        tokio::spawn(read_task);
     }
 
     fn strike(&self, peer: PeerId, why: &'static str) {

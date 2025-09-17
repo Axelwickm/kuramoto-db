@@ -33,7 +33,7 @@ impl WsResolver {
         self.table.write().await.insert(peer, addr);
     }
 }
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 impl PeerResolver for WsResolver {
     type Addr = WsAddr;
     async fn resolve(&self, peer: PeerId) -> Result<Self::Addr, TransportError> {
@@ -61,7 +61,7 @@ impl WsUriResolver {
         Ok(())
     }
 }
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 impl PeerResolver for WsUriResolver {
     type Addr = WsAddr;
     async fn resolve(&self, peer: PeerId) -> Result<Self::Addr, TransportError> {
@@ -107,7 +107,7 @@ pub struct WsConn {
     rx_once: std::sync::Mutex<Option<mpsc::Receiver<Vec<u8>>>>,
 }
 
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 impl TransportConn for WsConn {
     async fn send_bytes(&self, bytes: Vec<u8>) -> Result<(), TransportError> {
         let (ack_tx, ack_rx) = oneshot::channel();
@@ -132,7 +132,7 @@ impl TransportConn for WsConn {
     }
 }
 
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 impl Connector for WsConnector {
     type Addr = WsAddr;
     async fn dial(&self, addr: &Self::Addr) -> Result<Arc<dyn TransportConn>, TransportError> {

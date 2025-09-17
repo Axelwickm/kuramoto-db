@@ -21,7 +21,8 @@ pub struct InMemAddr {
 /// Resolves any PeerId to an InMemAddr with the same id.
 pub struct InMemResolver;
 
-#[async_trait::async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl PeerResolver for InMemResolver {
     type Addr = InMemAddr;
     async fn resolve(&self, peer: PeerId) -> Result<Self::Addr, TransportError> {
@@ -86,7 +87,8 @@ pub struct InMemConn {
     rx_once: Mutex<Option<ChanRx>>,
 }
 
-#[async_trait::async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl TransportConn for InMemConn {
     async fn send_bytes(&self, bytes: Vec<u8>) -> Result<(), TransportError> {
         self.tx
@@ -132,7 +134,8 @@ impl InMemConnector {
     }
 }
 
-#[async_trait::async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl Connector for InMemConnector {
     type Addr = InMemAddr;
     async fn dial(&self, addr: &Self::Addr) -> Result<Arc<dyn TransportConn>, TransportError> {
