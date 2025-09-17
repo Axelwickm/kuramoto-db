@@ -14,3 +14,10 @@ inherits = "default"
 test-timeout = "15s"
 retries = 0
 status-level = "fail"
+
+# Local profile with a 20s per-test timeout for diagnosing slow tests
+[profile.twenty]
+inherits = "default"
+test-timeout = "20s"
+retries = 0
+status-level = "pass"

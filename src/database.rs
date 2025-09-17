@@ -237,7 +237,10 @@ impl KuramotoDb {
                                             out
                                         }
                                     };
-                                    IndexRemoveRequest { table: idx.table_def, key: stored }
+                                    IndexRemoveRequest {
+                                        table: idx.table_def,
+                                        key: stored,
+                                    }
                                 })
                             })
                             .collect();
@@ -265,10 +268,10 @@ impl KuramotoDb {
                     .write()
                     .unwrap()
                     .insert(ih, (idx.table_def, E::table_def()));
-                self.index_table_by_name
-                    .write()
-                    .unwrap()
-                    .insert(idx.table_def.name().to_string(), (idx.table_def, E::table_def()));
+                self.index_table_by_name.write().unwrap().insert(
+                    idx.table_def.name().to_string(),
+                    (idx.table_def, E::table_def()),
+                );
             }
             // Name lookups for data & meta tables
             self.data_table_by_name
@@ -359,7 +362,10 @@ impl KuramotoDb {
     pub fn resolve_index_table_by_hash(&self, h: u64) -> Option<(StaticTableDef, StaticTableDef)> {
         self.index_table_by_hash.read().unwrap().get(&h).copied()
     }
-    pub fn resolve_index_pair_by_name(&self, name: &str) -> Option<(StaticTableDef, StaticTableDef)> {
+    pub fn resolve_index_pair_by_name(
+        &self,
+        name: &str,
+    ) -> Option<(StaticTableDef, StaticTableDef)> {
         self.index_table_by_name.read().unwrap().get(name).copied()
     }
     pub fn resolve_data_table_by_name(&self, name: &str) -> Option<StaticTableDef> {
@@ -382,8 +388,7 @@ impl KuramotoDb {
         data_table: &str,
         role: &str,
     ) -> Result<StaticTableDef, StorageError> {
-        self
-            .resolve_aux_table_by_role(data_table, role)
+        self.resolve_aux_table_by_role(data_table, role)
             .ok_or_else(|| {
                 StorageError::Other(format!(
                     "no auxiliary table registered for '{data_table}' with role '{role}'",
@@ -423,11 +428,9 @@ impl KuramotoDb {
         end: &[u8],
         limit: Option<usize>,
     ) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>, Vec<u8>)>, StorageError> {
-        let data_t = self
-            .resolve_data_table_by_name(table_name)
-            .ok_or_else(|| StorageError::Other(format!(
-                "no entity registered for table '{table_name}'"
-            )))?;
+        let data_t = self.resolve_data_table_by_name(table_name).ok_or_else(|| {
+            StorageError::Other(format!("no entity registered for table '{table_name}'"))
+        })?;
         let aux_t = self.resolve_aux_table_for_data(table_name, aux_role)?;
 
         self.with_read(None, |rt| {
@@ -451,7 +454,9 @@ impl KuramotoDb {
                     .map_err(|e| StorageError::Other(e.to_string()))?
                     .map(|v| v.value().to_vec());
                 out.push((pk, data_opt, aux_raw));
-                if limit.map_or(false, |n| out.len() >= n) { break; }
+                if limit.map_or(false, |n| out.len() >= n) {
+                    break;
+                }
             }
             Ok(out)
         })
@@ -490,9 +495,11 @@ impl KuramotoDb {
     ) -> Result<Vec<(Vec<u8>, Vec<u8>, Option<Vec<u8>>, Vec<u8>)>, StorageError> {
         let (idx_tdef, data_tdef) = self
             .resolve_index_pair_by_name(index_table_name)
-            .ok_or_else(|| StorageError::Other(format!(
-                "no index registered for table '{index_table_name}'"
-            )))?;
+            .ok_or_else(|| {
+                StorageError::Other(format!(
+                    "no index registered for table '{index_table_name}'"
+                ))
+            })?;
         // Auxiliary table shares the same parent name as data table
         let aux_tdef = self.resolve_aux_table_for_data(data_tdef.name(), aux_role)?;
 
@@ -527,7 +534,9 @@ impl KuramotoDb {
                     None => continue, // If no meta, skip (shouldn't happen for well-formed rows)
                 };
                 out.push((ikb, pk, data_opt, aux_raw));
-                if limit.map_or(false, |n| out.len() >= n) { break; }
+                if limit.map_or(false, |n| out.len() >= n) {
+                    break;
+                }
             }
             Ok(out)
         })
@@ -884,16 +893,15 @@ impl KuramotoDb {
         end_idx_key: &[u8],
         limit: Option<usize>,
     ) -> Result<Vec<(E, Vec<u8>)>, StorageError> {
-        self
-            .range_with_aux_raw_by_index_tx::<E>(
-                None,
-                role,
-                index_table,
-                start_idx_key,
-                end_idx_key,
-                limit,
-            )
-            .await
+        self.range_with_aux_raw_by_index_tx::<E>(
+            None,
+            role,
+            index_table,
+            start_idx_key,
+            end_idx_key,
+            limit,
+        )
+        .await
     }
 
     pub async fn get_by_index_tx<E: StorageEntity>(
@@ -1126,7 +1134,8 @@ impl KuramotoDb {
         e: &[u8],
         l: Option<usize>,
     ) -> Result<Vec<(E, Vec<u8>)>, StorageError> {
-        self.range_with_aux_raw_by_pk_tx::<E>(None, role, s, e, l).await
+        self.range_with_aux_raw_by_pk_tx::<E>(None, role, s, e, l)
+            .await
     }
 
     pub async fn put_by_table_bytes(
@@ -1167,8 +1176,7 @@ impl KuramotoDb {
         table_name: &str,
         pk: &[u8],
     ) -> Result<(), StorageError> {
-        self
-            .delete_by_table_pk_with_origin(table_name, pk, WriteOrigin::LocalCommit)
+        self.delete_by_table_pk_with_origin(table_name, pk, WriteOrigin::LocalCommit)
             .await
     }
 
@@ -1213,7 +1221,8 @@ impl KuramotoDb {
     }
 
     pub async fn put<E: StorageEntity>(&self, entity: E) -> Result<(), StorageError> {
-        self.put_with_origin::<E>(entity, WriteOrigin::LocalCommit).await
+        self.put_with_origin::<E>(entity, WriteOrigin::LocalCommit)
+            .await
     }
 
     pub async fn put_with_origin<E: StorageEntity>(
@@ -1246,7 +1255,10 @@ impl KuramotoDb {
                             IndexCardinality::Unique => k.clone(),
                             IndexCardinality::NonUnique => encode_nonunique_index_key(k, &pk),
                         };
-                        removes.push(IndexRemoveRequest { table: idx.table_def, key: stored });
+                        removes.push(IndexRemoveRequest {
+                            table: idx.table_def,
+                            key: stored,
+                        });
                     }
                     // Insert new-only keys
                     for k in new_keys.iter().filter(|k| !old_keys.contains(k)) {
@@ -1277,7 +1289,9 @@ impl KuramotoDb {
                         keys.into_iter().map(move |idx_key| {
                             let stored = match idx.cardinality {
                                 IndexCardinality::Unique => idx_key,
-                                IndexCardinality::NonUnique => encode_nonunique_index_key(&idx_key, &pk_clone),
+                                IndexCardinality::NonUnique => {
+                                    encode_nonunique_index_key(&idx_key, &pk_clone)
+                                }
                             };
                             IndexPutRequest {
                                 table: idx.table_def,
@@ -1309,7 +1323,8 @@ impl KuramotoDb {
     }
 
     pub async fn delete<E: StorageEntity>(&self, key: &[u8]) -> Result<(), StorageError> {
-        self.delete_with_origin::<E>(key, WriteOrigin::LocalCommit).await
+        self.delete_with_origin::<E>(key, WriteOrigin::LocalCommit)
+            .await
     }
 
     pub async fn delete_with_origin<E: StorageEntity>(
@@ -1335,7 +1350,10 @@ impl KuramotoDb {
                         IndexCardinality::Unique => raw,
                         IndexCardinality::NonUnique => encode_nonunique_index_key(&raw, &pk),
                     };
-                    IndexRemoveRequest { table: idx.table_def, key: stored }
+                    IndexRemoveRequest {
+                        table: idx.table_def,
+                        key: stored,
+                    }
                 })
             })
             .collect();
@@ -1363,7 +1381,8 @@ impl KuramotoDb {
     }
 
     pub async fn raw_write(&self, req: WriteRequest) -> Result<(), StorageError> {
-        self.raw_write_with_origin(req, WriteOrigin::LocalCommit).await
+        self.raw_write_with_origin(req, WriteOrigin::LocalCommit)
+            .await
     }
 
     pub async fn raw_write_with_origin(
@@ -1396,7 +1415,8 @@ impl KuramotoDb {
         if dbg {
             println!(
                 "db.write: handle_write start batch_len={} origin={:?}",
-                batch.len(), origin
+                batch.len(),
+                origin
             );
         }
         let wtxn = self
@@ -1436,7 +1456,9 @@ impl KuramotoDb {
                     index_puts,
                     index_removes,
                 } => {
-                    if dbg { println!("db.write: applying PUT table={}", data_table.name()); }
+                    if dbg {
+                        println!("db.write: applying PUT table={}", data_table.name());
+                    }
 
                     // ---- Insert/overwrite main row ----
                     {
@@ -1508,7 +1530,9 @@ impl KuramotoDb {
                     aux_ops,
                     index_removes,
                 } => {
-                    if dbg { println!("db.write: applying DELETE table={}", data_table.name()); }
+                    if dbg {
+                        println!("db.write: applying DELETE table={}", data_table.name());
+                    }
                     // ---- Delete main row ----
                     {
                         let mut t = wtxn
@@ -1551,10 +1575,14 @@ impl KuramotoDb {
         }
 
         // Commit once
-        if dbg { println!("db.write: commit begin"); }
+        if dbg {
+            println!("db.write: commit begin");
+        }
         wtxn.commit()
             .map_err(|e| StorageError::Other(e.to_string()))?;
-        if dbg { println!("db.write: commit done"); }
+        if dbg {
+            println!("db.write: commit done");
+        }
 
         // Trigger after-write hooks asynchronously to avoid deadlocks.
         let db_for_hooks = self.clone();
@@ -1562,16 +1590,25 @@ impl KuramotoDb {
         tokio::spawn(async move {
             let dbg = std::env::var("KDB_DEBUG_RANGE").ok().is_some();
             for plugin in plugins.iter() {
-                if dbg { println!("db.write: after_write start"); }
-                if let Err(e) = plugin.after_write(&db_for_hooks, &applied_snapshot, origin).await {
+                if dbg {
+                    println!("db.write: after_write start");
+                }
+                if let Err(e) = plugin
+                    .after_write(&db_for_hooks, &applied_snapshot, origin)
+                    .await
+                {
                     tracing::error!("after_write error: {}", e);
                 }
-                if dbg { println!("db.write: after_write end"); }
+                if dbg {
+                    println!("db.write: after_write end");
+                }
             }
         });
 
         // Reply once for the whole batch
-        if dbg { println!("db.write: sending reply Ok(())"); }
+        if dbg {
+            println!("db.write: sending reply Ok(())");
+        }
         let _ = reply.send(Ok(()));
         Ok(())
     }
@@ -1594,7 +1631,7 @@ mod tests {
     use crate::{
         KuramotoDb, StaticTableDef, WriteBatch, WriteRequest,
         meta::BlobMeta,
-        plugins::{versioning::VERSIONING_AUX_ROLE, Plugin},
+        plugins::{Plugin, versioning::VERSIONING_AUX_ROLE},
         region_lock::RegionLock,
         storage_entity::{AuxTableSpec, IndexCardinality, IndexSpec, StorageEntity},
         storage_error::StorageError,
@@ -1895,15 +1932,26 @@ mod tests {
     impl StorageEntity for MultiIdxEntity {
         const STRUCT_VERSION: u8 = 0;
 
-        fn primary_key(&self) -> Vec<u8> { self.id.to_be_bytes().to_vec() }
-        fn table_def() -> StaticTableDef { &MULTI_TBL }
-        fn aux_tables() -> &'static [AuxTableSpec] { MULTI_AUX }
-        fn load_and_migrate(data: &[u8]) -> Result<Self, StorageError> {
-            bincode::decode_from_slice(data.get(1..).unwrap_or_default(), bincode::config::standard())
-                .map(|(v, _)| v)
-                .map_err(|e| StorageError::Bincode(e.to_string()))
+        fn primary_key(&self) -> Vec<u8> {
+            self.id.to_be_bytes().to_vec()
         }
-        fn indexes() -> &'static [IndexSpec<Self>] { MULTI_INDEXES }
+        fn table_def() -> StaticTableDef {
+            &MULTI_TBL
+        }
+        fn aux_tables() -> &'static [AuxTableSpec] {
+            MULTI_AUX
+        }
+        fn load_and_migrate(data: &[u8]) -> Result<Self, StorageError> {
+            bincode::decode_from_slice(
+                data.get(1..).unwrap_or_default(),
+                bincode::config::standard(),
+            )
+            .map(|(v, _)| v)
+            .map_err(|e| StorageError::Bincode(e.to_string()))
+        }
+        fn indexes() -> &'static [IndexSpec<Self>] {
+            MULTI_INDEXES
+        }
 
         fn index_keys(&self, idx: &IndexSpec<Self>) -> Vec<Vec<u8>> {
             // produce one key per tag for the by_tag index
@@ -1928,7 +1976,10 @@ mod tests {
         sys.create_table_and_indexes::<MultiIdxEntity>().unwrap();
 
         // insert with two tags → two index entries
-        let mut e = MultiIdxEntity { id: 1, tags: vec!["a".into(), "b".into()] };
+        let mut e = MultiIdxEntity {
+            id: 1,
+            tags: vec!["a".into(), "b".into()],
+        };
         sys.put(e.clone()).await.unwrap();
         let pks_a = sys.get_index_all(&TAG_INDEX, b"a").await.unwrap();
         let pks_b = sys.get_index_all(&TAG_INDEX, b"b").await.unwrap();
@@ -1948,14 +1999,19 @@ mod tests {
 
         // delete entity → all index rows removed
         clock.advance(1).await;
-        sys.delete::<MultiIdxEntity>(&1u64.to_be_bytes()).await.unwrap();
+        sys.delete::<MultiIdxEntity>(&1u64.to_be_bytes())
+            .await
+            .unwrap();
         let pks_b3 = sys.get_index_all(&TAG_INDEX, b"b").await.unwrap();
         let pks_c3 = sys.get_index_all(&TAG_INDEX, b"c").await.unwrap();
         assert!(pks_b3.is_empty() && pks_c3.is_empty());
     }
 
     #[derive(Clone, Debug, PartialEq, Encode, Decode)]
-    struct MultiUniqueEntity { id: u64, codes: Vec<String> }
+    struct MultiUniqueEntity {
+        id: u64,
+        codes: Vec<String>,
+    }
 
     static MU_TBL: TableDefinition<'static, &'static [u8], Vec<u8>> =
         TableDefinition::new("multi_unique");
@@ -1978,15 +2034,26 @@ mod tests {
 
     impl StorageEntity for MultiUniqueEntity {
         const STRUCT_VERSION: u8 = 0;
-        fn primary_key(&self) -> Vec<u8> { self.id.to_be_bytes().to_vec() }
-        fn table_def() -> StaticTableDef { &MU_TBL }
-        fn aux_tables() -> &'static [AuxTableSpec] { MU_AUX }
-        fn load_and_migrate(data: &[u8]) -> Result<Self, StorageError> {
-            bincode::decode_from_slice(data.get(1..).unwrap_or_default(), bincode::config::standard())
-                .map(|(v, _)| v)
-                .map_err(|e| StorageError::Bincode(e.to_string()))
+        fn primary_key(&self) -> Vec<u8> {
+            self.id.to_be_bytes().to_vec()
         }
-        fn indexes() -> &'static [IndexSpec<Self>] { MU_INDEXES }
+        fn table_def() -> StaticTableDef {
+            &MU_TBL
+        }
+        fn aux_tables() -> &'static [AuxTableSpec] {
+            MU_AUX
+        }
+        fn load_and_migrate(data: &[u8]) -> Result<Self, StorageError> {
+            bincode::decode_from_slice(
+                data.get(1..).unwrap_or_default(),
+                bincode::config::standard(),
+            )
+            .map(|(v, _)| v)
+            .map_err(|e| StorageError::Bincode(e.to_string()))
+        }
+        fn indexes() -> &'static [IndexSpec<Self>] {
+            MU_INDEXES
+        }
         fn index_keys(&self, _idx: &IndexSpec<Self>) -> Vec<Vec<u8>> {
             let mut out: Vec<Vec<u8>> = self.codes.iter().map(|s| s.as_bytes().to_vec()).collect();
             out.sort();
@@ -2007,10 +2074,16 @@ mod tests {
         .await;
         sys.create_table_and_indexes::<MultiUniqueEntity>().unwrap();
 
-        let a = MultiUniqueEntity { id: 1, codes: vec!["x".into(), "y".into()] };
+        let a = MultiUniqueEntity {
+            id: 1,
+            codes: vec!["x".into(), "y".into()],
+        };
         sys.put(a).await.unwrap();
         // Second entity collides on "y"
-        let b = MultiUniqueEntity { id: 2, codes: vec!["y".into()] };
+        let b = MultiUniqueEntity {
+            id: 2,
+            codes: vec!["y".into()],
+        };
         let err = sys.put(b).await.err().expect("should reject duplicate key");
         assert!(matches!(err, StorageError::DuplicateIndexKey { .. }));
     }
@@ -2389,12 +2462,25 @@ mod tests {
     async fn plan_delete_by_table_pk_builds_and_applies() {
         let dir = tempfile::tempdir().unwrap();
         let clock = Arc::new(MockClock::new(0));
-        let db = KuramotoDb::new(dir.path().join("plan_del.redb").to_str().unwrap(), clock, vec![]).await;
+        let db = KuramotoDb::new(
+            dir.path().join("plan_del.redb").to_str().unwrap(),
+            clock,
+            vec![],
+        )
+        .await;
         db.create_table_and_indexes::<TestEntity>().unwrap();
 
         // Seed two rows with same value so non-unique index has multiple entries
-        let a = TestEntity { id: 1, name: "Alice".into(), value: 7 };
-        let b = TestEntity { id: 2, name: "Bob".into(), value: 7 };
+        let a = TestEntity {
+            id: 1,
+            name: "Alice".into(),
+            value: 7,
+        };
+        let b = TestEntity {
+            id: 2,
+            name: "Bob".into(),
+            value: 7,
+        };
         db.put(a.clone()).await.unwrap();
         db.put(b.clone()).await.unwrap();
 
@@ -2408,8 +2494,15 @@ mod tests {
         db.raw_write(req).await.unwrap();
 
         // Alice gone; Bob remains
-        assert!(db.get_data::<TestEntity>(&a.id.to_be_bytes()).await.is_err());
-        let got_b = db.get_data::<TestEntity>(&b.id.to_be_bytes()).await.unwrap();
+        assert!(
+            db.get_data::<TestEntity>(&a.id.to_be_bytes())
+                .await
+                .is_err()
+        );
+        let got_b = db
+            .get_data::<TestEntity>(&b.id.to_be_bytes())
+            .await
+            .unwrap();
         assert_eq!(got_b.name, "Bob");
 
         // Unique index for name must not have Alice
@@ -2429,10 +2522,19 @@ mod tests {
     async fn delete_by_table_pk_executes_delete() {
         let dir = tempfile::tempdir().unwrap();
         let clock = Arc::new(MockClock::new(0));
-        let db = KuramotoDb::new(dir.path().join("del_by_tbl.redb").to_str().unwrap(), clock, vec![]).await;
+        let db = KuramotoDb::new(
+            dir.path().join("del_by_tbl.redb").to_str().unwrap(),
+            clock,
+            vec![],
+        )
+        .await;
         db.create_table_and_indexes::<TestEntity>().unwrap();
 
-        let e = TestEntity { id: 10, name: "Z".into(), value: 99 };
+        let e = TestEntity {
+            id: 10,
+            name: "Z".into(),
+            value: 99,
+        };
         db.put(e.clone()).await.unwrap();
 
         // Sanity index present
@@ -2445,7 +2547,11 @@ mod tests {
             .unwrap();
 
         // Gone + index removed
-        assert!(db.get_data::<TestEntity>(&e.id.to_be_bytes()).await.is_err());
+        assert!(
+            db.get_data::<TestEntity>(&e.id.to_be_bytes())
+                .await
+                .is_err()
+        );
         let gone = db.get_index(&TEST_NAME_INDEX, b"Z").await.unwrap();
         assert!(gone.is_none());
     }

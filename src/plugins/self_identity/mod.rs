@@ -1,50 +1,68 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bincode::{Encode, Decode};
+use bincode::{Decode, Encode};
 use redb::ReadTransaction;
 use redb::TableDefinition;
 
-use crate::{
-    KuramotoDb, WriteBatch, WriteOrigin, StaticTableDef, storage_error::StorageError,
-    storage_entity::{AuxTableSpec, IndexSpec, StorageEntity},
-};
-use crate::plugins::{versioning::VERSIONING_AUX_ROLE, Plugin};
+use crate::plugins::{Plugin, versioning::VERSIONING_AUX_ROLE};
 use crate::uuid_bytes::UuidBytes;
+use crate::{
+    KuramotoDb, StaticTableDef, WriteBatch, WriteOrigin,
+    storage_entity::{AuxTableSpec, IndexSpec, StorageEntity},
+    storage_error::StorageError,
+};
 
 // Simple single-row table holding a persistent local peer id
 #[derive(Clone, Debug, Encode, Decode)]
 struct SelfIdRow {
-    key: u8,            // always 0
-    peer_id: [u8; 16],  // stable id
+    key: u8,           // always 0
+    peer_id: [u8; 16], // stable id
 }
 
-static TBL: TableDefinition<'static, &'static [u8], Vec<u8>> = TableDefinition::new("self_identity");
-static META: TableDefinition<'static, &'static [u8], Vec<u8>> = TableDefinition::new("self_identity_meta");
-static AUX_TABLES: &[AuxTableSpec] = &[AuxTableSpec { role: VERSIONING_AUX_ROLE, table: &META }];
+static TBL: TableDefinition<'static, &'static [u8], Vec<u8>> =
+    TableDefinition::new("self_identity");
+static META: TableDefinition<'static, &'static [u8], Vec<u8>> =
+    TableDefinition::new("self_identity_meta");
+static AUX_TABLES: &[AuxTableSpec] = &[AuxTableSpec {
+    role: VERSIONING_AUX_ROLE,
+    table: &META,
+}];
 static INDEXES: &[IndexSpec<SelfIdRow>] = &[];
 
 impl StorageEntity for SelfIdRow {
     const STRUCT_VERSION: u8 = 0;
-    fn primary_key(&self) -> Vec<u8> { vec![self.key] }
-    fn table_def() -> StaticTableDef { &TBL }
-    fn aux_tables() -> &'static [AuxTableSpec] { AUX_TABLES }
+    fn primary_key(&self) -> Vec<u8> {
+        vec![self.key]
+    }
+    fn table_def() -> StaticTableDef {
+        &TBL
+    }
+    fn aux_tables() -> &'static [AuxTableSpec] {
+        AUX_TABLES
+    }
     fn load_and_migrate(data: &[u8]) -> Result<Self, StorageError> {
         match data.first().copied() {
-            Some(0) => bincode::decode_from_slice::<Self, _>(&data[1..], bincode::config::standard())
-                .map(|(v, _)| v)
-                .map_err(|e| StorageError::Bincode(e.to_string())),
+            Some(0) => {
+                bincode::decode_from_slice::<Self, _>(&data[1..], bincode::config::standard())
+                    .map(|(v, _)| v)
+                    .map_err(|e| StorageError::Bincode(e.to_string()))
+            }
             _ => Err(StorageError::Bincode("bad version".into())),
         }
     }
-    fn indexes() -> &'static [IndexSpec<Self>] { INDEXES }
+    fn indexes() -> &'static [IndexSpec<Self>] {
+        INDEXES
+    }
 }
 
 #[derive(Default)]
 pub struct SelfIdentity;
 
 impl SelfIdentity {
-    pub fn new() -> Arc<Self> { Arc::new(SelfIdentity) }
+    pub fn new() -> Arc<Self> {
+        Arc::new(SelfIdentity)
+    }
 
     pub async fn get_peer_id(db: &KuramotoDb) -> Result<UuidBytes, StorageError> {
         // Try read
@@ -55,7 +73,14 @@ impl SelfIdentity {
         let id = UuidBytes::new();
         let mut arr = [0u8; 16];
         arr.copy_from_slice(id.as_bytes());
-        db.put_with_origin::<SelfIdRow>(SelfIdRow { key: 0, peer_id: arr }, WriteOrigin::Plugin(crate::plugins::fnv1a_16("self_identity"))).await?;
+        db.put_with_origin::<SelfIdRow>(
+            SelfIdRow {
+                key: 0,
+                peer_id: arr,
+            },
+            WriteOrigin::Plugin(crate::plugins::fnv1a_16("self_identity")),
+        )
+        .await?;
         Ok(id)
     }
 }
@@ -73,7 +98,14 @@ impl Plugin for SelfIdentity {
         });
     }
 
-    async fn before_update(&self, _db: &KuramotoDb, _txn: &ReadTransaction, _batch: &mut WriteBatch) -> Result<(), StorageError> { Ok(()) }
+    async fn before_update(
+        &self,
+        _db: &KuramotoDb,
+        _txn: &ReadTransaction,
+        _batch: &mut WriteBatch,
+    ) -> Result<(), StorageError> {
+        Ok(())
+    }
 }
 
 /* tests */

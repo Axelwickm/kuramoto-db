@@ -13,9 +13,16 @@ mod wasm;
 pub use wasm::*;
 
 // Compile-time guards for backend selection
-#[cfg(all(feature = "ws_transport", not(target_arch = "wasm32"), not(feature = "ws_native")))]
+#[cfg(all(
+    feature = "ws_transport",
+    not(target_arch = "wasm32"),
+    not(feature = "ws_native")
+))]
 compile_error!("feature 'ws_transport' requires 'ws_native' on non-wasm targets");
 
-#[cfg(all(feature = "ws_transport", target_arch = "wasm32", not(feature = "ws_wasm")))]
+#[cfg(all(
+    feature = "ws_transport",
+    target_arch = "wasm32",
+    not(feature = "ws_wasm")
+))]
 compile_error!("feature 'ws_transport' requires 'ws_wasm' on wasm32 targets");
-

@@ -3,55 +3,141 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
+use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
-use web_sys::{BinaryType, MessageEvent, WebSocket};
+use web_sys::{BinaryType, MessageEvent, WebSocket, js_sys};
 
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc, oneshot};
 
-use crate::plugins::communication::transports::{Connector, PeerId, PeerResolver, TransportConn, TransportError};
+use crate::plugins::communication::transports::{
+    Connector, PeerId, PeerResolver, TransportConn, TransportError,
+};
 
 #[derive(Clone, Debug)]
-pub struct WsAddr { pub peer: PeerId, pub url: String }
+pub struct WsAddr {
+    pub peer: PeerId,
+    pub url: String,
+}
 
-pub struct WsResolver { table: Arc<RwLock<HashMap<PeerId, WsAddr>>> }
-impl WsResolver { pub fn new() -> Self { Self { table: Arc::new(RwLock::new(HashMap::new())) } } pub async fn set(&self, peer: PeerId, addr: WsAddr) { self.table.write().await.insert(peer, addr); } }
+pub struct WsResolver {
+    table: Arc<RwLock<HashMap<PeerId, WsAddr>>>,
+}
+impl WsResolver {
+    pub fn new() -> Self {
+        Self {
+            table: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+    pub async fn set(&self, peer: PeerId, addr: WsAddr) {
+        self.table.write().await.insert(peer, addr);
+    }
+}
 #[async_trait::async_trait]
-impl PeerResolver for WsResolver { type Addr = WsAddr; async fn resolve(&self, peer: PeerId) -> Result<Self::Addr, TransportError> { self.table.read().await.get(&peer).cloned().ok_or_else(|| TransportError::Io("ws: peer not found".into())) } }
+impl PeerResolver for WsResolver {
+    type Addr = WsAddr;
+    async fn resolve(&self, peer: PeerId) -> Result<Self::Addr, TransportError> {
+        self.table
+            .read()
+            .await
+            .get(&peer)
+            .cloned()
+            .ok_or_else(|| TransportError::Io("ws: peer not found".into()))
+    }
+}
 
-pub struct WsUriResolver { table: Arc<RwLock<HashMap<PeerId, WsAddr>>> }
-impl WsUriResolver { pub fn new() -> Self { Self { table: Arc::new(RwLock::new(HashMap::new())) } } pub async fn set_uri(&self, peer: PeerId, uri: &str) -> Result<(), TransportError> { let addr = parse_ws_uri(peer, uri)?; self.table.write().await.insert(peer, addr); Ok(()) } }
+pub struct WsUriResolver {
+    table: Arc<RwLock<HashMap<PeerId, WsAddr>>>,
+}
+impl WsUriResolver {
+    pub fn new() -> Self {
+        Self {
+            table: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+    pub async fn set_uri(&self, peer: PeerId, uri: &str) -> Result<(), TransportError> {
+        let addr = parse_ws_uri(peer, uri)?;
+        self.table.write().await.insert(peer, addr);
+        Ok(())
+    }
+}
 #[async_trait::async_trait]
-impl PeerResolver for WsUriResolver { type Addr = WsAddr; async fn resolve(&self, peer: PeerId) -> Result<Self::Addr, TransportError> { self.table.read().await.get(&peer).cloned().ok_or_else(|| TransportError::Io("ws: peer not found".into())) } }
+impl PeerResolver for WsUriResolver {
+    type Addr = WsAddr;
+    async fn resolve(&self, peer: PeerId) -> Result<Self::Addr, TransportError> {
+        self.table
+            .read()
+            .await
+            .get(&peer)
+            .cloned()
+            .ok_or_else(|| TransportError::Io("ws: peer not found".into()))
+    }
+}
 
-fn parse_ws_uri(peer: PeerId, uri: &str) -> Result<WsAddr, TransportError> { let s = uri.trim(); if !(s.starts_with("ws://") || s.starts_with("wss://")) { return Err(TransportError::Io("ws uri must start with ws:// or wss://".into())); } Ok(WsAddr { peer, url: s.to_string() }) }
+fn parse_ws_uri(peer: PeerId, uri: &str) -> Result<WsAddr, TransportError> {
+    let s = uri.trim();
+    if !(s.starts_with("ws://") || s.starts_with("wss://")) {
+        return Err(TransportError::Io(
+            "ws uri must start with ws:// or wss://".into(),
+        ));
+    }
+    Ok(WsAddr {
+        peer,
+        url: s.to_string(),
+    })
+}
 
 pub struct WsConnector;
-impl WsConnector { pub fn new() -> Self { Self } }
+impl WsConnector {
+    pub fn new() -> Self {
+        Self
+    }
+}
 
-pub struct WsConn { ws: WebSocket, rx_once: std::sync::Mutex<Option<mpsc::Receiver<Vec<u8>>>>> }
+enum WsCmd {
+    Send {
+        bytes: Vec<u8>,
+        ack: oneshot::Sender<Result<(), TransportError>>,
+    },
+    Close,
+}
+
+pub struct WsConn {
+    cmd_tx: mpsc::UnboundedSender<WsCmd>,
+    rx_once: std::sync::Mutex<Option<mpsc::Receiver<Vec<u8>>>>,
+}
 
 #[async_trait::async_trait]
 impl TransportConn for WsConn {
     async fn send_bytes(&self, bytes: Vec<u8>) -> Result<(), TransportError> {
-        self.ws.set_binary_type(BinaryType::Arraybuffer);
-        self.ws
-            .send_with_u8_array(&bytes)
-            .map_err(|e| TransportError::Io(format!("ws send: {:?}", e)))
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(WsCmd::Send { bytes, ack: ack_tx })
+            .map_err(|_| TransportError::ConnectionClosed)?;
+        ack_rx
+            .await
+            .unwrap_or_else(|_| Err(TransportError::ConnectionClosed))
     }
     fn recv(&self) -> mpsc::Receiver<Vec<u8>> {
         let mut g = self.rx_once.lock().expect("poisoned");
-        if let Some(rx) = g.take() { rx } else { let (_t, rx) = mpsc::channel(1); rx }
+        if let Some(rx) = g.take() {
+            rx
+        } else {
+            let (_t, rx) = mpsc::channel(1);
+            rx
+        }
     }
-    async fn close(&self) { let _ = self.ws.close(); }
+    async fn close(&self) {
+        let _ = self.cmd_tx.send(WsCmd::Close);
+    }
 }
 
 #[async_trait::async_trait]
 impl Connector for WsConnector {
     type Addr = WsAddr;
     async fn dial(&self, addr: &Self::Addr) -> Result<Arc<dyn TransportConn>, TransportError> {
-        let ws = WebSocket::new(&addr.url).map_err(|e| TransportError::Io(format!("ws new: {:?}", e)))?;
+        let ws = WebSocket::new(&addr.url)
+            .map_err(|e| TransportError::Io(format!("ws new: {:?}", e)))?;
         ws.set_binary_type(BinaryType::Arraybuffer);
         let (tx, rx) = mpsc::channel::<Vec<u8>>(1024);
         let onmessage = {
@@ -70,7 +156,30 @@ impl Connector for WsConnector {
         };
         ws.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
         onmessage.forget();
-        Ok(Arc::new(WsConn { ws, rx_once: std::sync::Mutex::new(Some(rx)) }))
+
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<WsCmd>();
+        let ws_loop = ws.clone();
+        spawn_local(async move {
+            ws_loop.set_binary_type(BinaryType::Arraybuffer);
+            while let Some(cmd) = cmd_rx.recv().await {
+                match cmd {
+                    WsCmd::Send { bytes, ack } => {
+                        let res = ws_loop
+                            .send_with_u8_array(&bytes)
+                            .map_err(|e| TransportError::Io(format!("ws send: {:?}", e)));
+                        let _ = ack.send(res);
+                    }
+                    WsCmd::Close => {
+                        let _ = ws_loop.close();
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(Arc::new(WsConn {
+            cmd_tx,
+            rx_once: std::sync::Mutex::new(Some(rx)),
+        }))
     }
 }
-
