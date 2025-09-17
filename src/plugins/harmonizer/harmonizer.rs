@@ -42,6 +42,7 @@ use crate::{
     database::{AuxOp, IndexPutRequest, WriteRequest},
     plugins::communication::transports::PeerId,
 };
+use crate::time::Instant;
 
 #[derive(Clone, Debug)]
 pub struct PeerContext {
@@ -408,7 +409,7 @@ impl Harmonizer {
                                     };
                                     let mut adopted = false;
                                     if let Ok(txn) = db.begin_read_txn() {
-                                        let t_adopt = std::time::Instant::now();
+                                        let t_adopt = Instant::now();
                                         if let Ok(Some(_plan)) = this
                                             .optimizer
                                             .propose(&db, &txn, &[seed], Some(req.range.clone()))
@@ -1083,7 +1084,7 @@ impl Plugin for Harmonizer {
 
         #[cfg(feature = "harmonizer_debug")]
         println!("before_update: running optimizer.propose()");
-        let _t_propose = std::time::Instant::now();
+        let _t_propose = Instant::now();
 
         // Collect touched parent nodes for hinting
         let mut touched: Vec<crate::plugins::harmonizer::protocol::UpdateHintTouched> = Vec::new();

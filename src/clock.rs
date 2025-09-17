@@ -1,5 +1,6 @@
 use std::fmt::Debug;
-use tokio::time::{Duration, Instant};
+use crate::time::Instant;
+use tokio::time::Duration;
 
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::time::advance;

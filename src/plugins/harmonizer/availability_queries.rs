@@ -1,7 +1,7 @@
 use redb::ReadTransaction;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::OnceLock;
-use std::time::Instant;
+use crate::time::Instant;
 
 use crate::plugins::harmonizer::optimizer::Action::Delete;
 use crate::plugins::harmonizer::optimizer::Action::Insert;

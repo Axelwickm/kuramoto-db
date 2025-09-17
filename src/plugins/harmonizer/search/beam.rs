@@ -14,6 +14,7 @@
 
 use super::{CandidateGen, Evaluator, SearchAlgorithm, State};
 use async_trait::async_trait;
+use crate::time::Instant;
 
 #[derive(Clone, Debug)]
 pub struct BeamConfig {
@@ -166,7 +167,7 @@ where
         let mut stats = Stats::default();
 
         // ── timing ────────────────────────────────────────────────────────────
-        let t_total = std::time::Instant::now();
+        let t_total = Instant::now();
         let mut gen_candidates_ms: u128 = 0;
         let mut d1_rollout_ms: u128 = 0;
         let mut d1_score_ms: u128 = 0;
@@ -185,7 +186,7 @@ where
         }
 
         // s0
-        let t_s0 = std::time::Instant::now();
+        let t_s0 = Instant::now();
         let s0 = match self.score(eval, current).await {
             Some(v) => v,
             None => {
@@ -214,7 +215,7 @@ where
         // TODO(future): Interleave candidate generation and scoring; evaluate common/simple
         // variants first (and short-circuit on early dominance) instead of generating the
         // full set upfront. This can cut large tie plateaus early and avoid expensive rollout.
-        let t_gen = std::time::Instant::now();
+        let t_gen = Instant::now();
         let raw_kids = cand.candidates(current);
         gen_candidates_ms = t_gen.elapsed().as_millis();
 
@@ -229,7 +230,7 @@ where
         // First pass: compute immediate score (fast) and feasibility
         for a in raw_kids.into_iter() {
             let next = current.apply(&a);
-            let t_sc = std::time::Instant::now();
+            let t_sc = Instant::now();
             let sc = match self.score_raw(eval, &next).await {
                 Some(s) => s,
                 None => {
@@ -268,7 +269,7 @@ where
                 };
 
                 for &ix in plateau_ix.iter().take(to_roll) {
-                    let t_roll = std::time::Instant::now();
+                    let t_roll = Instant::now();
 
                     // Rollout priority (depth-1 only) that **ignores feasibility** for ranking.
                     // We look up to `rollout_depth` steps ahead and take the max raw score seen.
@@ -326,7 +327,7 @@ where
         }
 
         // Rank by priority (desc), then tie-break **lexicographically later** action wins
-        let t_sort_d1 = std::time::Instant::now();
+        let t_sort_d1 = Instant::now();
         kids.sort_by(|(pa, _sa, _fa, aa, _na), (pb, _sb, _fb, ab, _nb)| {
             pb.partial_cmp(pa)
                 .unwrap_or(std::cmp::Ordering::Equal)
@@ -449,7 +450,7 @@ where
 
         // -------- Depth ≥ 2: prio == immediate score; NO rollout here --------
         for d in 2..=self.cfg.depth {
-            let t_expand_depth = std::time::Instant::now();
+            let t_expand_depth = Instant::now();
             let mut expanded: Vec<Node<S>> = Vec::new();
             let mut expanded_count_this_depth = 0;
             let mut eval_ms_this_depth: u128 = 0;
@@ -463,7 +464,7 @@ where
                     if !eval.feasible(&next) {
                         continue;
                     }
-                    let t_eval = std::time::Instant::now();
+                    let t_eval = Instant::now();
                     let sc = match self.score_raw(eval, &next).await {
                         Some(s) => s,
                         None => {
@@ -518,7 +519,7 @@ where
                 break;
             }
 
-            let t_sort = std::time::Instant::now();
+            let t_sort = Instant::now();
             expanded.sort_by(|a, b| {
                 b.prio
                     .partial_cmp(&a.prio)

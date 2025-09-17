@@ -20,7 +20,7 @@ use redb::ReadTransaction;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
+use crate::time::Instant;
 
 use crate::{
     KuramotoDb,

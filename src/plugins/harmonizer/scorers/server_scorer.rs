@@ -5,7 +5,7 @@
 use async_trait::async_trait;
 use redb::ReadTransaction;
 use std::collections::HashMap;
-use std::time::Instant;
+use crate::time::Instant;
 use tokio::sync::Mutex;
 
 use crate::{
