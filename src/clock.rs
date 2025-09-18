@@ -1,12 +1,20 @@
-use crate::time::Instant;
 use std::fmt::Debug;
 use tokio::time::Duration;
 
 #[cfg(not(target_arch = "wasm32"))]
-use tokio::time::advance;
+use tokio::time::{advance, Instant as TokioInstant};
 
 #[cfg(target_arch = "wasm32")]
 use tokio::time::sleep;
+
+#[cfg(target_arch = "wasm32")]
+use crate::time::Instant as PlatformInstant;
+
+#[cfg(not(target_arch = "wasm32"))]
+type ClockInstant = TokioInstant;
+
+#[cfg(target_arch = "wasm32")]
+type ClockInstant = PlatformInstant;
 
 pub trait Clock: Debug + Send + Sync + 'static {
     /// Monotonic seconds (maps Tokio's Instant → u64 seconds).
@@ -17,13 +25,13 @@ pub trait Clock: Debug + Send + Sync + 'static {
 
 #[derive(Debug, Clone)]
 struct InstantMapper {
-    origin: Instant, // reference point
+    origin: ClockInstant, // reference point tied to Tokio's clock when available
     base: u64,       // logical seconds at `origin`
 }
 impl InstantMapper {
     fn new(start_seconds: u64) -> Self {
         Self {
-            origin: Instant::now(),
+            origin: ClockInstant::now(),
             base: start_seconds,
         }
     }
