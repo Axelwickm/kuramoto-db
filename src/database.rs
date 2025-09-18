@@ -12,6 +12,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
+use crate::memory_storage::MemoryBackend;
 use crate::plugins::Plugin;
 use crate::storage_entity::IndexCardinality;
 use crate::tables::TableHash;
@@ -150,6 +151,29 @@ impl KuramotoDb {
         plugins: Vec<Arc<dyn Plugin>>,
     ) -> Arc<Self> {
         let db = Database::create(path).unwrap();
+        Self::new_with_database(db, clock, plugins).await
+    }
+
+    pub async fn new_in_memory(clock: Arc<dyn Clock>, plugins: Vec<Arc<dyn Plugin>>) -> Arc<Self> {
+        let db = Database::builder()
+            .create_with_backend(MemoryBackend::new())
+            .unwrap();
+        Self::new_with_database(db, clock, plugins).await
+    }
+
+    pub async fn new_with_database(
+        db: Database,
+        clock: Arc<dyn Clock>,
+        plugins: Vec<Arc<dyn Plugin>>,
+    ) -> Arc<Self> {
+        Self::from_database(db, clock, plugins)
+    }
+
+    fn from_database(
+        db: Database,
+        clock: Arc<dyn Clock>,
+        plugins: Vec<Arc<dyn Plugin>>,
+    ) -> Arc<Self> {
         let (write_tx, mut write_rx) = mpsc::channel(100);
         let db_arc = Arc::new(db);
 

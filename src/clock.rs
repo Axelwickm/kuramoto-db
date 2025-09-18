@@ -1,5 +1,5 @@
-use std::fmt::Debug;
 use crate::time::Instant;
+use std::fmt::Debug;
 use tokio::time::Duration;
 
 #[cfg(not(target_arch = "wasm32"))]

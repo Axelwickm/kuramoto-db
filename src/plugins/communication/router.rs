@@ -11,7 +11,7 @@ use std::{
 };
 
 use bincode::{Decode, Encode};
-use tokio::sync::{mpsc, oneshot, Semaphore};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 use tracing::{debug, info, instrument, warn};
 
 #[cfg(target_arch = "wasm32")]
