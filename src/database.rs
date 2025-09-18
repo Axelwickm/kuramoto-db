@@ -106,6 +106,22 @@ type TableDeletePlanFn = dyn for<'a> Fn(
     + Send
     + Sync;
 
+#[cfg(target_arch = "wasm32")]
+fn spawn_background<F>(future: F)
+where
+    F: Future<Output = ()> + 'static,
+{
+    wasm_bindgen_futures::spawn_local(future);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn spawn_background<F>(future: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let _ = tokio::spawn(future);
+}
+
 pub fn encode_nonunique_index_key(idx_key: &[u8], pk: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(idx_key.len() + 1 + pk.len());
     out.extend_from_slice(idx_key);
@@ -198,7 +214,7 @@ impl KuramotoDb {
         }
 
         let sys2 = sys.clone();
-        tokio::spawn(async move {
+        spawn_background(async move {
             while let Some((batch, reply, origin)) = write_rx.recv().await {
                 let _ = sys2.clone().handle_write(batch, reply, origin).await;
             }
@@ -1611,7 +1627,7 @@ impl KuramotoDb {
         // Trigger after-write hooks asynchronously to avoid deadlocks.
         let db_for_hooks = self.clone();
         let plugins = self.plugins.clone();
-        tokio::spawn(async move {
+        spawn_background(async move {
             let dbg = std::env::var("KDB_DEBUG_RANGE").ok().is_some();
             for plugin in plugins.iter() {
                 if dbg {

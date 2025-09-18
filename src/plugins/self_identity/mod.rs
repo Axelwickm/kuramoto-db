@@ -92,10 +92,17 @@ impl Plugin for SelfIdentity {
         let db2 = db.clone();
         let plugin_id = crate::plugins::fnv1a_16("self_identity");
         let _ = db.create_table_and_indexes::<SelfIdRow>();
-        tokio::spawn(async move {
+
+        let runner = async move {
             let _ = SelfIdentity::get_peer_id(&db2).await;
             let _ = plugin_id; // silence
-        });
+        };
+
+        #[cfg(target_arch = "wasm32")]
+        wasm_bindgen_futures::spawn_local(runner);
+
+        #[cfg(not(target_arch = "wasm32"))]
+        tokio::spawn(runner);
     }
 
     async fn before_update(
